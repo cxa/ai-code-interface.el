@@ -292,9 +292,11 @@ The timer is reset only after meaningful output is observed."
       (when ai-code-backends-infra--vterm-render-queue
         (let ((data ai-code-backends-infra--vterm-render-queue))
           (setq ai-code-backends-infra--vterm-render-queue nil)
-          (ai-code-backends-infra--vterm-render-preserving-copy-mode-view
-           (lambda ()
-             (funcall orig-fun (get-buffer-process buffer) data))))))))
+          (when-let* ((process (get-buffer-process buffer))
+                      ((process-live-p process)))
+            (ai-code-backends-infra--vterm-render-preserving-copy-mode-view
+             (lambda ()
+               (funcall orig-fun process data)))))))))
 
 (defun ai-code-backends-infra--vterm-smart-renderer (orig-fun process input)
   "Smart rendering filter for optimized vterm display updates.

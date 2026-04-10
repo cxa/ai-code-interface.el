@@ -1180,6 +1180,52 @@
         (should (= (point) original-point))
         (should-not ai-code-backends-infra--vterm-render-queue)))))
 
+(ert-deftest test-ai-code-backends-infra-vterm-render-preserving-copy-mode-view-restores-window-state ()
+  "Copy-mode rendering should restore the visible window viewport."
+  (let ((buffer (generate-new-buffer " *ai-code-vterm-copy-mode-window*")))
+    (unwind-protect
+        (save-window-excursion
+          (switch-to-buffer buffer)
+          (with-current-buffer buffer
+            (setq-local vterm-copy-mode t)
+            (dotimes (line 80)
+              (insert (format "line %02d\n" line)))
+            (goto-char (point-min))
+            (forward-line 25)
+            (set-window-start (selected-window) (point))
+            (forward-line 4)
+            (set-window-point (selected-window) (point))
+            (let ((original-start (window-start))
+                  (original-window-point (window-point))
+                  (orig-fun (lambda ()
+                              (goto-char (point-max))
+                              (insert "tail\n")
+                              (goto-char (point-max)))))
+              (ai-code-backends-infra--vterm-render-preserving-copy-mode-view
+               orig-fun)
+              (should (= (window-start) original-start))
+              (should (= (window-point) original-window-point)))))
+      (when (buffer-live-p buffer)
+        (kill-buffer buffer)))))
+
+(ert-deftest test-ai-code-backends-infra-vterm-render-queued-output-skips-dead-process ()
+  "Queued output should be dropped when the buffer has no live process."
+  (with-temp-buffer
+    (setq-local ai-code-backends-infra--vterm-render-queue "queued-output")
+    (setq-local ai-code-backends-infra--vterm-render-timer 'mock-timer)
+    (let ((orig-called nil))
+      (cl-letf (((symbol-function 'get-buffer-process)
+                 (lambda (_buf) nil)))
+        (ai-code-backends-infra--vterm-render-queued-output
+         (lambda (process _input)
+           (setq orig-called t)
+           (unless (process-live-p process)
+             (error "Missing live process")))
+         (current-buffer))
+        (should-not orig-called)
+        (should (null ai-code-backends-infra--vterm-render-queue))
+        (should (null ai-code-backends-infra--vterm-render-timer))))))
+
 (ert-deftest test-ai-code-backends-infra-vterm-smart-renderer-timer-renders-in-copy-mode ()
   "Render timer should flush queued redraws while `vterm-copy-mode' is active."
   (with-temp-buffer
@@ -1200,6 +1246,10 @@
            (captured-timer-fn nil))
       (cl-letf (((symbol-function 'process-buffer)
                  (lambda (_proc) (current-buffer)))
+                ((symbol-function 'get-buffer-process)
+                 (lambda (_buf) mock-process))
+                ((symbol-function 'process-live-p)
+                 (lambda (process) (eq process mock-process)))
                 ((symbol-function 'run-at-time)
                  (lambda (_delay _repeat fn &rest args)
                    (setq captured-timer-fn (cons fn args))
