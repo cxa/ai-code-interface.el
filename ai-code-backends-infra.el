@@ -874,8 +874,9 @@ PROMPT-LABEL is used in the minibuffer prompt.
 When resuming and the active region contains a UUID, prompt as though ARG
 were non-nil and append that UUID to the default CLI args."
   (let* ((resume-command-p
-          (or (member "resume" switches)
-              (member "--resume" switches)))
+          (cl-some (lambda (switch)
+                     (member switch '("resume" "--resume")))
+                   switches))
          (selected-session-id
           (and (null arg)
                resume-command-p

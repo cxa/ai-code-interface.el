@@ -67,7 +67,7 @@
     (should (re-search-forward
              "^(defcustom ai-code-backends-infra-eat-preserve-position\\_>" nil t))))
 
-(ert-deftest test-ai-code-backends-infra-resolve-start-command-prefills-selected-uuid-for-double-dash-resume ()
+(ert-deftest test-ai-code-backends-infra--resume-double-dash-prefills-uuid ()
   "A selected UUID should make `--resume' prompt with that id appended."
   (let ((uuid test-ai-code-backends-infra-valid-uuid)
         seen-prompt
@@ -97,7 +97,7 @@
     (should (equal (plist-get result :command)
                    (format "claude --resume %s" uuid)))))
 
-(ert-deftest test-ai-code-backends-infra-resolve-start-command-prefills-selected-uuid-for-resume-subcommand ()
+(ert-deftest test-ai-code-backends-infra--resume-subcommand-prefills-uuid ()
   "A selected UUID should make `resume' prompt with that id appended."
   (let ((uuid test-ai-code-backends-infra-valid-uuid)
         seen-initial
@@ -121,7 +121,7 @@
     (should (equal (plist-get result :command)
                    (format "codex resume %s" uuid)))))
 
-(ert-deftest test-ai-code-backends-infra-resolve-start-command-ignores-non-uuid-selection ()
+(ert-deftest test-ai-code-backends-infra--resume-ignores-non-uuid ()
   "A non-UUID region should not trigger resume prompting."
   (with-temp-buffer
     (transient-mark-mode 1)
