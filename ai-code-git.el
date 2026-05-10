@@ -97,8 +97,8 @@ When `ai-code-default-review-source' is set, return it directly."
   "Return a note about configuring `ai-code-default-review-source' when helpful."
   (unless ai-code-default-review-source
     (concat
-     "Also tell the user that setting `ai-code-default-review-source` "
-     "to either `github-mcp` or `gh-cli` can bypass the initial review-source "
+     "Also tell the user that setting ai-code-default-review-source "
+     "to either github-mcp or gh-cli can bypass the initial review-source "
      "selection in future `C-c a v` runs.")))
 
 (defun ai-code--build-pr-review-init-prompt (review-source pr-url)
