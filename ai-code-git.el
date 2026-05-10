@@ -58,6 +58,7 @@ or nil (prompt the user)."
 (declare-function ai-code--insert-prompt "ai-code-prompt-mode" (prompt-text))
 (declare-function ai-code--ensure-files-directory "ai-code-prompt-mode" ())
 (declare-function ai-code--git-root "ai-code-file" (&optional dir))
+(declare-function ai-code--explain-code-change "ai-code-discussion" (&optional review-source))
 
 (defvar ai-code-files-dir-name)
 (defvar ai-code-pr-title-history nil
@@ -243,9 +244,14 @@ Otherwise, ask for the relevant pull request or issue URL."
       (ai-code--magit-generate-feature-branch-diff-file))
      ((eq review-mode 'review-current-branch-with-difftastic)
       (ai-code--review-current-branch-with-difftastic))
+     ((eq review-mode 'explain-code-change)
+      (require 'ai-code-discussion nil t)
+      (unless (fboundp 'ai-code--explain-code-change)
+        (user-error "Code change explanation support is not available"))
+      (ai-code--explain-code-change review-source))
      (t
-      (let* ((init-prompt
-              (if (eq review-mode 'send-current-branch-pr)
+       (let* ((init-prompt
+               (if (eq review-mode 'send-current-branch-pr)
                   (progn
                     (unless (magit-toplevel)
                       (user-error "Not inside a Git repository"))
@@ -284,10 +290,11 @@ Otherwise, ask for the relevant pull request or issue URL."
                               ("Send out PR for current branch" . send-current-branch-pr)
                               ("Review current branch with difftastic"
                                . review-current-branch-with-difftastic)
-                              ("Investigate issue" . investigate-issue)
-                              ("Review GitHub CI checks" . review-ci-checks)
-                              ("Resolve merge conflict" . resolve-merge-conflict)
-                              ("Generate diff file" . generate-diff-file)))
+                               ("Investigate issue" . investigate-issue)
+                               ("Review GitHub CI checks" . review-ci-checks)
+                               ("Explain code change" . explain-code-change)
+                               ("Resolve merge conflict" . resolve-merge-conflict)
+                               ("Generate diff file" . generate-diff-file)))
          (review-mode (completing-read "Select analysis mode (PR or issue): "
                                        review-mode-alist
                                        nil t nil nil "Review the PR")))

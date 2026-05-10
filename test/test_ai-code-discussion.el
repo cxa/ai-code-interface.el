@@ -51,9 +51,6 @@
   (let (captured-initial-prompt captured-final-prompt)
     (cl-letf (((symbol-function 'completing-read)
                (lambda (&rest _args) "GitHub PR"))
-              ((symbol-function 'ai-code--pull-or-review-action-choice)
-               (lambda ()
-                 'github-mcp))
               ((symbol-function 'ai-code--pull-or-review-source-instruction)
                (lambda (review-source &optional review-mode)
                  (should (eq review-source 'github-mcp))
@@ -74,7 +71,7 @@
               ((symbol-function 'ai-code--insert-prompt)
                (lambda (prompt)
                  (setq captured-final-prompt prompt))))
-      (ai-code--explain-code-change)
+      (ai-code--explain-code-change 'github-mcp)
       (should (string-match-p "https://github.com/acme/demo/pull/123"
                               captured-initial-prompt))
       (should (string-match-p "Use GitHub MCP server"

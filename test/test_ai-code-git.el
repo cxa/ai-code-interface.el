@@ -264,6 +264,13 @@ When .gitignore is missing some entries, they should be added."
     (should (eq (ai-code--pull-or-review-pr-mode-choice)
                 'review-ci-checks))))
 
+(ert-deftest ai-code-test-pull-or-review-pr-mode-choice-explain-code-change ()
+  "Choosing explain code change mode should return `explain-code-change'."
+  (cl-letf (((symbol-function 'completing-read)
+             (lambda (&rest _args) "Explain code change")))
+    (should (eq (ai-code--pull-or-review-pr-mode-choice)
+                'explain-code-change))))
+
 (ert-deftest ai-code-test-pull-or-review-source-instruction-explain-code-change ()
   "Explain-code-change mode should inspect the diff, not review comments."
   (let ((instruction
@@ -520,8 +527,30 @@ Return (CAPTURED-PROMPT DIFF-CALLED)."
                (lambda (&rest _args) "Generate diff file"))
               ((symbol-function 'ai-code--magit-generate-feature-branch-diff-file)
                (lambda () (setq diff-called t))))
+       (ai-code--pull-or-review-pr-with-source 'github-mcp)
+       (should diff-called))))
+
+(ert-deftest ai-code-test-pull-or-review-pr-with-source-explain-code-change-shares-flow ()
+  "Explain code change mode should dispatch to the shared explanation flow."
+  (let (captured-review-source)
+    (cl-letf (((symbol-function 'completing-read)
+               (lambda (&rest _args) "Explain code change"))
+              ((symbol-function 'require)
+               (lambda (feature &optional _filename _noerror)
+                 (unless (eq feature 'ai-code-discussion)
+                   (ert-fail (format "Unexpected require: %S" feature)))
+                 t))
+              ((symbol-function 'fboundp)
+               (lambda (fn)
+                 (if (eq fn 'ai-code--explain-code-change)
+                     t
+                   (let ((definition (symbol-function fn)))
+                     (and definition t)))))
+              ((symbol-function 'ai-code--explain-code-change)
+               (lambda (&optional review-source)
+                 (setq captured-review-source review-source))))
       (ai-code--pull-or-review-pr-with-source 'github-mcp)
-      (should diff-called))))
+      (should (eq captured-review-source 'github-mcp)))))
 
 (ert-deftest ai-code-test-pull-or-review-pr-mode-choice-resolve-merge-conflict ()
   "Choosing resolve merge conflict mode should return `resolve-merge-conflict'."

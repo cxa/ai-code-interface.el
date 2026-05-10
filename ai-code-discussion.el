@@ -436,6 +436,21 @@ sends to AI."
       (ai-code--pull-or-review-source-instruction review-source 'explain-code-change)
     "Inspect the pull request diff and relevant metadata to understand the change."))
 
+(defun ai-code--explain-code-change-review-source (review-source)
+  "Return REVIEW-SOURCE or prompt for one when needed."
+  (or review-source
+      (progn
+        (require 'ai-code-git nil t)
+        (if (fboundp 'ai-code--pull-or-review-action-choice)
+            (ai-code--pull-or-review-action-choice)
+          (let* ((action-alist '(("Use GitHub MCP server" . github-mcp)
+                                 ("Use gh CLI tool" . gh-cli)))
+                 (choice (completing-read "Select review source: "
+                                          action-alist
+                                          nil t nil nil
+                                          "Use GitHub MCP server")))
+            (alist-get choice action-alist nil nil #'string=))))))
+
 (defun ai-code--explain-code-change-insert-prompt (initial-prompt)
   "Read and insert an explanation prompt starting from INITIAL-PROMPT."
   (let ((final-prompt (ai-code-read-string "Prompt: " initial-prompt)))
@@ -452,8 +467,9 @@ sends to AI."
                    ai-code-discussion--explain-code-change-focus-note)
              "\n"))
 
-(defun ai-code--explain-code-change ()
-  "Explain a code change from a PR, branch range, or commit."
+(defun ai-code--explain-code-change (&optional review-source)
+  "Explain a code change from a PR, branch range, or commit.
+When REVIEW-SOURCE is non-nil, use it for the GitHub PR flow."
   (let* ((choices '(("GitHub PR" . github-pr)
                     ("base..branch" . branch-range)
                     ("commit" . commit)))
@@ -461,7 +477,8 @@ sends to AI."
          (code-change-source (alist-get selection choices nil nil #'string=)))
     (pcase code-change-source
       ('github-pr
-       (ai-code--explain-code-change-from-github-pr))
+       (ai-code--explain-code-change-from-github-pr
+        (ai-code--explain-code-change-review-source review-source)))
       ('branch-range
        (ai-code--explain-code-change-from-branch-range))
       ('commit
@@ -469,10 +486,9 @@ sends to AI."
       (_
        (user-error "Unknown code change source: %s" selection)))))
 
-(defun ai-code--explain-code-change-from-github-pr ()
-  "Build a prompt to explain a code change from a GitHub PR."
-  (let* ((review-source (ai-code--pull-or-review-action-choice))
-         (pr-url (ai-code-read-string "Pull request URL: "))
+(defun ai-code--explain-code-change-from-github-pr (review-source)
+  "Build a prompt to explain a code change from a GitHub PR using REVIEW-SOURCE."
+  (let* ((pr-url (ai-code-read-string "Pull request URL: "))
          (source-instruction
           (ai-code--explain-code-change-source-instruction review-source))
          (repo-context-string (ai-code--format-repo-context-info))
@@ -489,8 +505,14 @@ sends to AI."
                    "Summarize the overall goal of the code change."
                    "Explain the main files, functions, and behavior changes in the PR."
                    "Highlight important design decisions, risks, and follow-up considerations.")
-                  repo-context-string)))
+                   repo-context-string)))
     (ai-code--explain-code-change-insert-prompt initial-prompt)))
+
+(defun ai-code-explain-code-change (&optional review-source)
+  "Explain a code change using shared discussion helpers.
+When REVIEW-SOURCE is non-nil, use it for the GitHub PR flow."
+  (interactive)
+  (ai-code--explain-code-change review-source))
 
 (defun ai-code--explain-code-change-from-branch-range ()
   "Build a prompt to explain a code change from BASE..BRANCH."
