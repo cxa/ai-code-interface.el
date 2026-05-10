@@ -467,6 +467,12 @@ sends to AI."
                    ai-code-discussion--explain-code-change-focus-note)
              "\n"))
 
+(defun ai-code--format-code-change-extra-note (extra-note)
+  "Return EXTRA-NOTE with spacing suitable for prompt suffixes."
+  (if extra-note
+      (concat "\n\n" extra-note)
+    ""))
+
 (defun ai-code--explain-code-change (&optional review-source extra-note)
   "Explain a code change from a PR, branch range, or commit.
 When REVIEW-SOURCE is non-nil, use it for the GitHub PR flow.
@@ -509,9 +515,7 @@ Append EXTRA-NOTE when non-nil."
                    "Explain the main files, functions, and behavior changes in the PR."
                    "Highlight important design decisions, risks, and follow-up considerations.")
                   repo-context-string
-                  (if extra-note
-                      (concat "\n\n" extra-note)
-                    ""))))
+                  (ai-code--format-code-change-extra-note extra-note))))
     (ai-code--explain-code-change-insert-prompt initial-prompt)))
 
 (defun ai-code-explain-code-change (&optional review-source extra-note)
@@ -548,9 +552,7 @@ In the current repository, inspect `git diff %s..%s` and explain:
                      "The most important files, functions, and logic changes."
                      "The expected behavior impact, migration notes, and risks.")
                     repo-context-string
-                    (if extra-note
-                        (concat "\n\n" extra-note)
-                      ""))))
+                    (ai-code--format-code-change-extra-note extra-note))))
       (ai-code--explain-code-change-insert-prompt initial-prompt))))
 
 (defun ai-code--explain-code-change-from-commit (&optional extra-note)
@@ -576,9 +578,7 @@ In the current repository, inspect `git show %s` and explain:
                      "The key code paths and behavior changes introduced by the commit."
                      "Any noteworthy implementation details, risks, or trade-offs.")
                     repo-context-string
-                    (if extra-note
-                        (concat "\n\n" extra-note)
-                      ""))))
+                    (ai-code--format-code-change-extra-note extra-note))))
       (ai-code--explain-code-change-insert-prompt initial-prompt))))
 
 (defun ai-code--explain-symbol ()
