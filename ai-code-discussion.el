@@ -505,7 +505,7 @@ When REVIEW-SOURCE is non-nil, use it for the GitHub PR flow."
                    "Summarize the overall goal of the code change."
                    "Explain the main files, functions, and behavior changes in the PR."
                    "Highlight important design decisions, risks, and follow-up considerations.")
-                   repo-context-string)))
+                  repo-context-string)))
     (ai-code--explain-code-change-insert-prompt initial-prompt)))
 
 (defun ai-code-explain-code-change (&optional review-source)

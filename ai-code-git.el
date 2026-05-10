@@ -250,8 +250,8 @@ Otherwise, ask for the relevant pull request or issue URL."
         (user-error "Code change explanation support is not available"))
       (ai-code--explain-code-change review-source))
      (t
-       (let* ((init-prompt
-               (if (eq review-mode 'send-current-branch-pr)
+      (let* ((init-prompt
+              (if (eq review-mode 'send-current-branch-pr)
                   (progn
                     (unless (magit-toplevel)
                       (user-error "Not inside a Git repository"))
@@ -272,9 +272,9 @@ Otherwise, ask for the relevant pull request or issue URL."
                        (region-url (ai-code--extract-url-from-region))
                        (target-url (ai-code-read-string url-prompt region-url)))
                   (ai-code--build-pr-init-prompt review-source target-url review-mode))))
-             (prompt-label (if (eq review-mode 'send-current-branch-pr)
-                               "Enter PR creation prompt: "
-                             "Enter review prompt: "))
+              (prompt-label (if (eq review-mode 'send-current-branch-pr)
+                                "Enter PR creation prompt: "
+                              "Enter review prompt: "))
              (prompt (ai-code-read-string prompt-label init-prompt)))
         (ai-code--insert-prompt prompt))))))
 
