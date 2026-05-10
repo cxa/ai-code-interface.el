@@ -193,7 +193,6 @@ When .gitignore is missing some entries, they should be added."
     (let ((case-fold-search nil))
       (should (string-match-p "Use GitHub MCP server" captured-prompt)))
     (should (string-match-p "https://github.com/acme/demo/pull/123" captured-prompt))
-    (should (string-match-p "ai-code-default-review-source" captured-prompt))
     (should-not diff-called)))
 
 (ert-deftest ai-code-test-pull-or-review-diff-file-use-gh-cli ()
@@ -533,7 +532,7 @@ Return (CAPTURED-PROMPT DIFF-CALLED)."
 
 (ert-deftest ai-code-test-pull-or-review-pr-with-source-explain-code-change-shares-flow ()
   "Explain code change mode should dispatch to the shared explanation flow."
-  (let (captured-review-source captured-extra-note require-called)
+  (let (captured-review-source require-called)
     (cl-letf (((symbol-function 'completing-read)
                (lambda (&rest _args) "Explain code change"))
               ((symbol-function 'require)
@@ -546,14 +545,11 @@ Return (CAPTURED-PROMPT DIFF-CALLED)."
                (lambda (fn)
                  (eq fn 'ai-code--explain-code-change)))
               ((symbol-function 'ai-code--explain-code-change)
-               (lambda (&optional review-source extra-note)
-                 (setq captured-review-source review-source)
-                 (setq captured-extra-note extra-note))))
+               (lambda (&optional review-source)
+                 (setq captured-review-source review-source))))
       (ai-code--pull-or-review-pr-with-source 'github-mcp)
       (should require-called)
-      (should (eq captured-review-source 'github-mcp))
-      (should (string-match-p "ai-code-default-review-source"
-                              captured-extra-note)))))
+      (should (eq captured-review-source 'github-mcp)))))
 
 (ert-deftest ai-code-test-pull-or-review-pr-mode-choice-resolve-merge-conflict ()
   "Choosing resolve merge conflict mode should return `resolve-merge-conflict'."
@@ -632,10 +628,15 @@ Return (CAPTURED-PROMPT DIFF-CALLED)."
        (should (eq (ai-code--pull-or-review-action-choice) 'github-mcp))
        (should-not completing-read-called))))
 
-(ert-deftest ai-code-test-review-source-config-note-absent-when-default-set ()
-  "When a default review source is configured, do not return a guidance note."
-  (let ((ai-code-default-review-source 'github-mcp))
-    (should-not (ai-code--pull-or-review-review-source-config-note))))
+(ert-deftest ai-code-test-message-review-source-config-hint ()
+  "The review-source guidance should be shown in the minibuffer."
+  (let (captured-message)
+    (cl-letf (((symbol-function 'message)
+               (lambda (format-string &rest args)
+                 (setq captured-message (apply #'format format-string args)))))
+      (ai-code--pull-or-review-message-review-source-config-hint)
+      (should (string-match-p "ai-code-default-review-source" captured-message))
+      (should (string-match-p "C-c a v" captured-message)))))
 
 (ert-deftest ai-code-test-action-choice-returns-gh-cli-when-default-set ()
   "When `ai-code-default-review-source' is `gh-cli', return it directly."
@@ -659,11 +660,31 @@ Return (CAPTURED-PROMPT DIFF-CALLED)."
       (should (eq (ai-code--pull-or-review-action-choice) 'github-mcp))
       (should completing-read-called))))
 
-(ert-deftest ai-code-test-review-source-config-note-present-when-default-nil ()
-  "When no default review source is configured, return a guidance note."
-  (let ((ai-code-default-review-source nil))
-    (should (string-match-p "ai-code-default-review-source"
-                            (ai-code--pull-or-review-review-source-config-note)))))
+(ert-deftest ai-code-test-pull-or-review-diff-file-messages-config-hint-when-default-nil ()
+  "When no default review source is configured, `C-c a v' should message a hint."
+  (let ((ai-code-default-review-source nil)
+        captured-message)
+    (cl-letf (((symbol-function 'completing-read)
+               (lambda (&rest _args) "Use GitHub MCP server"))
+              ((symbol-function 'ai-code--pull-or-review-pr-with-source)
+               (lambda (_review-source)))
+              ((symbol-function 'message)
+               (lambda (format-string &rest args)
+                 (setq captured-message (apply #'format format-string args)))))
+      (ai-code-pull-or-review-diff-file)
+      (should (string-match-p "ai-code-default-review-source" captured-message)))))
+
+(ert-deftest ai-code-test-pull-or-review-diff-file-skips-config-hint-when-default-set ()
+  "When a default review source is configured, `C-c a v' should skip the hint."
+  (let ((ai-code-default-review-source 'github-mcp)
+        captured-message)
+    (cl-letf (((symbol-function 'ai-code--pull-or-review-pr-with-source)
+               (lambda (_review-source)))
+              ((symbol-function 'message)
+               (lambda (format-string &rest args)
+                 (setq captured-message (apply #'format format-string args)))))
+      (ai-code-pull-or-review-diff-file)
+      (should-not captured-message))))
 
 (provide 'test_ai-code-git)
 

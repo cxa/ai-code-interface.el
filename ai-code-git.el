@@ -58,8 +58,7 @@ or nil (prompt the user)."
 (declare-function ai-code--insert-prompt "ai-code-prompt-mode" (prompt-text))
 (declare-function ai-code--ensure-files-directory "ai-code-prompt-mode" ())
 (declare-function ai-code--git-root "ai-code-file" (&optional dir))
-(declare-function ai-code--explain-code-change "ai-code-discussion"
-                  (&optional review-source extra-note))
+(declare-function ai-code--explain-code-change "ai-code-discussion" (&optional review-source))
 
 (defvar ai-code-files-dir-name)
 (defvar ai-code-pr-title-history nil
@@ -93,10 +92,10 @@ When `ai-code-default-review-source' is set, return it directly."
                                       nil t nil nil "Use GitHub MCP server")))
         (alist-get choice action-alist nil nil #'string=))))
 
-(defun ai-code--pull-or-review-review-source-config-note ()
-  "Return a note about configuring `ai-code-default-review-source' when helpful."
-  (unless ai-code-default-review-source
-    "Also tell the user that setting ai-code-default-review-source to either github-mcp or gh-cli can bypass the initial review-source selection in future `C-c a v` runs."))
+(defun ai-code--pull-or-review-message-review-source-config-hint ()
+  "Tell the user how to skip future review-source prompt."
+  (message
+   "Tip: set ai-code-default-review-source to github-mcp or gh-cli to skip this review-source prompt in future C-c a v runs."))
 
 (defun ai-code--build-pr-review-init-prompt (review-source pr-url)
   "Build PR review initial prompt for REVIEW-SOURCE with PR-URL."
@@ -254,11 +253,9 @@ Otherwise, ask for the relevant pull request or issue URL."
       (require 'ai-code-discussion nil t)
       (unless (fboundp 'ai-code--explain-code-change)
         (user-error "Code change explanation support is not available"))
-      (ai-code--explain-code-change
-       review-source
-       (ai-code--pull-or-review-review-source-config-note)))
+      (ai-code--explain-code-change review-source))
      (t
-      (let* ((init-prompt-base
+      (let* ((init-prompt
               (if (eq review-mode 'send-current-branch-pr)
                   (progn
                     (unless (magit-toplevel)
@@ -276,21 +273,15 @@ Otherwise, ask for the relevant pull request or issue URL."
                              'ai-code-pr-title-history)))
                       (ai-code--build-send-current-branch-pr-init-prompt
                        review-source current-branch target-branch pr-title)))
-                 (let* ((url-prompt (ai-code--pull-or-review-url-prompt review-mode))
-                        (region-url (ai-code--extract-url-from-region))
-                        (target-url (ai-code-read-string url-prompt region-url)))
-                  (ai-code--build-pr-init-prompt review-source target-url review-mode))))
-             (review-source-note
-              (ai-code--pull-or-review-review-source-config-note))
-             (init-prompt
-              (if review-source-note
-                  (concat init-prompt-base "\n\n" review-source-note)
-                init-prompt-base))
-              (prompt-label (if (eq review-mode 'send-current-branch-pr)
-                                "Enter PR creation prompt: "
-                              "Enter review prompt: "))
-             (prompt (ai-code-read-string prompt-label init-prompt)))
-        (ai-code--insert-prompt prompt))))))
+                  (let* ((url-prompt (ai-code--pull-or-review-url-prompt review-mode))
+                         (region-url (ai-code--extract-url-from-region))
+                         (target-url (ai-code-read-string url-prompt region-url)))
+                     (ai-code--build-pr-init-prompt review-source target-url review-mode))))
+               (prompt-label (if (eq review-mode 'send-current-branch-pr)
+                                 "Enter PR creation prompt: "
+                                 "Enter review prompt: "))
+               (prompt (ai-code-read-string prompt-label init-prompt)))
+         (ai-code--insert-prompt prompt))))))
 
 (defun ai-code--pull-or-review-pr-mode-choice ()
   "Prompt user to choose analysis mode for a pull request or issue."
@@ -455,7 +446,10 @@ Provide overall assessment.
              (prompt (ai-code-read-string "Enter review prompt (type requirement at end): " init-prompt)))
         (ai-code--insert-prompt prompt))
     ;; For non-diff files, let user choose PR review via MCP/gh CLI.
-    (ai-code--pull-or-review-pr-with-source (ai-code--pull-or-review-action-choice))))
+    (let ((review-source (ai-code--pull-or-review-action-choice)))
+      (unless ai-code-default-review-source
+        (ai-code--pull-or-review-message-review-source-config-hint))
+      (ai-code--pull-or-review-pr-with-source review-source))))
 
 (defun ai-code--validate-git-repository ()
   "Validate that current directory is in a git repository.
