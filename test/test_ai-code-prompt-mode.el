@@ -352,12 +352,19 @@ and ensures everything is cleaned up afterward."
           (ai-code-note-search-data-source-instructions
            '("Use MCP servers as data sources when available."
              "Use the available search tools to inspect the selected paths."))
+          (expected-instructions nil)
           (asked-scopes nil)
           (sent-command nil)
           (switch-called nil))
      (make-directory roam-dir t)
      (unwind-protect
          (progn
+            (setq expected-instructions
+                  (concat
+                   (mapconcat #'identity
+                              ai-code-note-search-data-source-instructions
+                              "\n")
+                   "\n"))
             (cl-letf (((symbol-function 'y-or-n-p)
                        (lambda (prompt)
                          (push prompt asked-scopes)
@@ -398,11 +405,10 @@ and ensures everything is cleaned up afterward."
                                              "- @" (file-relative-name files-dir git-root) "\n"
                                              "- @" (file-relative-name roam-dir git-root) "\n"
                                              "- " external-dir "\n"
-                                             "Use MCP servers as data sources when available.\n"
-                                             "Use the available search tools to inspect the selected paths.\n"
+                                             expected-instructions
                                              "Focus on relevant information inside files, not just file names.\n"
                                              "Return the most relevant paths, matched excerpts, and a concise answer.\n"))
-                      sent-command))))
+                       sent-command))))
         (when (file-directory-p external-dir)
           (delete-directory external-dir t))))))
 
@@ -414,6 +420,7 @@ and ensures everything is cleaned up afterward."
           (ai-code-note-search-additional-paths (list external-dir))
           (ai-code-note-search-data-source-instructions
            '("Use MCP servers as data sources when available."))
+          (expected-instructions nil)
           (asked-scopes nil)
           (sent-command nil))
      (cl-letf (((symbol-function 'y-or-n-p)
@@ -434,10 +441,16 @@ and ensures everything is cleaned up afterward."
                   (setq sent-command command)))
                ((symbol-function 'ai-code-cli-switch-to-buffer)
                 (lambda ()))
-               ((symbol-function 'message)
-                (lambda (&rest _args) nil)))
+                ((symbol-function 'message)
+                 (lambda (&rest _args) nil)))
        (unwind-protect
            (progn
+             (setq expected-instructions
+                   (concat
+                    (mapconcat #'identity
+                               ai-code-note-search-data-source-instructions
+                               "\n")
+                    "\n"))
              (let ((ai-code-prompt-suffix nil)
                    (ai-code-auto-test-type nil)
                    (ai-code-auto-test-suffix nil)
@@ -451,7 +464,7 @@ and ensures everything is cleaned up afterward."
                       (regexp-quote (concat "Search my notes and related files for: base only\n"
                                             "Search scope paths:\n"
                                             "- @" (file-relative-name files-dir git-root) "\n"
-                                            "Use MCP servers as data sources when available.\n"
+                                            expected-instructions
                                             "Focus on relevant information inside files, not just file names.\n"
                                             "Return the most relevant paths, matched excerpts, and a concise answer.\n"))
                       sent-command))

@@ -526,8 +526,7 @@ for example `org-roam-directory'."
   :group 'ai-code)
 
 (defcustom ai-code-note-search-data-source-instructions
-  '("Use MCP servers as data sources when available to inspect the selected paths."
-    "Use the available search tools to inspect the selected paths.")
+  '("Prefer MCP servers as data sources when available; otherwise use the available search tools to inspect the selected paths.")
   "Instructions appended to note-search prompts for tool and data-source usage.
 Each entry should be a single instruction string."
   :type '(repeat string)
