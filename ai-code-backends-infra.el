@@ -614,6 +614,13 @@ from the window where it was initially created."
   "Return normalized absolute path for FILE."
   (expand-file-name file))
 
+(defun ai-code-backends-infra--default-instance-name ()
+  "Return the default instance name for the current buffer, or nil."
+  (when (and (eq major-mode 'ai-code-prompt-mode)
+             (stringp buffer-file-name)
+             (> (length buffer-file-name) 0))
+    (file-name-nondirectory buffer-file-name)))
+
 (defun ai-code-backends-infra--file-session-map-key (prefix source-buffer)
   "Return file-session map key for PREFIX and SOURCE-BUFFER."
   (when (and prefix (buffer-live-p source-buffer))
@@ -844,10 +851,13 @@ Returns the selected buffer or nil if none exist."
               (ai-code-backends-infra--remember-session-buffer prefix directory buffer)
               buffer))))))))
 
-(defun ai-code-backends-infra--prompt-for-instance-name (existing-instance-names &optional force-prompt)
+(defun ai-code-backends-infra--prompt-for-instance-name (existing-instance-names
+                                                         &optional force-prompt
+                                                         default-instance-name)
   "Prompt for a new instance name.
 EXISTING-INSTANCE-NAMES is a list of existing instance names.
-If FORCE-PROMPT is nil and there are no existing instances, return \"default\"."
+If FORCE-PROMPT is nil and there are no existing instances, return \"default\".
+DEFAULT-INSTANCE-NAME seeds the minibuffer when prompting."
   (if (or existing-instance-names force-prompt)
       (let ((proposed-name ""))
         (while (or (string= proposed-name "")
@@ -856,8 +866,9 @@ If FORCE-PROMPT is nil and there are no existing instances, return \"default\"."
                 (read-string (if existing-instance-names
                                  (format "Instance name (existing: %s): "
                                          (mapconcat #'identity existing-instance-names ", "))
-                               "Instance name: ")
-                             nil nil (and (> (length proposed-name) 0) proposed-name)))
+                                "Instance name: ")
+                             nil nil (or (and (> (length proposed-name) 0) proposed-name)
+                                         default-instance-name)))
           (cond
            ((string= proposed-name "")
             (message "Instance name cannot be empty. Please enter a name.")
@@ -945,12 +956,13 @@ Return a plist with :instance-name, :buffer-name, and :session-key."
                              (prefix
                               (ai-code-backends-infra--prompt-for-instance-name
                                existing-instance-names
-                               force-prompt))
+                               force-prompt
+                               (ai-code-backends-infra--default-instance-name)))
                              (t "default")))
          (resolved-buffer-name (or buffer-name
-                                   (and prefix
-                                        (ai-code-backends-infra--session-buffer-name
-                                         prefix
+                                    (and prefix
+                                         (ai-code-backends-infra--session-buffer-name
+                                          prefix
                                          working-dir
                                          resolved-instance)))))
     (list :instance-name resolved-instance

@@ -1126,6 +1126,43 @@
                      (cons working-dir "review")))
       (should-not prompt-called))))
 
+(ert-deftest test-ai-code-backends-infra-resolve-session-target-prefills-prompt-buffer-filename ()
+  "Prompt-mode buffers should seed new instance names from the file name."
+  (let* ((working-dir "/tmp/ai-code-session-target/")
+         (prefix "codex")
+         (existing-buffer (get-buffer-create "*codex[ai-code-session-target]*"))
+         seen-prompt
+         seen-default
+         context)
+    (unwind-protect
+        (with-temp-buffer
+          (setq-local major-mode 'ai-code-prompt-mode)
+          (setq-local buffer-file-name "/tmp/project/.ai.code.files/review-notes.org")
+          (cl-letf (((symbol-function 'ai-code-backends-infra--find-session-buffers)
+                    (lambda (&rest _args)
+                       (list existing-buffer)))
+                    ((symbol-function 'read-string)
+                     (lambda (prompt &optional _initial-input _history default-value &rest _args)
+                       (setq seen-prompt prompt
+                             seen-default default-value)
+                       default-value)))
+            (setq context
+                  (ai-code-backends-infra--resolve-session-target
+                   working-dir
+                   nil
+                   prefix
+                   nil
+                   nil))))
+      (when (buffer-live-p existing-buffer)
+        (kill-buffer existing-buffer)))
+    (should (equal seen-prompt "Instance name (existing: default): "))
+    (should (equal seen-default "review-notes.org"))
+    (should (equal (plist-get context :instance-name) "review-notes.org"))
+    (should (equal (plist-get context :buffer-name)
+                   "*codex[ai-code-session-target:review-notes.org]*"))
+    (should (equal (plist-get context :session-key)
+                   (cons working-dir "review-notes.org")))))
+
 (ert-deftest test-ai-code-backends-infra-resolve-session-context-includes-runtime-state ()
   "Resolved session context should include target data plus buffer and process."
   (let* ((working-dir "/tmp/ai-code-session-context/")
