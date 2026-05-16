@@ -221,7 +221,26 @@ ARG is the prefix argument."
                                 (string-match-p "\\S-" clipboard-context))
                        (concat "\n\nClipboard context:\n"
                                clipboard-context)))))
-        (ai-code--insert-prompt final-prompt)))))
+         (ai-code--insert-prompt final-prompt)))))
+
+(defconst ai-code-session-checkpoint-prompt
+  (concat
+   "Please stop and output a CHECKPOINT:\n"
+   "- Goal\n"
+   "- Files changed\n"
+   "- Current hypothesis\n"
+   "- Tests/build result\n"
+   "- Blockers\n"
+   "- Recommended next action\n"
+   "Do not continue editing after this checkpoint")
+  "Prompt sent by `ai-code-session-checkpoint'.")
+
+;;;###autoload
+(defun ai-code-session-checkpoint ()
+  "Ask the active AI session to summarize its current state and stop editing."
+  (interactive)
+  (ai-code-cli-send-command ai-code-session-checkpoint-prompt)
+  (ai-code-cli-switch-to-buffer))
 
 (defun ai-code--emacs-runtime-debug-prompt (description eval-available-p)
   "Return an Emacs runtime debugging prompt from DESCRIPTION.
@@ -420,6 +439,7 @@ Shows the current backend label to the right."
 (transient-define-group ai-code--menu-other-tools
   (ai-code--infix-toggle-auto-follow-up)
   ("." "Init projectile and gtags" ai-code-init-project)
+  ("P" "AI session checkpoint" ai-code-session-checkpoint)
   ("e" "Debug exception (C-u: clipboard)" ai-code-investigate-exception)
   ("f" "Fix Flycheck errors in scope" ai-code-flycheck-fix-errors-in-scope)
   ("k" "Copy Cur File Name (C-u: full)" ai-code-copy-buffer-file-name-to-clipboard)
