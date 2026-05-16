@@ -18,12 +18,27 @@
 (defvar vterm-copy-mode-hook)
 (defvar eat-term-name)
 (defvar ghostel-set-title-function)
+(defvar ghostel-kill-buffer-on-exit)
 (defvar ghostel--copy-mode-active)
+(defvar ghostel--input-mode)
 (defvar ghostel--process)
 
 (defconst test-ai-code-backends-infra-valid-uuid
   "123e4567-e89b-12d3-a456-426614174000"
   "UUID fixture used by resume command resolution tests.")
+
+(defun test-ai-code-backends-infra--capture-default-binding (symbol)
+  "Return SYMBOL's default binding state.
+The result is a cons of whether SYMBOL is bound and its default value."
+  (if (boundp symbol)
+      (cons t (default-value symbol))
+    (cons nil nil)))
+
+(defun test-ai-code-backends-infra--restore-default-binding (symbol state)
+  "Restore SYMBOL's default binding STATE from `...--capture-default-binding'."
+  (if (car state)
+      (set-default symbol (cdr state))
+    (makunbound symbol)))
 
 (ert-deftest test-ai-code-backends-infra-output-meaningful-p-noise ()
   "Ensure terminal noise is not considered meaningful output."
@@ -66,6 +81,27 @@
     (goto-char (point-min))
     (should (re-search-forward
              "^(defcustom ai-code-backends-infra-eat-preserve-position\\_>" nil t))))
+
+(ert-deftest test-ai-code-backends-infra-ghostel-forward-declarations-do-not-set-defaults ()
+  "Ghostel forward declarations should not override Ghostel defaults."
+  (with-temp-buffer
+    (insert-file-contents "ai-code-backends-infra-ghostel.el")
+    (let (forms)
+      (condition-case nil
+          (while t
+            (push (read (current-buffer)) forms))
+        (end-of-file nil))
+      (setq forms (nreverse forms))
+      (dolist (symbol '(ghostel-kill-buffer-on-exit
+                        ghostel-set-title-function))
+        (let ((form (seq-find
+                     (lambda (sexp)
+                       (and (listp sexp)
+                            (eq (car sexp) 'defvar)
+                            (eq (cadr sexp) symbol)))
+                     forms)))
+          (should form)
+          (should (= (length form) 2)))))))
 
 (ert-deftest test-ai-code-backends-infra--resume-double-dash-prefills-uuid ()
   "A selected UUID should make `--resume' prompt with that id appended."
@@ -335,6 +371,29 @@
           (advice-remove handler #'ai-code-backends-infra--terminal-reflow-filter))
         (fmakunbound handler)))))
 
+(ert-deftest test-ai-code-backends-infra-sync-terminal-dimensions-uses-ghostel-handler ()
+  "Ghostel dimension sync should update Ghostel's terminal model before PTY size."
+  (let ((adjust-calls nil)
+        (set-size-calls nil))
+    (cl-letf (((symbol-function 'get-buffer-process)
+               (lambda (_buffer) 'ghostel-proc))
+              ((symbol-function 'window-live-p)
+               (lambda (_window) t))
+              ((symbol-function 'ghostel--window-adjust-process-window-size)
+               (lambda (process windows)
+                 (push (list process windows) adjust-calls)
+                 '(90 . 24)))
+              ((symbol-function 'set-process-window-size)
+               (lambda (process height width)
+                 (push (list process height width) set-size-calls))))
+      (with-temp-buffer
+        (setq-local ai-code-backends-infra--session-terminal-backend 'ghostel)
+        (ai-code-backends-infra--sync-terminal-dimensions
+         (current-buffer)
+         'mock-window)))
+    (should (equal adjust-calls '((ghostel-proc (mock-window)))))
+    (should (equal set-size-calls '((ghostel-proc 24 90))))))
+
 (ert-deftest test-ai-code-backends-infra-display-buffer-in-side-window-uses-body-width ()
   "Horizontal side windows should size to the configured body width."
   (with-temp-buffer
@@ -521,6 +580,9 @@
     (setq-local ghostel--copy-mode-active t)
     (should (ai-code-backends-infra--terminal-navigation-mode-p))
     (setq-local ghostel--copy-mode-active nil)
+    (setq-local ghostel--input-mode 'copy)
+    (should (ai-code-backends-infra--terminal-navigation-mode-p))
+    (setq-local ghostel--input-mode 'semi-char)
     (should-not (ai-code-backends-infra--terminal-navigation-mode-p))))
 
 (ert-deftest test-ai-code-backends-infra-configure-vterm-buffer-installs-cursor-sync-hook ()
@@ -670,6 +732,8 @@
                      (lambda (_process)
                        (lambda (_process _output)
                          (setq orig-filter-called t))))
+                    ((symbol-function 'process-sentinel)
+                     (lambda (_process) nil))
                     ((symbol-function 'set-process-filter)
                      (lambda (_process filter)
                        (setq wrapped-filter filter)))
@@ -852,7 +916,9 @@
          (buffer (get-buffer-create buffer-name))
          (process 'ghostel-proc)
          (title-tracking-before-start :unset)
-         (saved-default (default-value 'ghostel-set-title-function))
+         (saved-default
+          (test-ai-code-backends-infra--capture-default-binding
+           'ghostel-set-title-function))
          (ai-code-backends-infra-terminal-backend 'ghostel))
     (unwind-protect
         (progn
@@ -875,7 +941,48 @@
              "echo hi"
              nil)
             (should (eq title-tracking-before-start nil))))
-      (setq-default ghostel-set-title-function saved-default)
+      (test-ai-code-backends-infra--restore-default-binding
+       'ghostel-set-title-function
+       saved-default)
+      (when (buffer-live-p buffer)
+        (kill-buffer buffer)))))
+
+(ert-deftest test-ai-code-backends-infra-create-terminal-session-ghostel-disables-title-tracking-after-exec ()
+  "Ghostel startup should keep title tracking disabled after `ghostel-exec'."
+  (let* ((buffer-name "*test-ai-code-ghostel-title-tracking-after-exec*")
+         (buffer (get-buffer-create buffer-name))
+         (process 'ghostel-proc)
+         (saved-default
+          (test-ai-code-backends-infra--capture-default-binding
+           'ghostel-set-title-function))
+         (ai-code-backends-infra-terminal-backend 'ghostel))
+    (unwind-protect
+        (progn
+          (setq-default ghostel-set-title-function #'ignore)
+          (cl-letf (((symbol-function 'ai-code-backends-infra--terminal-ensure-backend)
+                     (lambda () nil))
+                    ((symbol-function 'ghostel-exec)
+                     (lambda (target-buffer _program &optional _args)
+                       (with-current-buffer target-buffer
+                         ;; `ghostel-exec' enters `ghostel-mode', which resets
+                         ;; buffer-local title-tracking state.
+                         (kill-local-variable 'ghostel-set-title-function)
+                         (setq-local ghostel--process process))
+                       process))
+                    ((symbol-function 'get-buffer-process)
+                     (lambda (target-buffer)
+                       (with-current-buffer target-buffer
+                         ghostel--process))))
+            (ai-code-backends-infra--create-terminal-session
+             buffer-name
+             default-directory
+             "echo hi"
+             nil)
+            (with-current-buffer buffer
+              (should-not ghostel-set-title-function))))
+      (test-ai-code-backends-infra--restore-default-binding
+       'ghostel-set-title-function
+       saved-default)
       (when (buffer-live-p buffer)
         (kill-buffer buffer)))))
 
@@ -914,6 +1021,47 @@
       (when (file-directory-p working-dir)
         (delete-directory working-dir t)))))
 
+(ert-deftest test-ai-code-backends-infra-create-terminal-session-ghostel-preserves-native-sentinel ()
+  "Ghostel startup should preserve Ghostel's process sentinel for chaining."
+  (let* ((buffer-name "*test-ai-code-ghostel-native-sentinel*")
+         (buffer (get-buffer-create buffer-name))
+         (proc (make-process :name "ai-code-ghostel-native-sentinel"
+                             :buffer buffer
+                             :command '("sleep" "10")
+                             :noquery t))
+         (native-sentinel (lambda (&rest _args) nil))
+         (saved-kill-default
+          (test-ai-code-backends-infra--capture-default-binding
+           'ghostel-kill-buffer-on-exit))
+         (ai-code-backends-infra-terminal-backend 'ghostel))
+    (unwind-protect
+        (progn
+          (setq-default ghostel-kill-buffer-on-exit t)
+          (set-process-sentinel proc native-sentinel)
+          (cl-letf (((symbol-function 'ai-code-backends-infra--terminal-ensure-backend)
+                     (lambda () nil))
+                    ((symbol-function 'ghostel-exec)
+                     (lambda (target-buffer _program &optional _args)
+                       (with-current-buffer target-buffer
+                         (setq-local ghostel--process proc))
+                       proc)))
+            (ai-code-backends-infra--create-terminal-session
+             buffer-name
+             default-directory
+             "echo hi"
+             nil)
+            (should (eq (process-get proc 'ai-code-backends-infra--ghostel-sentinel)
+                        native-sentinel))
+            (with-current-buffer buffer
+              (should-not ghostel-kill-buffer-on-exit))))
+      (test-ai-code-backends-infra--restore-default-binding
+       'ghostel-kill-buffer-on-exit
+       saved-kill-default)
+      (when (process-live-p proc)
+        (delete-process proc))
+      (when (buffer-live-p buffer)
+        (kill-buffer buffer)))))
+
 (ert-deftest test-ai-code-backends-infra-configure-ghostel-buffer-installs-cursor-sync-hook ()
   "Ghostel session configuration should only add AI Code local behavior."
   (let ((hook-calls nil))
@@ -934,7 +1082,9 @@
 
 (ert-deftest test-ai-code-backends-infra-configure-ghostel-buffer-disables-title-tracking ()
   "Ghostel AI session buffers should keep their original buffer names."
-  (let ((saved-default (default-value 'ghostel-set-title-function)))
+  (let ((saved-default
+         (test-ai-code-backends-infra--capture-default-binding
+          'ghostel-set-title-function)))
     (unwind-protect
         (progn
           (setq-default ghostel-set-title-function #'ignore)
@@ -948,7 +1098,9 @@
               (ai-code-backends-infra--configure-ghostel-buffer)
               (should-not ghostel-set-title-function)
               (should (eq (default-value 'ghostel-set-title-function) #'ignore)))))
-      (setq-default ghostel-set-title-function saved-default))))
+      (test-ai-code-backends-infra--restore-default-binding
+       'ghostel-set-title-function
+       saved-default))))
 
 (ert-deftest test-ai-code-backends-infra-create-terminal-session-ghostel-wraps-output-filter ()
   "Ghostel session creation should track meaningful output and linkify output."
@@ -2298,6 +2450,54 @@
                                :post-start
                                (list :remember prefix working-dir buffer)
                                (list :display buffer)))))
+      (when (buffer-live-p buffer)
+        (kill-buffer buffer)))))
+
+(ert-deftest test-ai-code-backends-infra-finalize-started-session-chains-ghostel-sentinel ()
+  "Successful startup finalization should run Ghostel's native sentinel first."
+  (let* ((working-dir "/tmp/ai-code-finalize-ghostel-sentinel/")
+         (prefix "claude")
+         (buffer-name "*claude[finalize-ghostel-sentinel]*")
+         (buffer (get-buffer-create buffer-name))
+         (process 'mock-process)
+         (process-table (make-hash-table :test 'equal))
+         (installed-sentinel nil)
+         (calls nil))
+    (unwind-protect
+        (cl-letf (((symbol-function 'process-get)
+                   (lambda (_process prop)
+                     (and (eq prop 'ai-code-backends-infra--ghostel-sentinel)
+                          (lambda (proc event)
+                            (push (list :ghostel proc event) calls)))))
+                  ((symbol-function 'set-process-sentinel)
+                   (lambda (_process fn)
+                     (setq installed-sentinel fn)))
+                  ((symbol-function 'ai-code-backends-infra--cleanup-session)
+                   (lambda (&rest _args)
+                     (push :cleanup calls)))
+                  ((symbol-function 'ai-code-backends-infra--configure-session-buffer)
+                   (lambda (&rest _args) nil))
+                  ((symbol-function 'ai-code-backends-infra--remember-session-buffer)
+                   (lambda (&rest _args) nil))
+                  ((symbol-function 'ai-code-backends-infra--display-buffer-in-side-window)
+                   (lambda (&rest _args) nil)))
+          (ai-code-backends-infra--finalize-started-session
+           buffer
+           process
+           working-dir
+           buffer-name
+           process-table
+           "default"
+           prefix
+           nil
+           nil
+           nil
+           nil)
+          (should installed-sentinel)
+          (funcall installed-sentinel process "finished\n")
+          (should (equal (nreverse calls)
+                         (list (list :ghostel process "finished\n")
+                               :cleanup))))
       (when (buffer-live-p buffer)
         (kill-buffer buffer)))))
 

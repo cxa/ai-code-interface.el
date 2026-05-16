@@ -33,7 +33,9 @@
 
 (defvar ai-code-backends-infra--session-terminal-backend)
 (defvar ghostel--copy-mode-active nil)
-(defvar ghostel-set-title-function nil)
+(defvar ghostel--input-mode)
+(defvar ghostel-kill-buffer-on-exit)
+(defvar ghostel-set-title-function)
 
 (defun ai-code-backends-infra-ghostel-ensure-backend ()
   "Ensure the Ghostel backend is available."
@@ -43,7 +45,8 @@
 
 (defun ai-code-backends-infra-ghostel-navigation-mode-p ()
   "Return non-nil when the current Ghostel buffer is in copy mode."
-  (bound-and-true-p ghostel--copy-mode-active))
+  (or (bound-and-true-p ghostel--copy-mode-active)
+      (eq ghostel--input-mode 'copy)))
 
 (defun ai-code-backends-infra-ghostel-install-navigation-cursor-sync ()
   "Install cursor synchronization for Ghostel navigation mode."
@@ -73,6 +76,7 @@
 (defun ai-code-backends-infra--configure-ghostel-buffer ()
   "Configure the current Ghostel buffer for AI Code sessions."
   (setq-local ghostel-set-title-function nil)
+  (setq-local ghostel-kill-buffer-on-exit nil)
   (ai-code-backends-infra--configure-session-input-shortcuts)
   (ai-code-backends-infra--install-navigation-cursor-sync))
 
@@ -86,7 +90,10 @@
       (cond
        ((not program) nil)
        ((fboundp 'ghostel-exec)
-        (ghostel-exec buffer program args))
+        (let ((proc (ghostel-exec buffer program args)))
+          ;; `ghostel-exec' enters `ghostel-mode', which resets local state.
+          (ai-code-backends-infra--configure-ghostel-buffer)
+          proc))
        (t
         (user-error
          "Ghostel backend requires a Ghostel version that provides `ghostel-exec`"))))))
@@ -107,6 +114,11 @@ variables for the terminal process."
         (when (processp proc)
           (ignore-errors
             (set-process-query-on-exit-flag proc nil))
+          (when-let ((sentinel (ignore-errors (process-sentinel proc))))
+            (ignore-errors
+              (process-put proc
+                           'ai-code-backends-infra--ghostel-sentinel
+                           sentinel)))
           (let ((orig-filter (process-filter proc)))
             (set-process-filter
              proc
