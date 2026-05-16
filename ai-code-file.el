@@ -628,7 +628,7 @@ Includes stored context entries for the current Git repository if available."
                                 "\n"))))))))
 
 (defun ai-code--derive-ddd-context-prompt (git-root)
-  "Return the default multi-line DDD context derivation prompt for GIT-ROOT."
+  "Build and return a formatted DDD context derivation prompt string for GIT-ROOT."
   (concat
    "Derive a lightweight Domain-Driven Design (DDD) style context document for this existing repository.\n"
    "Do not assume the repository already follows DDD today.\n"
@@ -654,8 +654,8 @@ Includes stored context entries for the current Git repository if available."
 ;;;###autoload
 (defun ai-code-derive-ddd-context ()
   "Ask AI to derive a lightweight DDD context document for the current repo.
-Ensures the target Markdown file exists first so the backend has a concrete
-document to create or update under `.ai.code.files/domain/`."
+The target Markdown file under `.ai.code.files/domain/` is created if it does
+not already exist, so the backend has a concrete document to create or update."
   (interactive)
   (let* ((git-root (or (ai-code--git-root)
                        (user-error "Not inside a Git repository")))
