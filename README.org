@@ -463,7 +463,7 @@ When working with multiple AI sessions, it can be useful to receive desktop noti
      Customize `ai-code-antigravity-cli-program` or `ai-code-antigravity-cli-program-switches` if you want to
      point at a different binary or pass additional flags. After that, select the backend through
      `ai-code-select-backend` or bind a helper in your config.
-     The resume command adds =--resume= automatically.
+     The resume command adds =--continue= automatically.
 
    You can add other backends by customizing the `ai-code-backends` variable.
 
