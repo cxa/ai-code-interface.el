@@ -2,6 +2,7 @@
 * Release history
 
 ** Main branch change
+- Feat: Add Antigravity CLI backend support
 - Fix: Simplify ai-code-plain-read-string to use read-string
 
 ** 1.81
