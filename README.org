@@ -13,6 +13,7 @@ An Emacs interface for AI-assisted software development. *The purpose is to prov
   - [[https://github.com/openai/codex][OpenAI Codex]]
   - [[https://docs.github.com/en/copilot/how-tos/use-copilot-agents/use-copilot-cli][GitHub Copilot CLI]]
   - [[https://github.com/google-gemini/gemini-cli][Gemini CLI]]
+  - [[https://antigravity.google/product/antigravity-cli][Antigravity CLI]]
   - [[https://github.com/anthropics/claude-code][Claude Code]]
   - [[https://opencode.ai/][Opencode]]
   - [[https://kilo.ai/][Kilo]]
@@ -119,7 +120,7 @@ Enable installation of packages from MELPA by adding an entry to package-archive
 - `magit`: Git integration
 - `transient`: For the menu system
 - One of vterm (default), eat, or [[https://github.com/dakra/ghostel][ghostel]] needs to be installed to support native AI coding CLI backends, depending on `ai-code-backends-infra-terminal-backend`.
-- [[https://github.com/dakra/ghostel][ghostel]] is also supported as an *experimental* native backend infra option.
+- [[https://github.com/dakra/ghostel][ghostel]] is a newly supported native backend infra option.
   - Ghostel is an Emacs terminal emulator powered by libghostty-vt, the VT engine from Ghostty.
   - [[https://github.com/dakra/ghostel][ghostel]] is under active development, please install the latest version.
   - To try it:
