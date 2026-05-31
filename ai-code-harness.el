@@ -164,15 +164,14 @@ When INLINE is non-nil, use the inline-formatted diagnostics instruction."
            (file-path (expand-file-name
                        (ai-code--auto-test-harness-file-name type)
                        directory)))
-      (unless (file-exists-p file-path)
-        (with-temp-file file-path
-          (insert content)
-          (unless (bolp)
-            (insert "\n"))))
+      (with-temp-file file-path
+        (insert content)
+        (unless (bolp)
+          (insert "\n")))
       file-path)))
 
 (defun ai-code--auto-test-harness-reference-suffix (type)
-  "Return a short suffix that references the cached harness file for TYPE.
+  "Return a short suffix that references the local harness file for TYPE.
 
 If the harness file cannot be prepared, fall back to the inline suffix."
   (condition-case err
