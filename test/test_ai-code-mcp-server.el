@@ -627,6 +627,191 @@ DIAGNOSTICS is an expression returning a list of mock diagnostic structs."
         (kill-buffer session-buffer))
       (delete-directory project-dir t))))
 
+(ert-deftest ai-code-test-mcp-diagnostics-baseline-response-omits-files ()
+  "Recording a baseline must not echo the full diagnostics list into context.
+The baseline is stored server-side, so the tool response only needs a status
+and summary; returning every diagnostic would bloat the model context."
+  (let* ((project-dir (make-temp-file "ai-code-mcp-baseline-omit-" t))
+         (file-path (expand-file-name "sample.el" project-dir))
+         (session-buffer (generate-new-buffer " *ai-code-mcp-baseline-omit*"))
+         (ai-code-mcp-server-tools nil)
+         (ai-code-mcp--sessions (make-hash-table :test 'equal))
+         (ai-code-mcp--diagnostics-baselines (make-hash-table :test 'equal))
+         (ai-code-mcp--current-session-id "session-baseline-omit")
+         visited-buffer)
+    (unwind-protect
+        (progn
+          (with-temp-file file-path (insert "(message \"alpha\")\n"))
+          (setq visited-buffer (find-file-noselect file-path t))
+          (with-current-buffer visited-buffer
+            (setq-local flymake-mode t)
+            (ai-code-mcp-register-session
+             "session-baseline-omit" project-dir session-buffer)
+            (ai-code-test-mcp--with-flymake-diagnostics
+                (list (make-ai-code-test-mcp-mock-diagnostic
+                       :beg (point-min) :end (line-end-position)
+                       :type :warning :text "Existing problem"
+                       :backend 'mock-backend))
+              (let ((baseline (ai-code-test-mcp--read-json
+                               (ai-code-test-mcp--content-text
+                                (ai-code-mcp-dispatch
+                                 "tools/call"
+                                 '((name . "diagnostics_baseline")
+                                   (arguments . ())))))))
+                ;; The baseline is recorded server-side, not in the response body.
+                (should (equal "baseline_recorded"
+                               (alist-get 'status baseline)))
+                ;; So the response must not echo the project diagnostics list.
+                (should (= 0 (length (alist-get 'files baseline))))))))
+      (when (buffer-live-p visited-buffer)
+        (kill-buffer visited-buffer))
+      (when (buffer-live-p session-buffer)
+        (kill-buffer session-buffer))
+      (delete-directory project-dir t))))
+
+(ert-deftest ai-code-test-mcp-diagnostics-baseline-response-includes-next-actions ()
+  "The baseline response should carry a structured next action for the harness loop.
+Per the observation contract, the follow-up step (edit, then verify with
+since=\"baseline\") belongs in `next_actions', not only in the summary prose."
+  (let* ((project-dir (make-temp-file "ai-code-mcp-baseline-actions-" t))
+         (file-path (expand-file-name "sample.el" project-dir))
+         (session-buffer (generate-new-buffer " *ai-code-mcp-baseline-actions*"))
+         (ai-code-mcp-server-tools nil)
+         (ai-code-mcp--sessions (make-hash-table :test 'equal))
+         (ai-code-mcp--diagnostics-baselines (make-hash-table :test 'equal))
+         (ai-code-mcp--current-session-id "session-baseline-actions")
+         visited-buffer)
+    (unwind-protect
+        (progn
+          (with-temp-file file-path (insert "(message \"alpha\")\n"))
+          (setq visited-buffer (find-file-noselect file-path t))
+          (with-current-buffer visited-buffer
+            (setq-local flymake-mode t)
+            (ai-code-mcp-register-session
+             "session-baseline-actions" project-dir session-buffer)
+            (ai-code-test-mcp--with-flymake-diagnostics
+                (list (make-ai-code-test-mcp-mock-diagnostic
+                       :beg (point-min) :end (line-end-position)
+                       :type :warning :text "Existing problem"
+                       :backend 'mock-backend))
+              (let* ((baseline (ai-code-test-mcp--read-json
+                                (ai-code-test-mcp--content-text
+                                 (ai-code-mcp-dispatch
+                                  "tools/call"
+                                  '((name . "diagnostics_baseline")
+                                    (arguments . ()))))))
+                     (actions (alist-get 'next_actions baseline)))
+                (should (equal "baseline_recorded" (alist-get 'status baseline)))
+                ;; The harness's follow-up step is exposed as a structured action.
+                (should (> (length actions) 0))
+                (should (string-match-p "since=\"baseline\"" (aref actions 0)))))))
+      (when (buffer-live-p visited-buffer)
+        (kill-buffer visited-buffer))
+      (when (buffer-live-p session-buffer)
+        (kill-buffer session-buffer))
+      (delete-directory project-dir t))))
+
+(ert-deftest ai-code-test-mcp-diagnostics-truncation-note-is-context-aware ()
+  "The truncation note must not circularly suggest since=\"baseline\" in a delta
+report (the caller already uses it); it points to per-file (uri) narrowing
+instead.  The current report may still offer since=\"baseline\" to focus on
+newly introduced diagnostics."
+  (let* ((ai-code-mcp-diagnostics-max-report-diagnostics 1)
+         (entries (list `((uri . "file:///tmp/a.el")
+                          (diagnostics . ,(vector
+                                           (ai-code-mcp--make-diagnostic 1 0 1 1 'warning "checker" "one")
+                                           (ai-code-mcp--make-diagnostic 2 0 2 1 'warning "checker" "two"))))))
+         (delta-summary (alist-get 'summary
+                                   (ai-code-mcp--diagnostics-envelope entries 'delta)))
+         (current-summary (alist-get 'summary
+                                     (ai-code-mcp--diagnostics-envelope entries 'current))))
+    ;; Both reports are truncated and point to per-file (uri) narrowing.
+    (should (string-match-p "uri" delta-summary))
+    (should (string-match-p "uri" current-summary))
+    ;; The delta note must NOT tell the caller to use since="baseline" again.
+    (should-not (string-match-p "since=\"baseline\"" delta-summary))
+    ;; The current note may still offer since="baseline" (to focus on regressions).
+    (should (string-match-p "since=\"baseline\"" current-summary))))
+
+(ert-deftest ai-code-test-mcp-diagnostics-max-report-type-is-non-negative ()
+  "The diagnostics cap customization should restrict input to non-negative integers.
+A negative maximum is meaningless and would silently hide every diagnostic."
+  (let ((type (get 'ai-code-mcp-diagnostics-max-report-diagnostics 'custom-type)))
+    (should (memq 'natnum (flatten-tree type)))
+    (should-not (memq 'integer (flatten-tree type)))))
+
+(ert-deftest ai-code-test-mcp-diagnostics-envelope-truncates-large-reports ()
+  "The diagnostics envelope caps `files' so a large report cannot overflow context."
+  (let* ((ai-code-mcp-diagnostics-max-report-diagnostics 2)
+         (entries
+          (list `((uri . "file:///tmp/a.el")
+                  (diagnostics . ,(vector
+                                   (ai-code-mcp--make-diagnostic 1 0 1 1 'warning "checker" "one")
+                                   (ai-code-mcp--make-diagnostic 2 0 2 1 'warning "checker" "two")
+                                   (ai-code-mcp--make-diagnostic 3 0 3 1 'warning "checker" "three"))))
+                `((uri . "file:///tmp/b.el")
+                  (diagnostics . ,(vector
+                                   (ai-code-mcp--make-diagnostic 1 0 1 1 'error "checker" "four"))))))
+         (envelope (ai-code-mcp--diagnostics-envelope entries 'current))
+         (files (alist-get 'files envelope))
+         (shown (apply #'+ (mapcar (lambda (entry)
+                                     (length (alist-get 'diagnostics entry)))
+                                   (append files nil))))
+         (summary (alist-get 'summary envelope))
+         (actions (alist-get 'next_actions envelope)))
+    ;; Only the first `limit' diagnostics are listed (and actions follow them) ...
+    (should (= 2 shown))
+    (should (= 2 (length actions)))
+    ;; ... while the true totals and the truncation are reported in the summary.
+    (should (string-match-p "4 diagnostic" summary))
+    (should (string-match-p "2 of 4" summary))))
+
+(ert-deftest ai-code-test-mcp-diagnostics-baseline-summary-reports-top-sources ()
+  "The baseline summary names the dominant diagnostic sources without listing them.
+This keeps a useful signal about what produces the baseline noise even though
+the full diagnostics list is intentionally omitted from the response."
+  (let* ((project-dir (make-temp-file "ai-code-mcp-baseline-sources-" t))
+         (file-path (expand-file-name "sample.el" project-dir))
+         (session-buffer (generate-new-buffer " *ai-code-mcp-baseline-sources*"))
+         (ai-code-mcp-server-tools nil)
+         (ai-code-mcp--sessions (make-hash-table :test 'equal))
+         (ai-code-mcp--diagnostics-baselines (make-hash-table :test 'equal))
+         (ai-code-mcp--current-session-id "session-baseline-sources")
+         visited-buffer)
+    (unwind-protect
+        (progn
+          (with-temp-file file-path (insert "(message \"alpha\")\n"))
+          (setq visited-buffer (find-file-noselect file-path t))
+          (with-current-buffer visited-buffer
+            (setq-local flymake-mode t)
+            (ai-code-mcp-register-session
+             "session-baseline-sources" project-dir session-buffer)
+            (ai-code-test-mcp--with-flymake-diagnostics
+                (list (make-ai-code-test-mcp-mock-diagnostic
+                       :beg (point-min) :end (point-min)
+                       :type :warning :text "style one" :backend 'checkdoc)
+                      (make-ai-code-test-mcp-mock-diagnostic
+                       :beg (point-min) :end (point-min)
+                       :type :warning :text "style two" :backend 'checkdoc)
+                      (make-ai-code-test-mcp-mock-diagnostic
+                       :beg (point-min) :end (point-min)
+                       :type :error :text "compile one" :backend 'byte-compile))
+              (let ((summary (alist-get
+                              'summary
+                              (ai-code-test-mcp--read-json
+                               (ai-code-test-mcp--content-text
+                                (ai-code-mcp-dispatch
+                                 "tools/call"
+                                 '((name . "diagnostics_baseline")
+                                   (arguments . ()))))))))
+                (should (string-match-p "Top sources:" summary))
+                (should (string-match-p "checkdoc (2)" summary))))))
+      (when (buffer-live-p visited-buffer)
+        (kill-buffer visited-buffer))
+      (when (buffer-live-p session-buffer)
+        (kill-buffer session-buffer))
+      (delete-directory project-dir t))))
+
 (ert-deftest ai-code-test-mcp-get-diagnostics-since-baseline-reports-regression ()
   "Diagnostics that appear after the baseline are reported as a regression."
   (let* ((project-dir (make-temp-file "ai-code-mcp-baseline-regression-" t))
