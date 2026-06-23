@@ -7,6 +7,9 @@
 
 ;;; Code:
 
+(defvar magit-mode-map (make-sparse-keymap)
+  "Stub variable for test configuration.")
+
 (defun magit-toplevel (&optional _dir)
   "Return nil in the lightweight test stub."
   nil)

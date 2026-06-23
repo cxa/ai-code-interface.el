@@ -35,6 +35,7 @@ the terminal backend infrastructure.")
 
 (declare-function yas-load-directory "yasnippet" (dir))
 (declare-function yas-minor-mode "yasnippet")
+(declare-function ai-code-implement-todo "ai-code-change" (arg &optional default-action))
 (declare-function ai-code-cli-send-command "ai-code-backends" (command))
 (declare-function ai-code-cli-switch-to-buffer "ai-code-backends" ())
 (declare-function gptel-request "gptel" (prompt &rest args))
@@ -537,27 +538,34 @@ Special commands:
 
 ;;;###autoload
 (defun ai-code-prompt-send-block ()
-  "Send the current text block (paragraph) to the AI service.
-The block is the text separated by blank lines.
-It trims leading/trailing whitespace."
+  "Send context-aware action in prompt mode.
+Following issue #404 behavior:
+1. If cursor is on an Org section headline, call `ai-code-implement-todo`.
+2. If there is a selected region, send the selected region to the AI session.
+3. Otherwise, fallback to the existing `org-mode` `C-c C-c` action (`org-ctrl-c-ctrl-c`)."
   (interactive)
-  ;; DONE: use save-excursion, mark-paragraph to get the block-text
-  (let* ((block-text (save-excursion
-                       (save-mark-and-excursion
-                         (ai-code--mark-prompt-block)
-                         (buffer-substring-no-properties (region-beginning)
-                                                         (region-end)))))
-         (trimmed-text (when block-text (string-trim block-text))))
-    (if (and trimmed-text (string-match-p "\\S-" trimmed-text))
-        (if (and buffer-file-name
-                 (string= (file-name-nondirectory buffer-file-name)
-                          ai-code-prompt-file-name))
-            (ai-code--send-prompt trimmed-text)
-          (when-let ((edited-prompt
-                      (ai-code-read-string "Confirm and edit prompt before sending: "
-                                           trimmed-text)))
-            (ai-code--insert-prompt edited-prompt)))
-      (message "No text in the current block to send."))))
+  (cond
+   ((and (derived-mode-p 'org-mode)
+         (org-at-heading-p))
+    (call-interactively #'ai-code-implement-todo))
+   ((use-region-p)
+    (let* ((block-text (buffer-substring-no-properties (region-beginning)
+                                                       (region-end)))
+           (trimmed-text (when block-text (string-trim block-text))))
+      (if (and trimmed-text (string-match-p "\\S-" trimmed-text))
+          (if (and buffer-file-name
+                   (string= (file-name-nondirectory buffer-file-name)
+                            ai-code-prompt-file-name))
+              (ai-code--send-prompt trimmed-text)
+            (when-let ((edited-prompt
+                        (ai-code-read-string "Confirm and edit prompt before sending: "
+                                             trimmed-text)))
+              (ai-code--insert-prompt edited-prompt)))
+        (message "No text in the selected region to send."))))
+   (t
+    (if (fboundp 'org-ctrl-c-ctrl-c)
+        (call-interactively #'org-ctrl-c-ctrl-c)
+      (user-error "org-ctrl-c-ctrl-c is not defined")))))
 
 (defun ai-code--mark-prompt-block ()
   "Mark the current prompt block.

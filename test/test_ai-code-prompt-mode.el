@@ -121,7 +121,10 @@ evaluates BODY, and ensures everything is cleaned up afterward."
                    "edited prompt"))
                 ((symbol-function 'ai-code--insert-prompt)
                  (lambda (&rest _args)
-                   (setq insert-called t))))
+                   (setq insert-called t)))
+                ((symbol-function 'use-region-p) (lambda () t))
+                ((symbol-function 'region-beginning) (lambda () (point-min)))
+                ((symbol-function 'region-end) (lambda () (+ (point-min) 17))))
         (ai-code-prompt-send-block)))
     (should (string= sent-prompt "line one\nline two"))
     (should-not read-called)
@@ -145,7 +148,10 @@ evaluates BODY, and ensures everything is cleaned up afterward."
                    (setq inserted-prompt prompt)))
                 ((symbol-function 'ai-code--send-prompt)
                  (lambda (&rest _args)
-                   (setq sent-directly t))))
+                   (setq sent-directly t)))
+                ((symbol-function 'use-region-p) (lambda () t))
+                ((symbol-function 'region-beginning) (lambda () (point-min)))
+                ((symbol-function 'region-end) (lambda () (+ (point-min) 17))))
         (ai-code-prompt-send-block)))
     (should (equal read-args
                    '("Confirm and edit prompt before sending: "
@@ -153,6 +159,34 @@ evaluates BODY, and ensures everything is cleaned up afterward."
                      nil)))
     (should (string= inserted-prompt "edited prompt"))
     (should-not sent-directly)))
+
+(ert-deftest ai-code-test-prompt-send-block-on-org-headline-calls-implement-todo ()
+  "Test that running send block on Org headline triggers `ai-code-implement-todo`."
+  (let ((implement-called nil))
+    (with-temp-buffer
+      (org-mode)
+      (insert "* TODO Implement feature x")
+      (goto-char (point-min))
+      (cl-letf (((symbol-function 'ai-code-implement-todo)
+                 (lambda (&rest _args)
+                   (interactive)
+                   (setq implement-called t))))
+        (ai-code-prompt-send-block)))
+    (should implement-called)))
+
+(ert-deftest ai-code-test-prompt-send-block-fallback-to-org-ctrl-c-ctrl-c ()
+  "Test that running send block without headline or region falls back to `org-ctrl-c-ctrl-c`."
+  (let ((fallback-called nil))
+    (with-temp-buffer
+      (org-mode)
+      (insert "some random text")
+      (goto-char (point-min))
+      (cl-letf (((symbol-function 'org-ctrl-c-ctrl-c)
+                 (lambda (&rest _args)
+                   (interactive)
+                   (setq fallback-called t))))
+        (ai-code-prompt-send-block)))
+    (should fallback-called)))
 
 (ert-deftest ai-code-test-search-notes-with-ai-includes-task-and-additional-scopes ()
   "Test that note search always includes task files and can add note paths."
