@@ -16,6 +16,7 @@
   (defun magit-git-lines (&rest _args) nil)
   (provide 'magit))
 (require 'ai-code-file)
+(require 'ai-code-task)
 (require 'cl-lib)
 
 (defvar ai-code-use-prompt-suffix)

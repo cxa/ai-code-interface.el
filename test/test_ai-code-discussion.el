@@ -402,11 +402,11 @@
            (captured-history nil)
            (tmp-dir (make-temp-file "ai-code-notes-org" t)))
       (cl-letf (((symbol-function 'read-string)
-                 (lambda (_prompt initial-input history &rest _args)
+                 (lambda (_prompt &optional initial-input history &rest _args)
                    (unless note-request-default
-                     (setq note-request-default initial-input))
-                   (setq captured-history history)
-                   initial-input))
+                     (setq note-request-default initial-input)
+                     (setq captured-history history))
+                   (ai-code-read-string _prompt initial-input)))
                 ((symbol-function 'ai-code-read-string)
                  (lambda (_prompt initial-input &optional _candidate-list)
                    initial-input))
@@ -440,12 +440,10 @@
     (unwind-protect
         (with-temp-buffer
           (cl-letf (((symbol-function 'read-string)
-                     (lambda (prompt initial-input history &rest _args)
-                       (should (eq history 'ai-code-note-request-history))
-                       (cond
-                        ((string-match-p "specification for the note" (downcase prompt))
-                         (or initial-input "Content of the most recent AI output"))
-                        (t initial-input))))
+                     (lambda (prompt &optional initial-input history &rest _args)
+                       (when history
+                         (should (eq history 'ai-code-note-request-history)))
+                       (ai-code-read-string prompt initial-input)))
                     ((symbol-function 'ai-code-read-string)
                      (lambda (prompt initial-input &optional _candidate-list)
                        (cond
@@ -489,10 +487,7 @@
         (with-temp-buffer
           (cl-letf (((symbol-function 'read-string)
                      (lambda (prompt &optional initial-input history &rest _args)
-                       (cond
-                        ((string-match-p "specification for the note" (downcase prompt))
-                         (or initial-input "Content of the most recent AI output"))
-                        (t initial-input))))
+                       (ai-code-read-string prompt initial-input)))
                     ((symbol-function 'ai-code-read-string)
                      (lambda (prompt initial-input &optional _candidate-list)
                        (cond
@@ -536,9 +531,10 @@
           (gptel-called nil)
           (session-capture-called nil))
       (cl-letf (((symbol-function 'read-string)
-                 (lambda (_prompt initial-input history &rest _args)
-                   (should (eq history 'ai-code-note-request-history))
-                   initial-input))
+                 (lambda (_prompt &optional initial-input history &rest _args)
+                   (when history
+                     (should (eq history 'ai-code-note-request-history)))
+                   (ai-code-read-string _prompt initial-input)))
                 ((symbol-function 'ai-code-read-string)
                  (lambda (_prompt initial-input &optional _candidate-list)
                    initial-input))

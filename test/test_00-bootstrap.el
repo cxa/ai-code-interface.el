@@ -38,6 +38,16 @@
 (ai-code-test--prefer-packaged-library "transient")
 (ai-code-test--remove-shadowing-compat-libraries)
 
+(defvar ai-code-test--in-read-string-advice nil)
+
+(advice-add 'read-string :around
+            (lambda (orig-fun prompt &optional initial-input &rest args)
+              (if (and (not ai-code-test--in-read-string-advice)
+                       (fboundp 'ai-code-read-string))
+                  (let ((ai-code-test--in-read-string-advice t))
+                    (apply #'ai-code-read-string prompt initial-input args))
+                (apply orig-fun prompt initial-input args))))
+
 (provide 'test_00-bootstrap)
 
 ;;; test_00-bootstrap.el ends here

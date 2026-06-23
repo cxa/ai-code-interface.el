@@ -239,7 +239,7 @@ Return (CAPTURED-PROMPT DIFF-CALLED)."
                  (push prompt captured-read-string-prompts)
                  (if (string= prompt "PR title (optional, leave empty for AI to generate): ")
                      ""
-                   initial-input)))
+                   (ai-code-read-string prompt initial-input))))
               ((symbol-function 'y-or-n-p)
                (lambda (_prompt) nil))
               ((symbol-function 'ai-code--insert-prompt)
