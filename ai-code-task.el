@@ -93,10 +93,21 @@ Returns a filename with .org suffix."
   (insert task-name)
   (insert "\n\n* Investigation\n\n")
   (insert
-   "# Enter your prompts here. After that,\n# Select them and use C-c a SPC (ai-code-send-command) to send to AI\n")
+   "# Enter prompts here. Use @ for file path completion.\n")
   (insert
-   "#   Or You use C-c C-c (ai-code-prompt-send-block) to send the whole prompt block to AI\n\n")
-  (insert "# Use C-c a n (ai-code-take-notes) to copy notes back from AI session\n\n")
+   "# Select text and use C-c a SPC (ai-code-send-command) to send it to AI.\n")
+  (insert
+   "# Use C-c a i on a heading to run ai-code-implement-todo for the whole section.\n")
+  (insert
+   "# Use C-c C-c on a heading to send whole section to ai coding session.\n")
+  (insert
+   "#   or use it with an active region to send that region as a prompt block.\n")
+  (insert
+   "# Use C-c a H to append a backend-neutral handoff\n")
+  (insert
+   "#   or use it on a heading to load the handoff into ai coding session,\n")
+  (insert
+   "#   or C-u C-c a H to load the whole task file into a new backend session.\n")
   (insert "\n\n* Code Change\n\n"))
 
 (defun ai-code--open-or-create-task-file (task-file confirmed-filename task-name task-url)
