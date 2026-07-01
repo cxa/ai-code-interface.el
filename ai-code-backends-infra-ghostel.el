@@ -25,6 +25,8 @@
                   "ai-code-backends-infra" (buffer directory))
 (declare-function ai-code-backends-infra--sync-terminal-cursor
                   "ai-code-backends-infra" ())
+(declare-function ai-code-session-update-metadata
+                  "ai-code-session" (id-or-buffer metadata))
 (declare-function ghostel-exec "ghostel" (buffer program &optional args))
 (declare-function ghostel-send-key "ghostel" (key-name &optional mods))
 (declare-function ghostel-send-string "ghostel" (string))
@@ -34,10 +36,16 @@
 
 (defvar ai-code-backends-infra--session-terminal-backend)
 (eval-when-compile
+  (defvar ghostel-command-finish-functions)
+  (defvar ghostel-command-start-functions)
   (defvar ghostel-kill-buffer-on-exit)
+  (defvar ghostel-progress-function)
   (defvar ghostel-set-title-function)
   (defvar ghostel--copy-mode-active)
   (defvar ghostel--input-mode))
+
+(defvar-local ai-code-backends-infra-ghostel--progress-function nil
+  "Original Ghostel progress function captured before AI Code wrapping.")
 
 (defun ai-code-backends-infra-ghostel-ensure-backend ()
   "Ensure the Ghostel backend is available."
@@ -54,6 +62,83 @@
   "Install cursor synchronization for Ghostel navigation mode."
   (add-hook 'post-command-hook
             #'ai-code-backends-infra--sync-terminal-cursor nil t))
+
+(defun ai-code-backends-infra-ghostel--ai-session-buffer-p (&optional buffer)
+  "Return non-nil when BUFFER is an AI Code Ghostel session buffer."
+  (when (buffer-live-p (or buffer (current-buffer)))
+    (with-current-buffer (or buffer (current-buffer))
+      (eq ai-code-backends-infra--session-terminal-backend 'ghostel))))
+
+(defun ai-code-backends-infra-ghostel--update-session-metadata (buffer metadata)
+  "Merge METADATA into the AI Code session associated with BUFFER."
+  (when (and (buffer-live-p buffer)
+             (fboundp 'ai-code-session-update-metadata)
+             (ai-code-backends-infra-ghostel--ai-session-buffer-p buffer))
+    (with-current-buffer buffer
+      (ai-code-session-update-metadata buffer metadata))))
+
+(defun ai-code-backends-infra-ghostel--command-start (buffer)
+  "Record a Ghostel OSC 133 command-start event for BUFFER."
+  (ai-code-backends-infra-ghostel--update-session-metadata
+   buffer
+   (list :ghostel-command-state 'started
+         :ghostel-command-started-at (float-time)
+         :ghostel-command-finished-at nil
+         :ghostel-command-exit-status nil
+         :ghostel-status 'running)))
+
+(defun ai-code-backends-infra-ghostel--command-finish (buffer exit-status)
+  "Record a Ghostel OSC 133 command-finish event for BUFFER.
+EXIT-STATUS is the status reported by Ghostel, or nil when unavailable."
+  (ai-code-backends-infra-ghostel--update-session-metadata
+   buffer
+   (list :ghostel-command-state 'finished
+         :ghostel-command-finished-at (float-time)
+         :ghostel-command-exit-status exit-status
+         :ghostel-status (if (and exit-status (/= exit-status 0))
+                              'error
+                            'idle))))
+
+(defun ai-code-backends-infra-ghostel--progress-status (state)
+  "Return an AI Code status symbol for Ghostel progress STATE."
+  (pcase state
+    ('remove 'idle)
+    ('error 'error)
+    ('pause 'paused)
+    ((or 'set 'indeterminate) 'running)
+    (_ 'running)))
+
+(defun ai-code-backends-infra-ghostel--progress (state progress)
+  "Record a Ghostel OSC 9;4 progress report and delegate to Ghostel.
+STATE and PROGRESS use the signature of `ghostel-progress-function'."
+  (when (ai-code-backends-infra-ghostel--ai-session-buffer-p)
+    (ai-code-backends-infra-ghostel--update-session-metadata
+     (current-buffer)
+     (list :ghostel-progress-state state
+           :ghostel-progress-value progress
+           :ghostel-progress-updated-at (float-time)
+           :ghostel-status
+           (ai-code-backends-infra-ghostel--progress-status state))))
+  (when (and ai-code-backends-infra-ghostel--progress-function
+             (not (eq ai-code-backends-infra-ghostel--progress-function
+                      #'ai-code-backends-infra-ghostel--progress)))
+    (funcall ai-code-backends-infra-ghostel--progress-function state progress)))
+
+(defun ai-code-backends-infra-ghostel--install-lifecycle-hooks ()
+  "Install Ghostel lifecycle hooks for the current AI Code session."
+  (when (boundp 'ghostel-command-start-functions)
+    (add-hook 'ghostel-command-start-functions
+              #'ai-code-backends-infra-ghostel--command-start nil t))
+  (when (boundp 'ghostel-command-finish-functions)
+    (add-hook 'ghostel-command-finish-functions
+              #'ai-code-backends-infra-ghostel--command-finish nil t))
+  (when (boundp 'ghostel-progress-function)
+    (unless (eq ghostel-progress-function
+                #'ai-code-backends-infra-ghostel--progress)
+      (setq-local ai-code-backends-infra-ghostel--progress-function
+                  ghostel-progress-function))
+    (setq-local ghostel-progress-function
+                #'ai-code-backends-infra-ghostel--progress)))
 
 (defun ai-code-backends-infra-ghostel-send-string (string &optional paste)
   "Send STRING to the current Ghostel process.
@@ -82,6 +167,7 @@ If PASTE is non-nil, send it as a pasted string."
   "Configure the current Ghostel buffer for AI Code sessions."
   (setq-local ghostel-set-title-function nil)
   (setq-local ghostel-kill-buffer-on-exit nil)
+  (ai-code-backends-infra-ghostel--install-lifecycle-hooks)
   (ai-code-backends-infra--configure-session-input-shortcuts)
   (ai-code-backends-infra--install-navigation-cursor-sync))
 
