@@ -2,6 +2,8 @@
 * Release history
 
 ** Main branch change
+- Chore: Prompt for working directory on prefixed AI CLI start/resume
+- Fix: [codex] Normalize vterm dim SGR foreground, by cxa
 - Feat: Add C4 PlantUML architecture document derivation
 - Chore: Support optional editor context in GitHub issue investigation
 - Feat: improve gptel sync request timeout, truncation, and retry
