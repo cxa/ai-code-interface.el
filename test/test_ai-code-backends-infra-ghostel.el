@@ -17,6 +17,9 @@
 (defvar ghostel-progress-function)
 (defvar ghostel-set-title-function)
 (defvar ghostel-kill-buffer-on-exit)
+(defvar ghostel-kitty-graphics-mediums)
+(defvar ghostel--plain-link-detection-begin)
+(defvar ghostel--plain-link-detection-end)
 (defvar ai-code-backends-infra--session-directory)
 
 (ert-deftest test-ai-code-backends-infra-ghostel-create-session-restores-ai-state ()
@@ -78,6 +81,193 @@
                 #'ai-code-backends-infra-ghostel--progress))
     (should (eq ai-code-backends-infra-ghostel--progress-function
                 #'ignore))))
+
+(ert-deftest test-ai-code-backends-infra-ghostel-configures-visible-image-hook ()
+  "Ghostel AI session configuration should install visible image recovery."
+  (with-temp-buffer
+    (setq-local ai-code-backends-infra--session-terminal-backend 'ghostel)
+    (cl-letf (((symbol-function 'ai-code-backends-infra--configure-session-input-shortcuts)
+               (lambda () nil))
+              ((symbol-function 'ai-code-backends-infra--install-navigation-cursor-sync)
+               (lambda () nil)))
+      (ai-code-backends-infra--configure-ghostel-buffer))
+    (should (memq #'ai-code-backends-infra-ghostel--window-scroll
+                  window-scroll-functions))))
+
+(ert-deftest test-ai-code-backends-infra-ghostel-configures-image-mediums ()
+  "Ghostel AI session configuration should enable local image mediums."
+  (with-temp-buffer
+    (let ((ai-code-backends-infra-ghostel-kitty-graphics-mediums
+           '(file temp-file))
+          (original-bound (boundp 'ghostel-kitty-graphics-mediums))
+          (original-value (and (boundp 'ghostel-kitty-graphics-mediums)
+                               ghostel-kitty-graphics-mediums)))
+      (unwind-protect
+          (progn
+            (setq ghostel-kitty-graphics-mediums '(shared-mem))
+            (setq-local ai-code-backends-infra--session-terminal-backend 'ghostel)
+            (cl-letf (((symbol-function 'ai-code-backends-infra--configure-session-input-shortcuts)
+                       (lambda () nil))
+                      ((symbol-function 'ai-code-backends-infra--install-navigation-cursor-sync)
+                       (lambda () nil)))
+              (ai-code-backends-infra--configure-ghostel-buffer))
+            (should (equal ghostel-kitty-graphics-mediums
+                           '(file temp-file shared-mem))))
+        (if original-bound
+            (setq ghostel-kitty-graphics-mediums original-value)
+          (makunbound 'ghostel-kitty-graphics-mediums))))))
+
+(ert-deftest test-ai-code-backends-infra-ghostel-visible-linkify-restores-image-preview ()
+  "Visible Ghostel image linkification should restore inline image previews."
+  (let* ((root (make-temp-file "ai-code-ghostel-history-image-" t))
+         (image-file (expand-file-name "history.png" root)))
+    (unwind-protect
+        (progn
+          (with-temp-file image-file
+            (insert "fake image bytes"))
+          (cl-letf (((symbol-function 'display-images-p)
+                     (lambda (&optional _display) t))
+                    ((symbol-function 'create-image)
+                     (lambda (file &rest args)
+                       (list :image file :args args))))
+            (with-temp-buffer
+              (setq-local ai-code-backends-infra--session-directory root)
+              (setq-local ai-code-backends-infra--session-terminal-backend
+                          'ghostel)
+              (insert "Restored history\n")
+              (insert "history.png\n")
+              (ai-code-session-link--linkify-strict-image-preview-region
+               (point-min) (point-max))
+              (should
+               (= (length
+                   (cl-remove-if-not
+                    (lambda (overlay)
+                      (overlay-get overlay 'ai-code-session-image-preview))
+                    (overlays-in (point-min) (point-max))))
+                  1)))))
+      (when (file-directory-p root)
+        (delete-directory root t)))))
+
+(ert-deftest test-ai-code-backends-infra-ghostel-schedules-visible-linkify ()
+  "Visible image linkification should schedule bounded window scans."
+  (let (scheduled)
+    (with-temp-buffer
+      (set-window-buffer (selected-window) (current-buffer))
+      (setq-local ai-code-backends-infra--session-terminal-backend 'ghostel)
+      (let ((ai-code-backends-infra-ghostel-visible-image-linkify-delays
+             '(0.1 0.5)))
+        (cl-letf (((symbol-function 'run-at-time)
+                   (lambda (delay _repeat function &rest args)
+                     (push (list delay function args) scheduled)
+                     'mock-timer)))
+          (ai-code-backends-infra-ghostel-schedule-visible-image-linkify
+           (selected-window))
+          (should (equal (mapcar #'car (reverse scheduled))
+                         '(0.1 0.5))))))))
+
+(ert-deftest test-ai-code-backends-infra-ghostel-visible-linkify-is-bounded ()
+  "Visible image linkification should not scan the full scrollback."
+  (let (linkified)
+    (with-temp-buffer
+      (set-window-buffer (selected-window) (current-buffer))
+      (setq-local ai-code-backends-infra--session-terminal-backend 'ghostel)
+      (insert (make-string 1000 ?x))
+      (goto-char (point-min))
+      (set-window-start (selected-window) (point-min) t)
+      (let ((ai-code-backends-infra-ghostel-visible-image-linkify-max-chars
+             100))
+        (cl-letf (((symbol-function
+                    'ai-code-session-link--linkify-strict-image-preview-region)
+                   (lambda (start end)
+                     (setq linkified (cons start end)))))
+          (ai-code-backends-infra-ghostel--linkify-visible-image-previews
+           (current-buffer)
+           (selected-window))
+          (should linkified)
+          (should (<= (- (cdr linkified) (car linkified)) 100)))))))
+
+(ert-deftest test-ai-code-backends-infra-ghostel-visible-linkify-retries-same-region ()
+  "Visible image linkification should retry delayed scans for the same text."
+  (let ((scan-count 0))
+    (with-temp-buffer
+      (set-window-buffer (selected-window) (current-buffer))
+      (setq-local ai-code-backends-infra--session-terminal-backend 'ghostel)
+      (insert "history.png\n")
+      (goto-char (point-min))
+      (set-window-start (selected-window) (point-min) t)
+      (cl-letf (((symbol-function
+                  'ai-code-session-link--linkify-strict-image-preview-region)
+                 (lambda (_start _end)
+                   (setq scan-count (1+ scan-count)))))
+        (ai-code-backends-infra-ghostel--linkify-visible-image-previews
+         (current-buffer)
+         (selected-window))
+        (ai-code-backends-infra-ghostel--linkify-visible-image-previews
+         (current-buffer)
+         (selected-window))
+        (should (= scan-count 2))))))
+
+(ert-deftest test-ai-code-backends-infra-ghostel-redraw-linkify-is-bounded ()
+  "Ghostel redraw linkification should use the queued link-detection region."
+  (let (linkified original-called)
+    (with-temp-buffer
+      (setq-local ai-code-backends-infra--session-terminal-backend 'ghostel)
+      (setq-local ghostel--plain-link-detection-begin 4)
+      (setq-local ghostel--plain-link-detection-end 900)
+      (insert (make-string 1000 ?x))
+      (let ((ai-code-backends-infra-ghostel-visible-image-linkify-max-chars
+             100))
+        (cl-letf (((symbol-function
+                    'ai-code-session-link--linkify-strict-image-preview-region)
+                   (lambda (start end)
+                     (setq linkified (cons start end)))))
+          (ai-code-backends-infra-ghostel--run-queued-link-detection-around
+           (lambda (_buffer)
+             (setq original-called t))
+           (current-buffer))
+          (should original-called)
+          (should linkified)
+          (should (<= (- (cdr linkified) (car linkified)) 100)))))))
+
+(ert-deftest test-ai-code-backends-infra-ghostel-readonly-entry-schedules-visible-linkify ()
+  "Ghostel copy/emacs mode entry should schedule visible image recovery."
+  (let (scheduled)
+    (with-temp-buffer
+      (setq-local ai-code-backends-infra--session-terminal-backend 'ghostel)
+      (cl-letf (((symbol-function
+                  'ai-code-backends-infra-ghostel-schedule-visible-image-linkify-for-buffer)
+                 (lambda (&optional buffer delays)
+                   (setq scheduled (list buffer delays)))))
+        (ai-code-backends-infra-ghostel--after-readonly-command)
+        (should (equal scheduled (list (current-buffer) nil)))))))
+
+(ert-deftest test-ai-code-backends-infra-ghostel-start-process-binds-image-mediums-before-exec ()
+  "Ghostel startup should pass image mediums to `ghostel-exec' before init."
+  (with-temp-buffer
+    (let ((ai-code-backends-infra-ghostel-kitty-graphics-mediums
+           '(file temp-file))
+          (mediums-seen nil)
+          (original-bound (boundp 'ghostel-kitty-graphics-mediums))
+          (original-value (and (boundp 'ghostel-kitty-graphics-mediums)
+                               ghostel-kitty-graphics-mediums)))
+      (unwind-protect
+          (progn
+            (setq ghostel-kitty-graphics-mediums nil)
+            (cl-letf (((symbol-function 'ai-code-backends-infra--configure-session-input-shortcuts)
+                       (lambda () nil))
+                      ((symbol-function 'ai-code-backends-infra--install-navigation-cursor-sync)
+                       (lambda () nil))
+                      ((symbol-function 'ghostel-exec)
+                       (lambda (_buffer _program _args)
+                         (setq mediums-seen ghostel-kitty-graphics-mediums)
+                         nil)))
+              (ai-code-backends-infra--start-ghostel-process
+               (current-buffer) "codex --foo"))
+            (should (equal mediums-seen '(file temp-file)))
+            (should (equal ghostel-kitty-graphics-mediums '(file temp-file))))
+        (if original-bound
+            (setq ghostel-kitty-graphics-mediums original-value)
+          (makunbound 'ghostel-kitty-graphics-mediums))))))
 
 (ert-deftest test-ai-code-backends-infra-ghostel-command-lifecycle-updates-session-metadata ()
   "OSC 133 command hooks should write structured session metadata."

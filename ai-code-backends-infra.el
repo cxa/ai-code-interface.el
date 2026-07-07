@@ -224,7 +224,7 @@ to t via their post-start-fn.")
   "Return a sequence that pushes visible content into scrollback.
 Move cursor to the last row, emit enough newlines to scroll all
 visible lines into the scrollback buffer, then cursor home."
-  (let ((height (or (when-let ((win (get-buffer-window (current-buffer) t)))
+  (let ((height (or (when-let* ((win (get-buffer-window (current-buffer) t)))
                       (window-body-height win))
                     50)))
     (concat "\033[" (number-to-string height) ";1H"
@@ -551,7 +551,7 @@ When BACKEND is nil, use `ai-code-backends-infra-terminal-backend'."
 
 (defun ai-code-backends-infra--session-buffer-p (buffer)
   "Check if BUFFER belongs to an AI session."
-  (when-let ((name (if (stringp buffer) buffer (buffer-name buffer))))
+  (when-let* ((name (if (stringp buffer) buffer (buffer-name buffer))))
     (string-match-p "\\`\\*.*\\[.*\\].*\\*\\'" name)))
 
 (defun ai-code-backends-infra--terminal-reflow-filter (original-fn &rest args)
@@ -641,7 +641,11 @@ buffer is in scroll/copy mode, working around bug #1422."
     ;; The buffer may have been created with different dimensions before
     ;; being displayed in this window.
     (when (and window (buffer-live-p buffer))
-      (ai-code-backends-infra--sync-terminal-dimensions buffer window))
+      (ai-code-backends-infra--sync-terminal-dimensions buffer window)
+      (with-current-buffer buffer
+        (when (eq ai-code-backends-infra--session-terminal-backend 'ghostel)
+          (ai-code-backends-infra-ghostel-schedule-visible-image-linkify
+           window))))
     window))
 
 (defun ai-code-backends-infra--fit-side-window-body-width (window)
@@ -658,7 +662,7 @@ the buffer has been displayed in its final window, which may differ
 from the window where it was initially created."
   (when (and buffer window (buffer-live-p buffer) (window-live-p window))
     (with-current-buffer buffer
-      (when-let ((proc (get-buffer-process buffer)))
+      (when-let* ((proc (get-buffer-process buffer)))
         (let ((backend (ai-code-backends-infra--current-terminal-backend))
               (windows (or (get-buffer-window-list buffer nil t)
                            (list window))))
@@ -736,7 +740,7 @@ use the branch name."
 
 (defun ai-code-backends-infra--remember-file-session-buffer (prefix source-buffer session-buffer)
   "Remember SESSION-BUFFER as attached session for SOURCE-BUFFER and PREFIX."
-  (when-let ((key (ai-code-backends-infra--file-session-map-key prefix source-buffer)))
+  (when-let* ((key (ai-code-backends-infra--file-session-map-key prefix source-buffer)))
     (if (and session-buffer (buffer-live-p session-buffer))
         (puthash key session-buffer ai-code-backends-infra--file-session-map)
       (remhash key ai-code-backends-infra--file-session-map))))
@@ -899,7 +903,7 @@ Return a cons of (base-name . instance-name) or nil."
 
 (defun ai-code-backends-infra--session-instance-name (buffer-name prefix)
   "Return instance name for BUFFER-NAME with PREFIX."
-  (when-let ((parsed (ai-code-backends-infra--parse-session-buffer-name buffer-name prefix)))
+  (when-let* ((parsed (ai-code-backends-infra--parse-session-buffer-name buffer-name prefix)))
     (ai-code-backends-infra--normalize-instance-name (cdr parsed))))
 
 (defun ai-code-backends-infra--find-session-buffers (prefix directory)
@@ -908,10 +912,10 @@ Return a cons of (base-name . instance-name) or nil."
         (target-directory (ai-code-backends-infra--normalize-session-directory directory)))
     (cl-remove-if-not
      (lambda (buf)
-       (when-let ((parsed (ai-code-backends-infra--parse-session-buffer-name
-                           (buffer-name buf)
-                           prefix)))
-         (if-let ((buffer-directory (ai-code-backends-infra--buffer-session-directory buf)))
+       (when-let* ((parsed (ai-code-backends-infra--parse-session-buffer-name
+                            (buffer-name buf)
+                            prefix)))
+         (if-let* ((buffer-directory (ai-code-backends-infra--buffer-session-directory buf)))
              (string= (ai-code-backends-infra--normalize-session-directory buffer-directory)
                       target-directory)
            (string= (car parsed) base))))
@@ -935,8 +939,8 @@ Return a cons of (base-name . instance-name) or nil."
 (defun ai-code-backends-infra--session-buffer-matches-directory-p (buffer directory)
   "Return non-nil when BUFFER is live and still belongs to DIRECTORY."
   (and (buffer-live-p buffer)
-       (when-let ((buffer-directory
-                   (ai-code-backends-infra--buffer-session-directory buffer)))
+       (when-let* ((buffer-directory
+                    (ai-code-backends-infra--buffer-session-directory buffer)))
          (string=
           (ai-code-backends-infra--normalize-session-directory buffer-directory)
           (ai-code-backends-infra--normalize-session-directory directory)))))
@@ -968,10 +972,10 @@ Returns the selected buffer or nil if none exist."
                                 buffers))
              (choices (delq nil
                             (mapcar (lambda (buf)
-                                      (when-let ((instance
-                                                  (ai-code-backends-infra--session-instance-name
-                                                   (buffer-name buf)
-                                                   prefix)))
+                                      (when-let* ((instance
+                                                   (ai-code-backends-infra--session-instance-name
+                                                    (buffer-name buf)
+                                                    prefix)))
                                         (cons instance buf)))
                                     ordered-buffers)))
              (candidates (mapcar #'car choices))
@@ -1065,7 +1069,7 @@ any error output left behind by the CLI."
                                  "default"))
          (key (ai-code-backends-infra--session-key directory resolved-instance)))
     (remhash key process-table))
-  (when-let ((buffer (get-buffer buffer-name)))
+  (when-let* ((buffer (get-buffer buffer-name)))
     (ai-code-backends-infra--forget-session-buffer prefix directory buffer)
     (ai-code-session-unregister buffer)
     (when (buffer-live-p buffer)
@@ -1237,7 +1241,7 @@ When :prepare-launch is present, it may return :command, :cleanup-fn, and
                           (ai-code-backends-infra--session-working-directory arg)
                         (ai-code-backends-infra--session-working-directory)))
          (command (plist-get resolved :command))
-         (launch (when-let ((prepare-launch (plist-get options :prepare-launch)))
+         (launch (when-let* ((prepare-launch (plist-get options :prepare-launch)))
                    (funcall prepare-launch working-dir command)))
          (launch-command (or (plist-get launch :command) command))
          (cleanup-fn (plist-get launch :cleanup-fn))
@@ -1466,7 +1470,7 @@ When PREFIX and WORKING-DIR are provided, select from multiple sessions."
                   working-dir
                   force-prompt
                   source-buffer)))
-    (if-let ((window (get-buffer-window buffer)))
+    (if-let* ((window (get-buffer-window buffer)))
         (select-window window)
       (ai-code-backends-infra--display-buffer-in-side-window buffer))))
 
