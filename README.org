@@ -122,6 +122,9 @@ Enable installation of packages from MELPA by adding an entry to package-archive
 - One of vterm (default), eat, or [[https://github.com/dakra/ghostel][ghostel]] needs to be installed to support native AI coding CLI backends, depending on `ai-code-backends-infra-terminal-backend`.
 - [[https://github.com/dakra/ghostel][ghostel]] is a newly supported native backend infra option.
   - Ghostel is an Emacs terminal emulator powered by libghostty-vt, the VT engine from Ghostty.
+  - AI Code enables Ghostel image support for AI sessions:
+    - terminal programs can use Ghostel's Kitty graphics protocol;
+    - local image paths printed by an AI CLI (for example =screenshot.png=) are previewed inline in the session buffer.
   - [[https://github.com/dakra/ghostel][ghostel]] is under active development, please install the latest version.
   - To try it:
 
@@ -540,6 +543,23 @@ To transfer development work between different AI coding backends (e.g., from Co
 - A: Ghostel trims old output after `ghostel-max-scrollback` bytes are used. The default is 5 MB, so increase it before starting Ghostel sessions.
 #+begin_src elisp
   (setq ghostel-max-scrollback (* 20 1024 1024)) ; 20 MB
+#+end_src
+
+*** Q: How does image display work with the ghostel terminal backend?
+
+- A: Ghostel supports the Kitty graphics protocol. AI Code additionally previews local image file paths printed in Ghostel AI session buffers. You can tune this with:
+#+begin_src elisp
+  ;; Native Kitty graphics file-loading mediums for trusted local sessions.
+  (setq ai-code-backends-infra-ghostel-kitty-graphics-mediums '(file temp-file))
+
+  ;; Inline preview for image paths printed by the AI CLI.
+  (setq ai-code-session-link-ghostel-image-preview-enabled t)
+  (setq ai-code-session-link-ghostel-image-preview-max-bytes (* 10 1024 1024))
+  ;; Display caps in pixels. nil (default) fits the session window and only
+  ;; scales large images down -- small images keep their native size. Set an
+  ;; integer for a fixed hard cap instead.
+  (setq ai-code-session-link-ghostel-image-preview-max-width nil)
+  (setq ai-code-session-link-ghostel-image-preview-max-height nil)
 #+end_src
 
 *** Q: Gemini CLI response is relatively slow, how to improve?
