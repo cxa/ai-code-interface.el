@@ -9,8 +9,11 @@
 ;;; Code:
 
 (require 'cl-lib)
+(require 'image)
 (require 'project)
+(require 'rx)
 (require 'subr-x)
+(require 'url-util)
 
 (declare-function ai-code-session-navigate-link-at-mouse "ai-code-input" (event))
 (declare-function ai-code-session-navigate-link-at-point "ai-code-input" ())
@@ -20,6 +23,9 @@
 (defvar ai-code-backends-infra--session-directory nil
   "Session working directory set by ai-code-backends-infra buffers.")
 
+(defvar ai-code-backends-infra--session-terminal-backend nil
+  "Terminal backend symbol set by ai-code-backends-infra buffers.")
+
 (defcustom ai-code-session-link-enabled t
   "When non-nil, make supported links clickable in AI session buffers.
 
@@ -27,6 +33,48 @@ Disable this if you prefer to avoid the extra linkification work on
 terminal output redraw."
   :type 'boolean
   :group 'ai-code)
+
+(defcustom ai-code-session-link-ghostel-image-preview-enabled t
+  "When non-nil, preview local image file links in Ghostel AI sessions.
+
+This only affects AI session buffers managed by the Ghostel terminal backend.
+It complements Ghostel's native Kitty graphics support by previewing image
+files when an AI CLI prints a local image path such as screenshot.png."
+  :type 'boolean
+  :group 'ai-code)
+
+(defcustom ai-code-session-link-ghostel-image-preview-max-bytes
+  (* 10 1024 1024)
+  "Maximum local image file size, in bytes, previewed in Ghostel sessions."
+  :type 'integer
+  :group 'ai-code)
+
+(defcustom ai-code-session-link-ghostel-image-preview-max-width nil
+  "Maximum displayed image width for Ghostel session previews, in pixels.
+When nil, previews fit the session window's body width.  Previews only ever
+scale down, so small images keep their native size either way.  Set an
+integer to impose a fixed hard cap instead."
+  :type '(choice (const :tag "Fit session window" nil)
+                 (integer :tag "Fixed pixel cap"))
+  :group 'ai-code)
+
+(defcustom ai-code-session-link-ghostel-image-preview-max-height nil
+  "Maximum displayed image height for Ghostel session previews, in pixels.
+When nil, preview height is not capped; the width cap controls default
+scaling and tall previews can be inspected by scrolling.  Set an integer to
+impose a fixed hard cap instead."
+  :type '(choice (const :tag "No height cap" nil)
+                 (integer :tag "Fixed pixel cap"))
+  :group 'ai-code)
+
+(defconst ai-code-session-link--visible-image-preview-max-line-width 2048
+  "Maximum candidate width inspected by strict visible image preview scanning.")
+
+(defconst ai-code-session-link--visible-image-preview-max-candidates 8
+  "Maximum image candidates inspected by one strict visible preview scan.")
+
+(defconst ai-code-session-link--visible-image-preview-prefix-max-lines 8
+  "Maximum previous terminal rows used to rebuild a wrapped image path.")
 
 (defvar ai-code-session-link--keymap
   (let ((map (make-sparse-keymap)))
@@ -44,8 +92,19 @@ terminal output redraw."
     map)
   "Keymap used for clickable session symbols.")
 
+(defvar ai-code-session-link--image-preview-keymap
+  (let ((map (make-sparse-keymap)))
+    (define-key map [mouse-1] #'ai-code-session-link--ignore-image-preview-event)
+    (define-key map [mouse-2] #'ai-code-session-link--ignore-image-preview-event)
+    (define-key map (kbd "RET") #'ai-code-session-link--ignore-image-preview-event)
+    map)
+  "Keymap used to keep inline image previews from opening file links.")
+
 (defconst ai-code-session-link--linkify-min-tail-width 512
   "Minimum number of tail characters to rescan for session links.")
+
+(defconst ai-code-session-link--linkify-redraw-delay 0
+  "Seconds to wait before relinkifying recent terminal output.")
 
 (defconst ai-code-session-link--url-pattern-regexp
   "\\(https?://[^][(){}<>\"' \t\n]+\\)"
@@ -64,8 +123,30 @@ terminal output redraw."
   "Maximum number of symbol links to apply near one file link.")
 
 (defconst ai-code-session-link--path-base-regexp
-  "@?[[:alnum:]_./~-]*[./][[:alnum:]_./~-]+"
+  "@?\\(?:file:\\(?://localhost\\|//\\)?\\)?[[:alnum:]_./~%+-]*[./][[:alnum:]_./~%+-]+"
   "Regexp matching a local file-like or directory-like path.")
+
+(defconst ai-code-session-link--path-fragment-regexp
+  "[-[:alnum:]_./~%+:\\\\]+"
+  "Regexp matching one terminal row fragment of a local path.")
+
+(defconst ai-code-session-link--wrapped-path-max-lines 8
+  "Maximum number of terminal rows inspected for one wrapped path.")
+
+(defconst ai-code-session-link--file-suffix-regexp
+  (concat
+   "\\(?:"
+   "#L[0-9]+\\(?:-L?[0-9]+\\)?"
+   "\\|"
+   ":L[0-9]+\\(?:-L?[0-9]+\\)?"
+   "\\|"
+   ":[0-9]+:[0-9]+\\>"
+   "\\|"
+   ":[0-9]+-[0-9]+\\>"
+   "\\|"
+   ":[0-9]+\\>"
+   "\\)")
+  "Regexp matching the optional line or column suffix of a file link.")
 
 (defconst ai-code-session-link--symbol-identifier-regexp
   "[[:alpha:]_][[:alnum:]_*!?]*"
@@ -157,6 +238,87 @@ terminal output redraw."
     "xml" "yaml" "yml" "zsh")
   "Lowercase extensions accepted for basename file links.")
 
+(defconst ai-code-session-link--image-file-extensions
+  '("apng" "avif" "bmp" "gif" "heic" "heif" "jpeg" "jpg" "pbm" "pgm"
+    "png" "ppm" "svg" "tif" "tiff" "webp" "xbm" "xpm")
+  "Lowercase image extensions accepted for Ghostel session previews.")
+
+(defconst ai-code-session-link--file-url-prefix-regexp
+  "file:\\(?://localhost\\|//\\)?"
+  "Regexp matching local file URL prefixes accepted in session output.")
+
+(defconst ai-code-session-link--image-extension-regexp
+  (regexp-opt ai-code-session-link--image-file-extensions)
+  "Regexp matching image extensions accepted for Ghostel previews.")
+
+(defconst ai-code-session-link--wrapped-path-continuation-regexp
+  "\\(?:\n[ \t]*[-[:alnum:]_./~%+:\\\\]+\\)*"
+  "Regexp matching terminal-wrapped continuation segments of a path.
+Ghostel hard-wraps long lines, so a single file path can span several
+terminal rows (a common case for tools, such as Claude, that print bare
+paths rather than `file://' URLs).  Each continuation row is glued back
+together by `ai-code-session-link--normalize-file', which strips the
+embedded newline and leading indentation.")
+
+(defconst ai-code-session-link--file-url-image-regexp
+  (concat
+   "\\(" ai-code-session-link--file-url-prefix-regexp
+   "\\(?:[-[:alnum:]_./~%+:\\\\]+\\|\n[ \t]*[-[:alnum:]_./~%+:\\\\]+\\)+"
+   "\\.\\(?:"
+   ai-code-session-link--image-extension-regexp
+   "\\)\\)")
+  "Regexp matching file URL image references, including terminal wrapping.")
+
+(defconst ai-code-session-link--local-image-path-regexp
+  (concat
+   "\\(?:~\\|/\\|\\.\\.?/\\|[[:alnum:]_.~-]+/\\)"
+   "[^][(){}<>\"'\n\r]*"
+   ai-code-session-link--wrapped-path-continuation-regexp
+   "\\.\\(?:"
+   ai-code-session-link--image-extension-regexp
+   "\\)")
+  "Regexp matching local image paths that may contain spaces.
+Tolerates Ghostel hard-wrapping via
+`ai-code-session-link--wrapped-path-continuation-regexp'.")
+
+(defconst ai-code-session-link--wrapped-image-reference-regexp
+  (concat
+   "[^][(){}<>\"'\n\r]*"
+   ai-code-session-link--wrapped-path-continuation-regexp
+   "\\.\\(?:"
+   ai-code-session-link--image-extension-regexp
+   "\\)")
+  "Regexp matching image references inside an explicit wrapper.
+Tolerates Ghostel hard-wrapping via
+`ai-code-session-link--wrapped-path-continuation-regexp'.")
+
+(defconst ai-code-session-link--image-reference-patterns
+  (list
+   (list ai-code-session-link--file-url-image-regexp 1)
+   (list (concat "[\"'`]\\(" ai-code-session-link--wrapped-image-reference-regexp "\\)[\"'`]")
+         1)
+   (list (concat "[(<]\\(" ai-code-session-link--wrapped-image-reference-regexp "\\)[)>]")
+         1)
+   (list (concat "\\[\\[\\(file:[^]\n\r]*\\.\\(?:"
+                 ai-code-session-link--image-extension-regexp
+                 "\\)\\)\\(?:\\]\\[[^]\n\r]*\\)?\\]\\]")
+         1)
+   (list (concat "\\(?:^\\|[ \t:]\\)\\(" ai-code-session-link--local-image-path-regexp "\\)")
+         1))
+  "Patterns used to detect image file references with looser path syntax.")
+
+(defconst ai-code-session-link--reference-wrapper-left-regexp
+  (rx (+ (any "\"'`<([{")))
+  "Regexp matching wrapper characters before a session file reference.")
+
+(defconst ai-code-session-link--reference-wrapper-right-regexp
+  (rx (+ (any "\"'`>)}],.;:!?")))
+  "Regexp matching wrapper characters after a session file reference.")
+
+(defconst ai-code-session-link--unicode-trailing-punctuation-categories
+  '(Pe Pf Po)
+  "Unicode general categories accepted after image preview anchors.")
+
 (defvar-local ai-code-session-link--linkify-timer nil
   "Timer used to re-linkify recent terminal output after redraw settles.")
 
@@ -185,10 +347,32 @@ terminal output redraw."
   "Normalize session link FILENAME for project lookup."
   (when (stringp filename)
     (let* ((trimmed (string-trim filename))
-           (without-at (string-remove-prefix "@" trimmed))
-           (normalized (string-remove-prefix "file://" without-at)))
+           (unwrapped (replace-regexp-in-string "[\n\r][ \t]*" "" trimmed))
+           (without-wrappers
+            (string-trim
+             unwrapped
+             ai-code-session-link--reference-wrapper-left-regexp
+             ai-code-session-link--reference-wrapper-right-regexp))
+           (without-at (string-remove-prefix "@" without-wrappers))
+           (file-url-p (string-match-p "\\`file:" without-at))
+           (without-file-prefix
+            (replace-regexp-in-string
+             (concat "\\`" ai-code-session-link--file-url-prefix-regexp)
+             "" without-at))
+           (without-shell-escaped-spaces
+            (replace-regexp-in-string "\\\\ " " " without-file-prefix))
+           (normalized (if file-url-p
+                           (or (ignore-errors
+                                 (url-unhex-string without-shell-escaped-spaces))
+                               without-shell-escaped-spaces)
+                         without-shell-escaped-spaces)))
       (unless (string-empty-p normalized)
         normalized))))
+
+(defun ai-code-session-link--normalize-link-text (text)
+  "Normalize visible session link TEXT for stored navigation data."
+  (when (stringp text)
+    (replace-regexp-in-string "[\n\r][ \t]*" "" text)))
 
 (defun ai-code-session-link--cache-get-or-compute (cache key compute)
   "Return cached value from CACHE for KEY, or call COMPUTE and store it."
@@ -220,7 +404,7 @@ terminal output redraw."
      (expand-file-name root)
      (lambda ()
        (or (ignore-errors
-             (when-let ((project (project-current nil root)))
+             (when-let* ((project (project-current nil root)))
                (let ((project-root (expand-file-name (project-root project))))
                  (mapcar (lambda (file)
                            (if (file-name-absolute-p file)
@@ -261,7 +445,7 @@ Optional PROJECT-FILES supplies the project file list."
   "Return the current session project root directory with trailing slash."
   (let ((root (or ai-code-backends-infra--session-directory
                   (and (fboundp 'project-current)
-                       (when-let ((project (project-current nil default-directory)))
+                       (when-let* ((project (project-current nil default-directory)))
                          (expand-file-name (project-root project))))
                   default-directory)))
     (and root (file-name-as-directory (expand-file-name root)))))
@@ -278,7 +462,9 @@ Optional PROJECT-FILES supplies the project file list."
 
 (defun ai-code-session-link--resolve-existing-local-path (path root)
   "Resolve PATH to an existing local file or directory using ROOT."
-  (seq-find #'file-exists-p
+  (seq-find (lambda (candidate)
+              (and (not (file-remote-p candidate))
+                   (file-exists-p candidate)))
             (ai-code-session-link--local-path-candidates path root)))
 
 (defun ai-code-session-link--cheap-file-link-candidate-p (path &optional root)
@@ -286,7 +472,7 @@ Optional PROJECT-FILES supplies the project file list."
 Optional ROOT is the session project root used for bounded local existence
 checks.  Expensive project-wide resolution stays in
 `ai-code-session-link--resolve-session-file' on activation."
-  (when-let ((normalized (ai-code-session-link--normalize-file path)))
+  (when-let* ((normalized (ai-code-session-link--normalize-file path)))
     (let ((extension (file-name-extension normalized)))
       (or (ai-code-session-link--resolve-existing-local-path normalized root)
           (and (not (file-name-absolute-p normalized))
@@ -320,37 +506,351 @@ checks.  Expensive project-wide resolution stays in
                   (t nil))))))
       nil)))
 
+(defun ai-code-session-link--ghostel-session-p ()
+  "Return non-nil when the current buffer is a Ghostel-managed AI session."
+  (and (boundp 'ai-code-backends-infra--session-terminal-backend)
+       (eq ai-code-backends-infra--session-terminal-backend 'ghostel)))
+
+(defun ai-code-session-link--trusted-local-session-p ()
+  "Return non-nil when session file probing is safe for local preview."
+  (not (file-remote-p
+        (or ai-code-backends-infra--session-directory
+            default-directory))))
+
+(defun ai-code-session-link--image-preview-enabled-p ()
+  "Return non-nil when image previews should be applied in this buffer."
+  (and ai-code-session-link-ghostel-image-preview-enabled
+       (ai-code-session-link--ghostel-session-p)
+       (ai-code-session-link--trusted-local-session-p)
+       (display-images-p)))
+
+(defun ai-code-session-link--image-extension-p (file)
+  "Return non-nil when FILE has a known image file extension."
+  (when-let* ((extension (file-name-extension file)))
+    (member (downcase extension)
+            ai-code-session-link--image-file-extensions)))
+
+(defun ai-code-session-link--safe-local-image-file-p (file)
+  "Return non-nil when FILE is a local image safe enough to preview."
+  (and (stringp file)
+       (ai-code-session-link--image-extension-p file)
+       (not (file-remote-p file))
+       (file-regular-p file)
+       (file-readable-p file)
+       (let ((attrs (file-attributes file 'integer)))
+         (and attrs
+              (<= (file-attribute-size attrs)
+                  ai-code-session-link-ghostel-image-preview-max-bytes)))))
+
 (defun ai-code-session-link--parse-file-link-text (text)
   "Parse file-like session link TEXT into a plist."
-  (when (stringp text)
-    (catch 'parsed
-      (dolist (pattern ai-code-session-link--file-patterns)
-        (let ((regexp (concat "\\`" (car pattern) "\\'")))
-          (when (string-match regexp text)
-            (throw
-             'parsed
-             (list :file (match-string (nth 1 pattern) text)
-                   :line-start (when-let ((group (nth 2 pattern))
-                                          (line (match-string group text)))
-                                 (string-to-number line))
-                   :column-start (when-let ((group (nth 3 pattern))
-                                            (column (match-string group text)))
-                                   (string-to-number column))))))))))
+  (when-let* ((text (ai-code-session-link--normalize-link-text text)))
+    (if (or (string-match-p "\\`file:" text)
+            (when-let* ((normalized (ai-code-session-link--normalize-file text)))
+              (ai-code-session-link--image-extension-p normalized)))
+        (list :file text)
+      (catch 'parsed
+        (dolist (pattern ai-code-session-link--file-patterns)
+          (let ((regexp (concat "\\`" (car pattern) "\\'")))
+            (when (string-match regexp text)
+              (throw
+               'parsed
+               (list :file (match-string (nth 1 pattern) text)
+                     :line-start (when-let* ((group (nth 2 pattern))
+                                             (line (match-string group text)))
+                                   (string-to-number line))
+                     :column-start (when-let* ((group (nth 3 pattern))
+                                               (column (match-string group text)))
+                                     (string-to-number column)))))))))))
+
+(defun ai-code-session-link--image-preview-file (link-text)
+  "Return an absolute local image file resolved from LINK-TEXT, or nil."
+  (when-let* ((link (ai-code-session-link--parse-file-link-text link-text))
+              (file (plist-get link :file))
+              ((ai-code-session-link--image-extension-p file))
+              (abs-file (ai-code-session-link--resolve-session-file file))
+              ((ai-code-session-link--safe-local-image-file-p abs-file)))
+    abs-file))
+
+(defun ai-code-session-link--delete-image-preview-overlays (start end)
+  "Delete image preview overlays touching START through END."
+  (let* ((line-start (save-excursion
+                       (goto-char start)
+                       (line-beginning-position)))
+         (line-end (save-excursion
+                     (goto-char end)
+                     (line-end-position)))
+         (scan-end (min (point-max) (1+ line-end))))
+    (dolist (overlay (delete-dups
+                      (append (overlays-in line-start scan-end)
+                              (overlays-at line-start)
+                              (overlays-at start)
+                              (overlays-at end)
+                              (overlays-at line-end)
+                              (overlays-at scan-end))))
+      (when (overlay-get overlay 'ai-code-session-image-preview)
+        (delete-overlay overlay)))))
+
+(defun ai-code-session-link--image-preview-indent (match-start)
+  "Return indentation for an image preview after MATCH-START's line.
+The preview aligns with the line's leading prompt gutter, not with column zero."
+  (save-excursion
+    (goto-char match-start)
+    (let ((line-start (line-beginning-position))
+          (line-end (line-end-position)))
+      (goto-char line-start)
+      (skip-chars-forward " \t" line-end)
+      (buffer-substring-no-properties line-start (point)))))
+
+(defun ai-code-session-link--image-preview-string (image file indent)
+  "Return an after-string preview for IMAGE loaded from FILE.
+INDENT is inserted before the image on the preview line."
+  (concat
+   "\n"
+   indent
+   (propertize
+    " "
+    'display image
+    'help-echo (format "Image preview: %s" file)
+    'keymap ai-code-session-link--image-preview-keymap
+    'follow-link nil)
+   "\n"))
+
+(defun ai-code-session-link--unicode-trailing-punctuation-p (char)
+  "Return non-nil when CHAR is non-ASCII trailing Unicode punctuation."
+  (and (characterp char)
+       (> char 127)
+       (memq (get-char-code-property char 'general-category)
+             ai-code-session-link--unicode-trailing-punctuation-categories)))
+
+(defun ai-code-session-link--image-preview-anchor-end (match-end)
+  "Return the preview overlay end after display suffixes at MATCH-END."
+  (save-excursion
+    (goto-char match-end)
+    (let ((line-end (line-end-position))
+          next)
+      (when (looking-at "\\]\\[[^]\n\r]*\\]\\]")
+        (goto-char (match-end 0)))
+      (while (and
+              (< (point) line-end)
+              (setq next
+                    (cond
+                     ((looking-at
+                       ai-code-session-link--reference-wrapper-right-regexp)
+                      (match-end 0))
+                     ((ai-code-session-link--unicode-trailing-punctuation-p
+                       (char-after))
+                      (1+ (point))))))
+        (goto-char next))
+      (point))))
+
+(defun ai-code-session-link--ignore-image-preview-event (&optional _event)
+  "Ignore mouse or keyboard EVENT on an inline image preview."
+  (interactive)
+  nil)
+
+(defun ai-code-session-link--image-preview-link-file (link-text)
+  "Return the local image file for previewable LINK-TEXT, or nil."
+  (when (ai-code-session-link--image-preview-enabled-p)
+    (ai-code-session-link--image-preview-file link-text)))
+
+(defun ai-code-session-link--live-image-preview-overlay-p (overlay)
+  "Return non-nil when OVERLAY is still anchored to its image link text."
+  (and (overlayp overlay)
+       (eq (overlay-buffer overlay) (current-buffer))
+       (overlay-get overlay 'ai-code-session-image-preview)
+       (< (overlay-start overlay) (overlay-end overlay))
+       (let ((link-text (overlay-get overlay 'ai-code-session-image-link-text))
+             (display-text
+              (or (overlay-get overlay 'ai-code-session-image-display-text)
+                  (overlay-get overlay 'ai-code-session-image-link-text))))
+         (and link-text
+              display-text
+              (get-text-property (overlay-start overlay)
+                                 'ai-code-session-link)
+              (equal (buffer-substring-no-properties
+                      (overlay-start overlay) (overlay-end overlay))
+                     display-text)))))
+
+(defun ai-code-session-link--live-image-preview-overlays-in-region (start end)
+  "Return live image preview overlays between START and END."
+  (cl-remove-if-not
+   #'ai-code-session-link--live-image-preview-overlay-p
+   (overlays-in start end)))
+
+(defun ai-code-session-link--image-preview-overlay-present-p
+    (start end display-text)
+  "Return non-nil when START to END already has a preview for DISPLAY-TEXT."
+  (cl-some
+   (lambda (overlay)
+     (and (ai-code-session-link--live-image-preview-overlay-p overlay)
+          (= (overlay-start overlay) start)
+          (<= end (overlay-end overlay))
+          (let ((overlay-link
+                 (overlay-get overlay 'ai-code-session-image-link-text))
+                (overlay-display
+                 (overlay-get overlay 'ai-code-session-image-display-text)))
+            (or (equal display-text overlay-link)
+                (equal display-text overlay-display)))))
+   (overlays-in start end)))
+
+(defun ai-code-session-link--text-may-contain-image-reference-p (text)
+  "Return non-nil when TEXT may contain an image reference."
+  (and (stringp text)
+       (string-match-p
+        (concat "\\(?:file:\\|\\.\\(?:" ai-code-session-link--image-extension-regexp "\\)\\)")
+        text)))
+
+(defun ai-code-session-link--image-preview-refresh-needed-p (start end)
+  "Return non-nil when image previews between START and END need refreshing."
+  (catch 'missing-preview
+    (let ((ai-code-session-link--project-files-cache
+           (ai-code-session-link--buffer-project-files-cache))
+          (ai-code-session-link--resolved-path-cache
+           (make-hash-table :test 'equal)))
+      (dolist (file-link (ai-code-session-link--collect-file-links start end))
+        (let ((link-start (plist-get file-link :start))
+              (link-end (plist-get file-link :end))
+              (link-text (plist-get file-link :text)))
+          (when (and (ai-code-session-link--image-preview-link-file link-text)
+                     (not (ai-code-session-link--image-preview-overlay-present-p
+                           link-start link-end link-text)))
+            (throw 'missing-preview t)))))
+    nil))
+
+(defun ai-code-session-link--image-preview-format-hint (file)
+  "Return an image MIME-style data hint for FILE, or nil."
+  (when-let* ((extension (file-name-extension file)))
+    (intern (format "image/%s"
+                    (pcase (downcase extension)
+                      ("jpg" "jpeg")
+                      ("tif" "tiff")
+                      (other other))))))
+
+(defun ai-code-session-link--image-preview-data (file)
+  "Return unibyte image data read from FILE."
+  (with-temp-buffer
+    (set-buffer-multibyte nil)
+    (insert-file-contents-literally file)
+    (buffer-string)))
+
+(defconst ai-code-session-link--image-preview-fallback-max-width 960
+  "Width cap used when no window is available to fit the preview to.")
+
+(defun ai-code-session-link--image-preview-max-dimensions (indent)
+  "Return a (MAX-WIDTH . MAX-HEIGHT) pixel cap for an image preview.
+An explicit integer custom is used verbatim as a hard cap.  When the custom
+is nil the preview fits the session window's body width, reduced by INDENT
+so the image never overflows into a horizontal scroll.  Height is uncapped by
+default so large screenshots can use the available width and be inspected by
+scrolling.  These are upper bounds only: `create-image' scales large images
+down to fit but never enlarges a small one.  A fixed width fallback applies
+when no window shows the buffer."
+  (let* ((window (get-buffer-window (current-buffer) t))
+         (char-width (frame-char-width (if window
+                                           (window-frame window)
+                                         (selected-frame))))
+         (indent-pixels (* (string-width (or indent "")) char-width)))
+    (cons
+     (cond
+      ((integerp ai-code-session-link-ghostel-image-preview-max-width)
+       ai-code-session-link-ghostel-image-preview-max-width)
+      (window
+       (max 1 (- (window-body-width window t) indent-pixels char-width)))
+      (t ai-code-session-link--image-preview-fallback-max-width))
+     (and (integerp ai-code-session-link-ghostel-image-preview-max-height)
+          ai-code-session-link-ghostel-image-preview-max-height))))
+
+(defun ai-code-session-link--create-image-preview (file max-width max-height)
+  "Create a data-backed preview image for FILE.
+MAX-WIDTH and MAX-HEIGHT are pixel caps passed to `create-image', which only
+scales down, so a smaller image keeps its native size.  A nil cap leaves that
+dimension unbounded.
+
+Using image data instead of a file-backed image spec keeps inline previews
+stable when `image-mode' opens and flushes the same image file."
+  (let* ((data (ai-code-session-link--image-preview-data file))
+         (data-p (or (ai-code-session-link--image-preview-format-hint file)
+                     t))
+         (type (ignore-errors (image-type data nil data-p))))
+    (ignore-errors
+      (apply #'create-image
+             data type data-p
+             (append (when max-width (list :max-width max-width))
+                     (when max-height (list :max-height max-height)))))))
+
+(defun ai-code-session-link--apply-image-preview (match-start match-end link-text)
+  "Display an image preview for LINK-TEXT after MATCH-START through MATCH-END."
+  (when (ai-code-session-link--image-preview-enabled-p)
+    (when-let* ((file (ai-code-session-link--image-preview-file link-text)))
+      (ai-code-session-link--apply-image-preview-for-file
+       match-start match-end link-text file))))
+
+(defun ai-code-session-link--apply-image-preview-for-file
+    (match-start match-end link-text file &optional display-text)
+  "Display FILE preview for LINK-TEXT after MATCH-START through MATCH-END."
+  (when (ai-code-session-link--image-preview-enabled-p)
+    (let* ((anchor-end
+            (ai-code-session-link--image-preview-anchor-end match-end))
+           (display-text
+            (or display-text
+                (buffer-substring-no-properties match-start match-end)))
+           (display-text
+            (if (> anchor-end match-end)
+                (concat display-text
+                        (buffer-substring-no-properties match-end anchor-end))
+              display-text))
+           (indent (ai-code-session-link--image-preview-indent match-start))
+           (dimensions (ai-code-session-link--image-preview-max-dimensions indent))
+           (image (ai-code-session-link--create-image-preview
+                   file (car dimensions) (cdr dimensions))))
+      (when image
+        (let ((overlay (make-overlay match-start anchor-end nil nil nil)))
+          (overlay-put overlay 'ai-code-session-image-preview t)
+          (overlay-put overlay 'ai-code-session-image-file file)
+          (overlay-put overlay 'ai-code-session-image-link-text link-text)
+          (overlay-put overlay 'ai-code-session-image-display-text
+                       (or display-text link-text))
+          (overlay-put overlay 'after-string
+                       (ai-code-session-link--image-preview-string
+                        image file indent))
+          overlay)))))
 
 (defun ai-code-session-link--apply-properties (start end &optional text help-echo)
   "Apply session link properties from START to END.
 Optional TEXT overrides the stored link text.
 Optional HELP-ECHO overrides the hover help text."
-  (add-text-properties
-   start end
-   (list 'ai-code-session-link (or text
-                                   (buffer-substring-no-properties start end))
-         'mouse-face 'highlight
-         'help-echo help-echo
-         'keymap ai-code-session-link--keymap
-         'follow-link t
-         'font-lock-face 'link
-         'face 'link)))
+  (let ((link-text
+         (ai-code-session-link--normalize-link-text
+          (or text (buffer-substring-no-properties start end)))))
+    (ai-code-session-link--apply-link-properties-to-visible-text
+     start end
+     (list 'ai-code-session-link link-text
+           'mouse-face 'highlight
+           'help-echo help-echo
+           'keymap ai-code-session-link--keymap
+           'follow-link t
+           'font-lock-face 'link
+           'face 'link))))
+
+(defun ai-code-session-link--apply-link-properties-to-visible-text
+    (start end properties)
+  "Apply PROPERTIES from START to END, skipping wrapped-line indentation."
+  (save-excursion
+    (goto-char start)
+    (let ((segment-start start)
+          segment-end)
+      (while (< segment-start end)
+        (goto-char segment-start)
+        (skip-chars-forward " \t" (min end (line-end-position)))
+        (setq segment-start (point)
+              segment-end (min end (line-end-position)))
+        (when (< segment-start segment-end)
+          (add-text-properties segment-start segment-end properties))
+        (setq segment-start
+              (if (< segment-end end)
+                  (1+ segment-end)
+                end))))))
 
 (defun ai-code-session-link--apply-symbol-properties (start end symbol file-link)
   "Apply clickable SYMBOL properties from START to END using FILE-LINK."
@@ -487,26 +987,170 @@ Optional NEXT-FILE-START caps the scan boundary."
                  symbol-start symbol-end candidate file-link)
                 (setq link-count (1+ link-count))))))))))
 
+(defun ai-code-session-link--sort-and-prune-file-links (file-links)
+  "Return FILE-LINKS ordered by start, with contained links removed."
+  (let ((sorted
+         (sort file-links
+               (lambda (left right)
+                 (let ((left-start (plist-get left :start))
+                       (right-start (plist-get right :start))
+                       (left-end (plist-get left :end))
+                       (right-end (plist-get right :end)))
+                   (if (= left-start right-start)
+                       (> left-end right-end)
+                     (< left-start right-start)))))))
+    (let (kept)
+      (dolist (link sorted)
+        (let ((link-start (plist-get link :start))
+              (link-end (plist-get link :end)))
+          (unless (cl-some
+                   (lambda (kept-link)
+                     (and (<= (plist-get kept-link :start) link-start)
+                          (<= link-end (plist-get kept-link :end))))
+                   kept)
+            (push link kept))))
+      (nreverse kept))))
+
+(defun ai-code-session-link--blank-between-p (start end)
+  "Return non-nil when buffer text between START and END is blank."
+  (save-excursion
+    (goto-char start)
+    (skip-chars-forward " \t" end)
+    (>= (point) end)))
+
+(defun ai-code-session-link--line-path-fragment-bounds (start end)
+  "Return path fragment bounds between START and END after indentation."
+  (save-excursion
+    (goto-char start)
+    (skip-chars-forward " \t" end)
+    (let ((fragment-start (point)))
+      (when (looking-at ai-code-session-link--path-fragment-regexp)
+        (let ((fragment-end (min (match-end 0) end)))
+          (when (< fragment-start fragment-end)
+            (cons fragment-start fragment-end)))))))
+
+(defun ai-code-session-link--file-suffix-end-at (position limit)
+  "Return end of a file suffix at POSITION, bounded by LIMIT."
+  (save-excursion
+    (goto-char position)
+    (when (looking-at ai-code-session-link--file-suffix-regexp)
+      (let ((suffix-end (match-end 0)))
+        (and (<= suffix-end limit) suffix-end)))))
+
+(defun ai-code-session-link--file-link-end-at (base-end line-end)
+  "Return file link end from BASE-END, including a suffix before LINE-END."
+  (or (ai-code-session-link--file-suffix-end-at base-end line-end)
+      base-end))
+
+(defun ai-code-session-link--wrapped-file-link-candidate-p (text root)
+  "Return non-nil when wrapped link TEXT resolves to a local file for ROOT."
+  (when-let* ((parsed (ai-code-session-link--parse-file-link-text text))
+              (file (plist-get parsed :file))
+              (normalized (ai-code-session-link--normalize-file file)))
+    (ai-code-session-link--resolve-existing-local-path normalized root)))
+
+(defun ai-code-session-link--wrapped-file-link-at
+    (match-start match-end scan-end root)
+  "Return a wrapped file link candidate starting at MATCH-START.
+MATCH-END is the end of the first-row path match.  SCAN-END bounds the
+search, and ROOT is the session project root."
+  (save-excursion
+    (goto-char match-start)
+    (let ((first-line-end (min scan-end (line-end-position)))
+          (current-line-end nil)
+          (best-link nil)
+          (continued-lines 0)
+          (scan t))
+      (setq current-line-end first-line-end)
+      (when (ai-code-session-link--blank-between-p match-end first-line-end)
+        (while (and scan
+                    (< continued-lines ai-code-session-link--wrapped-path-max-lines)
+                    (< current-line-end scan-end)
+                    (eq (char-after current-line-end) ?\n))
+          (let* ((next-line-start (1+ current-line-end))
+                 (next-line-end
+                  (save-excursion
+                    (goto-char next-line-start)
+                    (min scan-end (line-end-position))))
+                 (fragment
+                  (ai-code-session-link--line-path-fragment-bounds
+                   next-line-start next-line-end)))
+            (if (not fragment)
+                (setq scan nil)
+              (let* ((base-end (cdr fragment))
+                     (link-end
+                      (ai-code-session-link--file-link-end-at
+                       base-end next-line-end)))
+                (if (not (ai-code-session-link--blank-between-p
+                          link-end next-line-end))
+                    (setq scan nil)
+                  (cl-incf continued-lines)
+                  (let ((link-text
+                         (ai-code-session-link--normalize-link-text
+                          (buffer-substring-no-properties
+                           match-start link-end))))
+                    (when (ai-code-session-link--wrapped-file-link-candidate-p
+                           link-text root)
+                      (setq best-link
+                            (list :start match-start
+                                  :end link-end
+                                  :text link-text))))
+                  (setq current-line-end next-line-end)))))))
+      best-link)))
+
+(defun ai-code-session-link--collect-wrapped-file-links (start end root)
+  "Return hard-wrapped file link matches between START and END for ROOT."
+  (let (file-links)
+    (save-excursion
+      (goto-char start)
+      (while (re-search-forward ai-code-session-link--path-base-regexp end t)
+        (when-let* ((file-link
+                     (ai-code-session-link--wrapped-file-link-at
+                      (match-beginning 0)
+                      (match-end 0)
+                      end
+                      root)))
+          (push file-link file-links))))
+    (nreverse file-links)))
+
 (defun ai-code-session-link--collect-file-links (start end)
   "Return file link matches between START and END without eager resolution."
   (let ((root (ai-code-session-link--project-root-for-paths))
         (seen-starts (make-hash-table :test 'eql))
         file-links)
-    (save-excursion
-      (dolist (pattern ai-code-session-link--file-patterns)
-        (goto-char start)
-        (while (re-search-forward (car pattern) end t)
-          (let ((match-start (match-beginning 0))
-                (match-end (match-end 0)))
-            (unless (gethash match-start seen-starts)
-              (let ((path (match-string-no-properties (nth 1 pattern))))
-                (when (ai-code-session-link--cheap-file-link-candidate-p path root)
-                  (puthash match-start t seen-starts)
-                  (push (list :start match-start
-                              :end match-end
-                              :text (buffer-substring-no-properties match-start match-end))
-                        file-links))))))))
-    (nreverse file-links)))
+    (setq file-links
+          (ai-code-session-link--collect-wrapped-file-links start end root))
+    (cl-labels
+        ((add-link
+          (match-start match-end link-text &optional candidate-text)
+          (unless (gethash match-start seen-starts)
+            (when (ai-code-session-link--cheap-file-link-candidate-p
+                   (or candidate-text link-text) root)
+              (puthash match-start t seen-starts)
+              (push (list :start match-start
+                          :end match-end
+                          :text link-text)
+                    file-links)))))
+      (save-excursion
+        (dolist (pattern ai-code-session-link--image-reference-patterns)
+          (goto-char start)
+          (while (re-search-forward (car pattern) end t)
+            (let* ((capture (cadr pattern))
+                   (match-start (match-beginning capture))
+                   (match-end (match-end capture))
+                   (link-text (match-string-no-properties capture)))
+              (add-link match-start match-end link-text))))
+        (dolist (pattern ai-code-session-link--file-patterns)
+          (goto-char start)
+          (while (re-search-forward (car pattern) end t)
+            (let ((match-start (match-beginning 0))
+                  (match-end (match-end 0))
+                  (path (match-string-no-properties (nth 1 pattern))))
+              (add-link
+               match-start match-end
+               (buffer-substring-no-properties match-start match-end)
+               path))))))
+    (ai-code-session-link--sort-and-prune-file-links file-links)))
 
 (defun ai-code-session-link--linkify-url-region (start end)
   "Apply URL session links between START and END."
@@ -522,23 +1166,225 @@ Optional NEXT-FILE-START caps the scan boundary."
 
 (defun ai-code-session-link--linkify-file-region (start end)
   "Apply file session links between START and END."
-  (let ((ai-code-session-link--project-files-cache
-         (ai-code-session-link--buffer-project-files-cache))
-        (ai-code-session-link--resolved-path-cache (make-hash-table :test 'equal)))
-    (let ((file-links (ai-code-session-link--collect-file-links start end)))
-      (while file-links
-        (let* ((file-link (car file-links))
-               (next-file-link (cadr file-links))
-               (match-start (plist-get file-link :start))
-               (match-end (plist-get file-link :end))
-               (link-text (plist-get file-link :text)))
-          (unless (get-text-property match-start 'ai-code-session-link)
-            (ai-code-session-link--apply-properties
-             match-start match-end link-text "mouse-1: Visit file")
-            (ai-code-session-link--linkify-symbols-near-file
-             link-text match-end end
-             (and next-file-link (plist-get next-file-link :start))))
-          (setq file-links (cdr file-links)))))))
+  (let ((inhibit-read-only t)
+        (inhibit-modification-hooks t))
+    (ai-code-session-link--delete-image-preview-overlays start end)
+    (let ((ai-code-session-link--project-files-cache
+           (ai-code-session-link--buffer-project-files-cache))
+          (ai-code-session-link--resolved-path-cache
+           (make-hash-table :test 'equal)))
+      (let ((file-links (ai-code-session-link--collect-file-links start end)))
+        (while file-links
+          (let* ((file-link (car file-links))
+                 (next-file-link (cadr file-links))
+                 (match-start (plist-get file-link :start))
+                 (match-end (plist-get file-link :end))
+                 (link-text (plist-get file-link :text))
+                 (image-link-file
+                  (ai-code-session-link--image-preview-link-file link-text)))
+            (if image-link-file
+                (ai-code-session-link--apply-properties
+                 match-start match-end link-text
+                 "mouse-1: Visit image file")
+              (unless (get-text-property match-start 'ai-code-session-link)
+                (ai-code-session-link--apply-properties
+                 match-start match-end link-text "mouse-1: Visit file")
+                (ai-code-session-link--linkify-symbols-near-file
+                 link-text match-end end
+                 (and next-file-link (plist-get next-file-link :start)))))
+            (ai-code-session-link--apply-image-preview
+             match-start match-end link-text)
+            (setq file-links (cdr file-links))))))))
+
+(defun ai-code-session-link--strict-image-candidate-bounds (match-start match-end)
+  "Return strict local image path bounds around MATCH-START and MATCH-END."
+  (let ((start match-start)
+        (end match-end)
+        (min-start (line-beginning-position)))
+    (while (and (> start min-start)
+                (not (memq (char-before start)
+                           '(?\s ?\t ?\n ?\r ?\" ?' ?` ?< ?> ?\( ?\)
+                             ?\[ ?\] ?{ ?}))))
+      (setq start (1- start)))
+    (when (and (< start end)
+               (<= (- end start)
+                   ai-code-session-link--visible-image-preview-max-line-width))
+      (cons start end))))
+
+(defun ai-code-session-link--image-preview-existing-local-file (link-text)
+  "Return existing local image file for LINK-TEXT without project scanning."
+  (when-let* ((link (ai-code-session-link--parse-file-link-text link-text))
+              (file (plist-get link :file))
+              (normalized (ai-code-session-link--normalize-file file))
+              ((ai-code-session-link--image-extension-p normalized))
+              (root (ai-code-session-link--project-root-for-paths))
+              (abs-file
+               (ai-code-session-link--resolve-existing-local-path
+                normalized root))
+              ((ai-code-session-link--safe-local-image-file-p abs-file)))
+    abs-file))
+
+(defun ai-code-session-link--strict-path-continuation-line-p (line)
+  "Return non-nil when LINE is safe to treat as a wrapped path fragment."
+  (and (stringp line)
+       (not (string-empty-p line))
+       (<= (length line)
+           ai-code-session-link--visible-image-preview-max-line-width)
+       (string-match-p "\\`[-[:alnum:]_./~%+:\\\\]+\\'" line)))
+
+(defun ai-code-session-link--strict-absolute-path-suffix (line)
+  "Return an absolute path suffix from LINE, or nil."
+  (when (and (stringp line)
+             (string-match
+              "\\(?:\\`\\|[ \t]\\)\\(/[^] \t\n\r\"'`<>(){}[]+\\)\\'"
+              line))
+    (match-string 1 line)))
+
+(defun ai-code-session-link--strict-previous-line-prefix (position)
+  "Return a safe wrapped path prefix before POSITION, or nil."
+  (cdr (ai-code-session-link--strict-previous-line-prefix-info position)))
+
+(defun ai-code-session-link--strict-previous-line-prefix-info (position)
+  "Return a (START . PREFIX) pair before POSITION, or nil."
+  (save-excursion
+    (goto-char position)
+    (let ((suffix "")
+          (lines 0)
+          result
+          stop)
+      (while (and (not result)
+                  (not stop)
+                  (< lines
+                     ai-code-session-link--visible-image-preview-prefix-max-lines)
+                  (not (bobp)))
+        (forward-line -1)
+        (setq lines (1+ lines))
+        (let* ((raw-line
+                (buffer-substring-no-properties
+                 (line-beginning-position)
+                 (line-end-position)))
+               (line (string-trim raw-line))
+               (content-start
+                (+ (line-beginning-position)
+                   (or (string-match-p "[^ \t]" raw-line)
+                       (length raw-line))))
+               (too-long
+                (> (+ (length line) (length suffix))
+                   ai-code-session-link--visible-image-preview-max-line-width)))
+          (cond
+           (too-long
+            (setq stop t))
+           ((string-match "file:" line)
+            (setq result
+                  (cons (+ content-start (match-beginning 0))
+                        (concat (substring line (match-beginning 0))
+                                suffix))))
+           ((string-match
+             "\\(?:\\`\\|[ \t]\\)\\(/[^] \t\n\r\"'`<>(){}[]+\\)\\'"
+             line)
+            (setq result
+                  (cons (+ content-start (match-beginning 1))
+                        (concat (match-string 1 line) suffix))))
+           ((and (ai-code-session-link--strict-path-continuation-line-p line)
+                 (or suffix
+                     (string-match-p "[/-]\\'" line)
+                     (string-match-p "/" line)))
+            (setq suffix (concat line suffix)))
+           (t
+            (setq stop t)))))
+      result)))
+
+(defun ai-code-session-link--strict-image-candidates
+    (start end link-text)
+  "Return strict image candidates for LINK-TEXT between START and END."
+  (let* ((trimmed (string-trim link-text))
+         (normalized (ai-code-session-link--normalize-file trimmed))
+         (prefix-info
+          (and normalized
+               (not (file-name-absolute-p normalized))
+               (not (string-prefix-p "file:" normalized))
+               (ai-code-session-link--strict-previous-line-prefix-info start)))
+         (current-candidate
+          (list :start start
+                :end end
+                :link-text trimmed
+                :display-text link-text))
+         candidates)
+    (when prefix-info
+      (let* ((candidate-start (car prefix-info))
+             (candidate-text (concat (cdr prefix-info) trimmed))
+             (display-text
+              (buffer-substring-no-properties candidate-start end)))
+        (push (list :start candidate-start
+                    :end end
+                    :link-text candidate-text
+                    :display-text display-text)
+              candidates)))
+    (append (nreverse candidates) (list current-candidate))))
+
+(defun ai-code-session-link--strict-image-candidate-texts (start link-text)
+  "Return strict image candidate texts for LINK-TEXT at START."
+  (let* ((trimmed (string-trim link-text))
+         (normalized (ai-code-session-link--normalize-file trimmed))
+         (prefix (and normalized
+                      (not (file-name-absolute-p normalized))
+                      (not (string-prefix-p "file:" normalized))
+                      (ai-code-session-link--strict-previous-line-prefix start))))
+    (let ((candidates (list trimmed)))
+      (when prefix
+        (push (concat prefix trimmed) candidates))
+      (delete-dups
+       (delq nil
+             (nreverse candidates))))))
+
+(defun ai-code-session-link--linkify-strict-image-preview-region (start end)
+  "Apply image previews between START and END using strict local path parsing.
+This avoids broad path regexps and project scans, making it suitable for
+visible-window recovery in large terminal scrollback."
+  (when (ai-code-session-link--image-preview-enabled-p)
+    (let ((inhibit-read-only t)
+          (inhibit-modification-hooks t))
+      (ai-code-session-link--delete-image-preview-overlays start end)
+      (save-excursion
+        (let ((case-fold-search t)
+              (candidate-count 0)
+              (extension-regexp
+               (concat "\\.\\(?:" ai-code-session-link--image-extension-regexp "\\)")))
+          (goto-char start)
+          (while (and (< candidate-count
+                         ai-code-session-link--visible-image-preview-max-candidates)
+                      (re-search-forward extension-regexp end t))
+            (setq candidate-count (1+ candidate-count))
+            (let* ((bounds
+                    (ai-code-session-link--strict-image-candidate-bounds
+                     (match-beginning 0)
+                     (match-end 0)))
+                   (match-start (car-safe bounds))
+                   (match-end (cdr-safe bounds))
+                   (link-text
+                    (and bounds
+                         (buffer-substring-no-properties match-start match-end))))
+              (when link-text
+                (catch 'previewed
+                  (dolist (candidate
+                           (ai-code-session-link--strict-image-candidates
+                            match-start match-end link-text))
+                    (when-let* ((link-text (plist-get candidate :link-text))
+                                (file
+                                 (ai-code-session-link--image-preview-existing-local-file
+                                  link-text)))
+                      (ai-code-session-link--apply-properties
+                       (plist-get candidate :start)
+                       (plist-get candidate :end)
+                       link-text
+                       "mouse-1: Visit image file")
+                      (ai-code-session-link--apply-image-preview-for-file
+                       (plist-get candidate :start)
+                       (plist-get candidate :end)
+                       link-text
+                       file
+                       (plist-get candidate :display-text))
+                      (throw 'previewed t))))))))))))
 
 (defun ai-code-session-link--property-at-point (property)
   "Return PROPERTY at point or immediately before point."
@@ -564,16 +1410,16 @@ Optional NEXT-FILE-START caps the scan boundary."
               (abs-file (ai-code-session-link--resolve-session-file file)))
     (find-file-other-window abs-file)
     (goto-char (point-min))
-    (when-let ((line-start (plist-get link :line-start)))
+    (when-let* ((line-start (plist-get link :line-start)))
       (forward-line (1- line-start)))
-    (when-let ((column-start (plist-get link :column-start)))
+    (when-let* ((column-start (plist-get link :column-start)))
       (when (> column-start 0)
         (move-to-column (1- column-start))))
     t))
 
 (defun ai-code-session-link--try-xref-definition (symbol)
   "Try xref lookup for SYMBOL in the current buffer."
-  (when-let ((lookup (ai-code-session-link--primary-symbol-search-term symbol)))
+  (when-let* ((lookup (ai-code-session-link--primary-symbol-search-term symbol)))
     (when (fboundp 'xref-find-definitions)
       (condition-case nil
           (progn
@@ -583,7 +1429,7 @@ Optional NEXT-FILE-START caps the scan boundary."
 
 (defun ai-code-session-link--try-helm-gtags-definition (symbol)
   "Try helm-gtags lookup for SYMBOL in the current buffer."
-  (when-let ((lookup (ai-code-session-link--primary-symbol-search-term symbol)))
+  (when-let* ((lookup (ai-code-session-link--primary-symbol-search-term symbol)))
     (when (fboundp 'helm-gtags-find-tag)
       (condition-case nil
           (progn
@@ -635,7 +1481,8 @@ Optional NEXT-FILE-START caps the scan boundary."
   "Make supported URLs and in-project file references clickable from START to END."
   (when (and ai-code-session-link-enabled
              (< start end))
-    (let ((inhibit-read-only t))
+    (let ((inhibit-read-only t)
+          (inhibit-modification-hooks t))
       (save-excursion
         (save-restriction
           (widen)
@@ -643,7 +1490,13 @@ Optional NEXT-FILE-START caps the scan boundary."
                 end (min (point-max) end))
           (let ((bounds (cons start end))
                 (region-text (buffer-substring-no-properties start end)))
-            (unless (ai-code-session-link--unchanged-region-p bounds region-text)
+            (if (ai-code-session-link--unchanged-region-p bounds region-text)
+                (when (and (ai-code-session-link--image-preview-enabled-p)
+                           (ai-code-session-link--text-may-contain-image-reference-p
+                            region-text)
+                           (ai-code-session-link--image-preview-refresh-needed-p
+                            start end))
+                  (ai-code-session-link--linkify-file-region start end))
               (let ((pos start))
                 (while (< pos end)
                   (let ((next (or (next-single-property-change
@@ -705,8 +1558,9 @@ Optional NEXT-FILE-START caps the scan boundary."
          (max (point-min) (- end tail-width))
          end)))))
 
-(defun ai-code-session-link--schedule-linkify-recent-output (buffer output)
-  "Linkify recent OUTPUT in BUFFER after terminal redraw settles."
+(defun ai-code-session-link--schedule-linkify-recent-output (buffer output &optional delay)
+  "Linkify recent OUTPUT in BUFFER after terminal redraw settles.
+Optional DELAY overrides the default redraw delay in seconds."
   (when (ai-code-session-link--should-linkify-recent-output-p buffer output)
     (with-current-buffer buffer
       (setq ai-code-session-link--pending-tail-width
@@ -715,7 +1569,7 @@ Optional NEXT-FILE-START caps the scan boundary."
       (unless ai-code-session-link--linkify-timer
         (setq ai-code-session-link--linkify-timer
               (run-at-time
-               0 nil
+               (or delay ai-code-session-link--linkify-redraw-delay) nil
                (lambda (buf)
                  (when (buffer-live-p buf)
                    (with-current-buffer buf

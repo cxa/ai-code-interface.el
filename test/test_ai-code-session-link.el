@@ -13,6 +13,7 @@
 (require 'ai-code-session-link)
 
 (defvar ai-code-backends-infra--session-directory)
+(defvar ai-code-backends-infra--session-terminal-backend)
 
 (ert-deftest ai-code-session-link-test-toggle-defaults-enabled ()
   "Session linkification should be enabled by default."
@@ -25,6 +26,19 @@
                  "src/Foo.java"))
   (should (equal (ai-code-session-link--normalize-file "file:///tmp/project/Foo.java")
                  "/tmp/project/Foo.java"))
+  (should (equal (ai-code-session-link--normalize-file "file://localhost/tmp/project/Foo.java")
+                 "/tmp/project/Foo.java"))
+  (should (equal (ai-code-session-link--normalize-file "file:/tmp/project/Foo.java")
+                 "/tmp/project/Foo.java"))
+  (should (equal (ai-code-session-link--normalize-file
+                  "file:///tmp/project/image-\nwrapped.png")
+                 "/tmp/project/image-wrapped.png"))
+  (should (equal (ai-code-session-link--normalize-file
+                  "<file:///tmp/project/My%20Image.png>")
+                 "/tmp/project/My Image.png"))
+  (should (equal (ai-code-session-link--normalize-file
+                  "./screens/My\\ Image.png")
+                 "./screens/My Image.png"))
   (should-not (ai-code-session-link--normalize-file "   ")))
 
 (ert-deftest ai-code-session-link-test-project-files-expands-relative-project-entries ()
@@ -797,6 +811,741 @@
                "src/FileABC.java:42")
               (should-not ai-code-session-link--linkify-timer)
               (should (zerop ai-code-session-link--pending-tail-width)))))
+      (when (file-directory-p root)
+        (delete-directory root t)))))
+
+(ert-deftest ai-code-session-link-test-ghostel-image-preview-adds-overlay ()
+  "Ghostel sessions should preview local image file links."
+  (let* ((root (make-temp-file "ai-code-session-image-preview-" t))
+         (image-file (expand-file-name "screenshot.png" root))
+         (created-image nil))
+    (unwind-protect
+        (progn
+          (with-temp-file image-file
+            (insert "fake image bytes"))
+          (cl-letf (((symbol-function 'display-images-p)
+                     (lambda (&optional _display) t))
+                    ((symbol-function 'create-image)
+                     (lambda (data &rest args)
+                       (setq created-image (cons data args))
+                       (list :image data :args args))))
+            (with-temp-buffer
+              (setq-local ai-code-backends-infra--session-directory root)
+              (setq-local ai-code-backends-infra--session-terminal-backend 'ghostel)
+              (insert "Saved screenshot.png\n")
+              (ai-code-session-link--linkify-session-region (point-min) (point-max))
+              (goto-char (point-min))
+              (search-forward "screenshot.png")
+              (let* ((link-start (match-beginning 0))
+                     (link-end (match-end 0))
+                     (preview-overlays
+                      (cl-remove-if-not
+                       (lambda (overlay)
+                         (overlay-get overlay 'ai-code-session-image-preview))
+                       (overlays-in (point-min) (point-max)))))
+                (should (equal (get-text-property (match-beginning 0)
+                                                  'ai-code-session-link)
+                               "screenshot.png"))
+                (should (= (length preview-overlays) 1))
+                (should (equal (overlay-get (car preview-overlays)
+                                            'ai-code-session-image-file)
+                               image-file))
+                (should (= (overlay-start (car preview-overlays))
+                           link-start))
+                (should (= (overlay-end (car preview-overlays))
+                           link-end))
+                (should (equal (car created-image) "fake image bytes"))
+                (should-not (equal (car created-image) image-file))
+                (should (nth 2 created-image))
+                (should (member :max-width created-image))
+                (should-not (member :max-height created-image))))))
+      (when (file-directory-p root)
+        (delete-directory root t)))))
+
+(ert-deftest ai-code-session-link-test-unicode-trailing-punctuation-categories ()
+  "Image preview suffix detection should use Unicode punctuation categories."
+  (should (ai-code-session-link--unicode-trailing-punctuation-p ?\u3002))
+  (should (ai-code-session-link--unicode-trailing-punctuation-p ?\u061f))
+  (should (ai-code-session-link--unicode-trailing-punctuation-p ?\uff09))
+  (should-not (ai-code-session-link--unicode-trailing-punctuation-p ?/))
+  (should-not (ai-code-session-link--unicode-trailing-punctuation-p ?a)))
+
+(ert-deftest ai-code-session-link-test-ghostel-image-preview-follows-trailing-punctuation ()
+  "Image previews should appear after sentence punctuation following a path."
+  (let* ((root (make-temp-file "ai-code-session-image-preview-punctuation-" t))
+         (image-file (expand-file-name "screenshot.png" root)))
+    (unwind-protect
+        (progn
+          (with-temp-file image-file
+            (insert "fake image bytes"))
+          (cl-letf (((symbol-function 'display-images-p)
+                     (lambda (&optional _display) t))
+                    ((symbol-function 'create-image)
+                     (lambda (data &rest args)
+                       (list :image data :args args))))
+            (dolist (suffix (list "." (string ?\u3002)))
+              (with-temp-buffer
+                (setq-local ai-code-backends-infra--session-directory root)
+                (setq-local ai-code-backends-infra--session-terminal-backend
+                            'ghostel)
+                (insert "Saved " image-file suffix "\n")
+                (ai-code-session-link--linkify-session-region
+                 (point-min) (point-max))
+                (goto-char (point-min))
+                (search-forward image-file)
+                (let* ((link-start (match-beginning 0))
+                       (link-end (match-end 0))
+                       (preview-overlays
+                        (cl-remove-if-not
+                         (lambda (overlay)
+                           (overlay-get overlay 'ai-code-session-image-preview))
+                         (overlays-in (point-min) (point-max))))
+                       (overlay (car preview-overlays)))
+                  (should (= (length preview-overlays) 1))
+                  (should (= (overlay-start overlay) link-start))
+                  (should (= (overlay-end overlay) (1+ link-end)))
+                  (should (equal (overlay-get
+                                  overlay
+                                  'ai-code-session-image-display-text)
+                                 (concat image-file suffix)))
+                  (should (equal (overlay-get
+                                  overlay
+                                  'ai-code-session-image-link-text)
+                                 image-file))
+                  (should-not
+                   (ai-code-session-link--image-preview-refresh-needed-p
+                    (point-min) (point-max))))))))
+      (when (file-directory-p root)
+        (delete-directory root t)))))
+
+(ert-deftest ai-code-session-link-test-remote-ghostel-generic-linkify-skips-file-stats ()
+  "Remote Ghostel generic linkification should not stat TRAMP candidates."
+  (let ((remote-root "/mock-remote/tmp/project/")
+        (file-exists-called nil)
+        (create-image-called nil))
+    (cl-letf (((symbol-function 'display-images-p)
+               (lambda (&optional _display) t))
+              ((symbol-function 'file-remote-p)
+               (lambda (file &rest _args)
+                 (and (stringp file)
+                      (string-prefix-p "/mock-remote/" file))))
+              ((symbol-function 'file-exists-p)
+               (lambda (_file)
+                 (setq file-exists-called t)
+                 nil))
+              ((symbol-function 'create-image)
+               (lambda (&rest _args)
+                 (setq create-image-called t)
+                 'image)))
+      (with-temp-buffer
+        (setq-local ai-code-backends-infra--session-directory
+                    remote-root)
+        (setq-local ai-code-backends-infra--session-terminal-backend
+                    'ghostel)
+        (setq-local default-directory remote-root)
+        (insert "Saved ./remote.png\n")
+        (ai-code-session-link--linkify-session-region
+         (point-min) (point-max))
+        (should-not file-exists-called)
+        (should-not create-image-called)
+        (should-not
+         (cl-some
+          (lambda (overlay)
+            (overlay-get overlay 'ai-code-session-image-preview))
+          (overlays-in (point-min) (point-max))))))))
+
+(ert-deftest ai-code-session-link-test-ghostel-image-preview-wrapped-bare-path ()
+  "A bare local image path hard-wrapped across terminal rows should preview.
+Tools such as Claude print bare paths (no `file://' prefix); when the path
+is long enough Ghostel wraps it, splitting the token across rows.  The
+detection regexp must stitch those rows back together."
+  (let* ((root (make-temp-file "ai-code-session-image-preview-wrap-" t))
+         (image-file
+          (expand-file-name
+           "a-very-long-wrapped-screenshot-name-for-terminal-testing.png"
+           root))
+         (split (/ (length image-file) 2))
+         (head (substring image-file 0 split))
+         (tail (substring image-file split))
+         (created-image nil))
+    ;; Guard against an accidental split inside a space run; the temp path
+    ;; has none, but keep the invariant explicit for future readers.
+    (should-not (string-match-p "[ \t]" image-file))
+    (unwind-protect
+        (progn
+          (with-temp-file image-file
+            (insert "fake image bytes"))
+          (cl-letf (((symbol-function 'display-images-p)
+                     (lambda (&optional _display) t))
+                    ((symbol-function 'create-image)
+                     (lambda (data &rest args)
+                       (setq created-image (cons data args))
+                       (list :image data :args args))))
+            (with-temp-buffer
+              (setq-local ai-code-backends-infra--session-directory root)
+              (setq-local ai-code-backends-infra--session-terminal-backend 'ghostel)
+              ;; Mimic a Ghostel hard wrap: the path breaks mid-token and the
+              ;; continuation row carries a leading render gutter.
+              (insert (format "Wrote %s\n    %s\n" head tail))
+              (ai-code-session-link--linkify-session-region (point-min) (point-max))
+              (let ((preview-overlays
+                     (cl-remove-if-not
+                      (lambda (overlay)
+                        (overlay-get overlay 'ai-code-session-image-preview))
+                      (overlays-in (point-min) (point-max)))))
+                (should (= (length preview-overlays) 1))
+                (should (equal (overlay-get (car preview-overlays)
+                                            'ai-code-session-image-file)
+                               image-file))
+                (should (equal (car created-image) "fake image bytes"))))))
+      (when (file-directory-p root)
+        (delete-directory root t)))))
+
+(ert-deftest ai-code-session-link-test-ghostel-image-preview-keeps-line-gutter ()
+  "Image previews should align with the image path line's leading gutter."
+  (let* ((root (make-temp-file "ai-code-session-image-preview-indent-" t))
+         (image-file (expand-file-name "screenshot.png" root)))
+    (unwind-protect
+        (progn
+          (with-temp-file image-file
+            (insert "fake image bytes"))
+          (cl-letf (((symbol-function 'display-images-p)
+                     (lambda (&optional _display) t))
+                    ((symbol-function 'create-image)
+                     (lambda (file &rest args)
+                       (list :image file :args args))))
+            (with-temp-buffer
+              (setq-local ai-code-backends-infra--session-directory root)
+              (setq-local ai-code-backends-infra--session-terminal-backend 'ghostel)
+              (insert "    | /tmp/nope.txt\n")
+              (insert "    | screenshot.png\n")
+              (ai-code-session-link--linkify-session-region (point-min) (point-max))
+              (let* ((preview-overlays
+                      (cl-remove-if-not
+                       (lambda (overlay)
+                         (overlay-get overlay 'ai-code-session-image-preview))
+                       (overlays-in (point-min) (point-max))))
+                     (after-string (overlay-get (car preview-overlays)
+                                                'after-string)))
+                (should (= (length preview-overlays) 1))
+                (should (string-prefix-p "\n    " after-string))))))
+      (when (file-directory-p root)
+        (delete-directory root t)))))
+
+(ert-deftest ai-code-session-link-test-ghostel-image-preview-absorbs-clicks ()
+  "Clicking the inline image preview should not open the file link."
+  (let* ((root (make-temp-file "ai-code-session-image-preview-click-" t))
+         (image-file (expand-file-name "screenshot.png" root)))
+    (unwind-protect
+        (progn
+          (with-temp-file image-file
+            (insert "fake image bytes"))
+          (cl-letf (((symbol-function 'display-images-p)
+                     (lambda (&optional _display) t))
+                    ((symbol-function 'create-image)
+                     (lambda (file &rest args)
+                       (list :image file :args args))))
+            (with-temp-buffer
+              (setq-local ai-code-backends-infra--session-directory root)
+              (setq-local ai-code-backends-infra--session-terminal-backend 'ghostel)
+              (insert "Saved screenshot.png\n")
+              (ai-code-session-link--linkify-session-region (point-min) (point-max))
+              (let* ((preview-overlays
+                      (cl-remove-if-not
+                       (lambda (overlay)
+                         (overlay-get overlay 'ai-code-session-image-preview))
+                       (overlays-in (point-min) (point-max))))
+                     (overlay (car preview-overlays))
+                     (after-string (overlay-get overlay 'after-string))
+                     (image-index (cl-position-if
+                                   (lambda (index)
+                                     (get-text-property index 'display after-string))
+                                   (number-sequence 0 (1- (length after-string)))))
+                     (preview-keymap
+                      (and image-index
+                           (get-text-property image-index 'keymap after-string))))
+                (should (= (length preview-overlays) 1))
+                (goto-char (point-min))
+                (search-forward "screenshot.png")
+                (should (eq (lookup-key (get-text-property (match-beginning 0)
+                                                           'keymap)
+                                        [mouse-1])
+                            'ai-code-session-navigate-link-at-mouse))
+                (should preview-keymap)
+                (should (eq (lookup-key preview-keymap [mouse-1])
+                            'ai-code-session-link--ignore-image-preview-event))
+                (should-not (eq (lookup-key preview-keymap [mouse-1])
+                                'ai-code-session-navigate-link-at-mouse))
+                (should-not (overlay-get overlay 'keymap))))))
+      (when (file-directory-p root)
+        (delete-directory root t)))))
+
+(ert-deftest ai-code-session-link-test-ghostel-image-preview-recreates-missing-overlay ()
+  "Image previews should be recreated when link text is already linked."
+  (let* ((root (make-temp-file "ai-code-session-image-preview-recreate-" t))
+         (image-file (expand-file-name "screenshot.png" root)))
+    (unwind-protect
+        (progn
+          (with-temp-file image-file
+            (insert "fake image bytes"))
+          (cl-letf (((symbol-function 'display-images-p)
+                     (lambda (&optional _display) t))
+                    ((symbol-function 'create-image)
+                     (lambda (file &rest args)
+                       (list :image file :args args))))
+            (with-temp-buffer
+              (setq-local ai-code-backends-infra--session-directory root)
+              (setq-local ai-code-backends-infra--session-terminal-backend 'ghostel)
+              (insert "Saved screenshot.png\n")
+              (ai-code-session-link--linkify-session-region (point-min) (point-max))
+              (dolist (overlay (overlays-in (point-min) (point-max)))
+                (when (overlay-get overlay 'ai-code-session-image-preview)
+                  (delete-overlay overlay)))
+              (goto-char (point-min))
+              (search-forward "screenshot.png")
+              (should (get-text-property (match-beginning 0)
+                                         'ai-code-session-link))
+              (ai-code-session-link--linkify-file-region (point-min) (point-max))
+              (should
+               (= (length
+                   (cl-remove-if-not
+                    (lambda (overlay)
+                      (overlay-get overlay 'ai-code-session-image-preview))
+                    (overlays-in (point-min) (point-max))))
+                  1)))))
+      (when (file-directory-p root)
+        (delete-directory root t)))))
+
+(ert-deftest ai-code-session-link-test-ghostel-image-preview-refreshes-unchanged-history ()
+  "Image previews should refresh for unchanged Ghostel history text."
+  (let* ((root (make-temp-file "ai-code-session-image-preview-history-" t))
+         (image-file (expand-file-name "history.png" root)))
+    (unwind-protect
+        (progn
+          (with-temp-file image-file
+            (insert "fake image bytes"))
+          (with-temp-buffer
+            (setq-local ai-code-backends-infra--session-directory root)
+            (setq-local ai-code-backends-infra--session-terminal-backend 'ghostel)
+            (insert "Saved history.png\n")
+            (cl-letf (((symbol-function 'display-images-p)
+                       (lambda (&optional _display) nil)))
+              (ai-code-session-link--linkify-session-region (point-min) (point-max)))
+            (goto-char (point-min))
+            (search-forward "history.png")
+            (should (get-text-property (match-beginning 0)
+                                       'ai-code-session-link))
+            (should-not
+             (cl-some
+              (lambda (overlay)
+                (overlay-get overlay 'ai-code-session-image-preview))
+              (overlays-in (point-min) (point-max))))
+            (cl-letf (((symbol-function 'display-images-p)
+                       (lambda (&optional _display) t))
+                      ((symbol-function 'create-image)
+                       (lambda (file &rest args)
+                         (list :image file :args args))))
+              (ai-code-session-link--linkify-session-region (point-min) (point-max)))
+            (should
+             (= (length
+                 (cl-remove-if-not
+                  (lambda (overlay)
+                    (overlay-get overlay 'ai-code-session-image-preview))
+                  (overlays-in (point-min) (point-max))))
+                1))))
+      (when (file-directory-p root)
+        (delete-directory root t)))))
+
+(ert-deftest ai-code-session-link-test-ghostel-image-preview-keeps-repeated-history-stable ()
+  "Unchanged Ghostel history should not duplicate live image previews."
+  (let* ((root (make-temp-file "ai-code-session-image-preview-repeat-" t))
+         (image-file (expand-file-name "history.png" root))
+         (create-count 0))
+    (unwind-protect
+        (progn
+          (with-temp-file image-file
+            (insert "fake image bytes"))
+          (cl-letf (((symbol-function 'display-images-p)
+                     (lambda (&optional _display) t))
+                    ((symbol-function 'create-image)
+                     (lambda (file &rest args)
+                       (setq create-count (1+ create-count))
+                       (list :image file :args args))))
+            (with-temp-buffer
+              (setq-local ai-code-backends-infra--session-directory root)
+              (setq-local ai-code-backends-infra--session-terminal-backend
+                          'ghostel)
+              (insert "Saved history.png\n")
+              (ai-code-session-link--linkify-session-region
+               (point-min) (point-max))
+              (should (= create-count 1))
+              (ai-code-session-link--linkify-session-region
+               (point-min) (point-max))
+              (should (= create-count 1))
+              (should
+               (= (length
+                   (cl-remove-if-not
+                    (lambda (overlay)
+                      (overlay-get overlay 'ai-code-session-image-preview))
+                    (overlays-in (point-min) (point-max))))
+                  1)))))
+      (when (file-directory-p root)
+        (delete-directory root t)))))
+
+(ert-deftest ai-code-session-link-test-ghostel-image-preview-strict-visible-scan ()
+  "Strict visible image scanning should preview local images without project scans."
+  (let* ((root (make-temp-file "ai-code-session-image-preview-visible-" t))
+         (image-file (expand-file-name "visible.png" root))
+         project-scan-count)
+    (unwind-protect
+        (progn
+          (with-temp-file image-file
+            (insert "fake image bytes"))
+          (cl-letf (((symbol-function 'display-images-p)
+                     (lambda (&optional _display) t))
+                    ((symbol-function 'create-image)
+                     (lambda (data &rest args)
+                       (list :image data :args args)))
+                    ((symbol-function 'ai-code-session-link--project-files)
+                     (lambda (&rest _args)
+                       (setq project-scan-count (1+ (or project-scan-count 0)))
+                       nil)))
+            (with-temp-buffer
+              (setq-local ai-code-backends-infra--session-directory root)
+              (setq-local ai-code-backends-infra--session-terminal-backend
+                          'ghostel)
+              (insert "Saved to: " image-file "\n")
+              (setq buffer-read-only t)
+              (ai-code-session-link--linkify-strict-image-preview-region
+               (point-min) (point-max))
+              (should-not project-scan-count)
+              (should
+               (= (length
+                   (cl-remove-if-not
+                    (lambda (overlay)
+                      (overlay-get overlay 'ai-code-session-image-preview))
+                    (overlays-in (point-min) (point-max))))
+                  1)))))
+      (when (file-directory-p root)
+        (delete-directory root t)))))
+
+(ert-deftest ai-code-session-link-test-ghostel-image-preview-strict-visible-wrap ()
+  "Strict visible image scanning should handle simple wrapped file URLs."
+  (let* ((root (make-temp-file "ai-code-session-image-preview-visible-wrap-" t))
+         (dir (expand-file-name "generated_images/session" root))
+         (image-file (expand-file-name "ig_wrapped_image.png" dir))
+         (split-index (- (length image-file)
+                         (length (file-name-nondirectory image-file)))))
+    (unwind-protect
+        (progn
+          (make-directory dir t)
+          (with-temp-file image-file
+            (insert "fake image bytes"))
+          (cl-letf (((symbol-function 'display-images-p)
+                     (lambda (&optional _display) t))
+                    ((symbol-function 'create-image)
+                     (lambda (data &rest args)
+                       (list :image data :args args))))
+            (with-temp-buffer
+              (setq-local ai-code-backends-infra--session-directory root)
+              (setq-local ai-code-backends-infra--session-terminal-backend
+                          'ghostel)
+              (insert "file://")
+              (insert (substring image-file 0 split-index))
+              (insert "\n  ")
+              (let ((segment-start (point)))
+                (insert (substring image-file split-index))
+                (insert "\n")
+                (setq buffer-read-only t)
+                (ai-code-session-link--linkify-strict-image-preview-region
+                 (point-min) (point-max))
+                (let ((preview-overlays
+                       (cl-remove-if-not
+                        (lambda (overlay)
+                          (overlay-get overlay 'ai-code-session-image-preview))
+                        (overlays-in (point-min) (point-max)))))
+                  (should (= (length preview-overlays) 1))
+                  (should (equal (get-text-property
+                                  segment-start
+                                  'ai-code-session-link)
+                                 (concat "file://" image-file)))
+                  (should (equal (overlay-get (car preview-overlays)
+                                              'ai-code-session-image-file)
+                                 image-file)))))))
+      (when (file-directory-p root)
+        (delete-directory root t)))))
+
+(ert-deftest ai-code-session-link-test-ghostel-image-preview-file-url-wrap ()
+  "Ghostel image previews should handle terminal-wrapped file:// URLs."
+  (let* ((root (make-temp-file "ai-code-session-image-preview-url-" t))
+         (dir (expand-file-name "generated_images/019f3849-01c6-70d2-9306-f19721bfa0f4" root))
+         (image-file (expand-file-name
+                      "ig_0316e59b09ff2b45016a4be031a5b8819ab73e1af52a3e7bd2.png"
+                      dir))
+         (split-index (- (length image-file)
+                         (length (file-name-nondirectory image-file))))
+         (create-image-data nil))
+    (unwind-protect
+        (progn
+          (make-directory dir t)
+          (with-temp-file image-file
+            (insert "fake image bytes"))
+          (cl-letf (((symbol-function 'display-images-p)
+                     (lambda (&optional _display) t))
+                    ((symbol-function 'create-image)
+                     (lambda (data &rest args)
+                       (setq create-image-data data)
+                       (list :image data :args args))))
+            (with-temp-buffer
+              (setq-local ai-code-backends-infra--session-directory root)
+              (setq-local ai-code-backends-infra--session-terminal-backend 'ghostel)
+              (insert "  file://")
+              (insert (substring image-file 0 split-index))
+              (insert "\n")
+              (insert "    ")
+              (insert (substring image-file split-index))
+              (insert "\n")
+              (ai-code-session-link--linkify-session-region (point-min) (point-max))
+              (let ((preview-overlays
+                     (cl-remove-if-not
+                      (lambda (overlay)
+                        (overlay-get overlay 'ai-code-session-image-preview))
+                      (overlays-in (point-min) (point-max)))))
+                (should (= (length preview-overlays) 1))
+                (should (equal create-image-data "fake image bytes"))
+                (should (equal (overlay-get (car preview-overlays)
+                                            'ai-code-session-image-file)
+                               image-file))))))
+      (when (file-directory-p root)
+        (delete-directory root t)))))
+
+(ert-deftest ai-code-session-link-test-ghostel-image-preview-strict-visible-wrap-bare-path ()
+  "Strict visible scanning should rejoin a wrapped BARE absolute path.
+Regression: `ai-code-session-link--strict-previous-line-prefix' used a
+malformed negated character class (a `]' escaped with a backslash) that
+closed the class early, so it only matched lines ending in a literal `]'.
+Bare wrapped paths -- as printed by tools such as Claude, which omit the
+`file://' prefix -- were therefore never recovered from the previous row."
+  (let* ((root (make-temp-file
+                "ai-code-session-image-preview-visible-wrap-bare-" t))
+         (dir (expand-file-name
+               "generated/2d806356-90b2-4e71-82fa-30359ee62190" root))
+         (image-file (expand-file-name "ghostel-wrapped-bare-image.png" dir))
+         ;; Break right before the file name so the continuation row is a
+         ;; relative fragment (no leading slash) -- this is what forces the
+         ;; previous-line prefix recovery path (the buggy branch).
+         (split-index (- (length image-file)
+                         (length (file-name-nondirectory image-file)))))
+    (unwind-protect
+        (progn
+          (make-directory dir t)
+          (with-temp-file image-file
+            (insert "fake image bytes"))
+          (cl-letf (((symbol-function 'display-images-p)
+                     (lambda (&optional _display) t))
+                    ((symbol-function 'create-image)
+                     (lambda (data &rest args)
+                       (list :image data :args args))))
+            (with-temp-buffer
+              (setq-local ai-code-backends-infra--session-directory root)
+              (setq-local ai-code-backends-infra--session-terminal-backend
+                          'ghostel)
+              ;; Bare path (no file:// prefix) hard-wrapped across two rows,
+              ;; each carrying a leading render gutter.
+              (insert "  ")
+              (insert (substring image-file 0 split-index))
+              (insert "\n    ")
+              (insert (substring image-file split-index))
+              (insert "\n")
+              (setq buffer-read-only t)
+              (ai-code-session-link--linkify-strict-image-preview-region
+               (point-min) (point-max))
+              (let ((preview-overlays
+                     (cl-remove-if-not
+                      (lambda (overlay)
+                        (overlay-get overlay 'ai-code-session-image-preview))
+                      (overlays-in (point-min) (point-max)))))
+                (should (= (length preview-overlays) 1))
+                (should (equal (overlay-get (car preview-overlays)
+                                            'ai-code-session-image-file)
+                               image-file))))))
+      (when (file-directory-p root)
+        (delete-directory root t)))))
+
+(ert-deftest ai-code-session-link-test-ghostel-image-preview-strict-visible-wrap-three-rows ()
+  "Strict visible scanning should rejoin bare paths wrapped over three rows."
+  (let* ((root (make-temp-file
+                "ai-code-session-image-preview-visible-wrap-three-" t))
+         (dir (expand-file-name "sloth-layout-check" root))
+         (image-file (expand-file-name "sloth-window-after-53660.png" dir))
+         (needle "sloth-layout-check/sloth-window-after-53660.png")
+         (needle-start (string-match (regexp-quote needle) image-file))
+         (path-prefix (substring image-file 0 needle-start)))
+    (unwind-protect
+        (progn
+          (make-directory dir t)
+          (with-temp-file image-file
+            (insert "fake image bytes"))
+          (cl-letf (((symbol-function 'display-images-p)
+                     (lambda (&optional _display) t))
+                    ((symbol-function 'create-image)
+                     (lambda (data &rest args)
+                       (list :image data :args args))))
+            (with-temp-buffer
+              (setq-local ai-code-backends-infra--session-directory root)
+              (setq-local ai-code-backends-infra--session-terminal-backend
+                          'ghostel)
+              (insert "  ")
+              (insert path-prefix)
+              (insert "sloth-layout-\n    check/sloth-window-after-\n    53660.png\n")
+              (setq buffer-read-only t)
+              (ai-code-session-link--linkify-strict-image-preview-region
+               (point-min) (point-max))
+              (let ((preview-overlays
+                     (cl-remove-if-not
+                      (lambda (overlay)
+                        (overlay-get overlay 'ai-code-session-image-preview))
+                      (overlays-in (point-min) (point-max)))))
+                (should (= (length preview-overlays) 1))
+                (should (equal (overlay-get (car preview-overlays)
+                                            'ai-code-session-image-file)
+                               image-file))))))
+      (when (file-directory-p root)
+        (delete-directory root t)))))
+
+(ert-deftest ai-code-session-link-test-image-preview-max-dimensions ()
+  "Preview caps: integer customs are hard caps; nil height is uncapped."
+  ;; An explicit integer custom is used verbatim, regardless of any window.
+  (let ((ai-code-session-link-ghostel-image-preview-max-width 400)
+        (ai-code-session-link-ghostel-image-preview-max-height 300))
+    (with-temp-buffer
+      (should (equal (ai-code-session-link--image-preview-max-dimensions "")
+                     '(400 . 300)))))
+  ;; With nil customs and no window showing the buffer, only the fixed width
+  ;; fallback applies.  Height remains uncapped so screenshots can fill width.
+  (let ((ai-code-session-link-ghostel-image-preview-max-width nil)
+        (ai-code-session-link-ghostel-image-preview-max-height nil))
+    (with-temp-buffer
+      (should (equal (ai-code-session-link--image-preview-max-dimensions "  ")
+                     (cons ai-code-session-link--image-preview-fallback-max-width
+                           nil))))))
+
+(ert-deftest ai-code-session-link-test-ghostel-image-preview-common-reference-forms ()
+  "Ghostel image previews should handle common local image reference forms."
+  (let* ((root (make-temp-file "ai-code-session-image-preview-forms-" t))
+         (image-dir (expand-file-name "generated images" root))
+         (spaced-image (expand-file-name "My Image.png" image-dir))
+         (relative-dir (expand-file-name "relative output" root))
+         (relative-image (expand-file-name "Relative Image.png" relative-dir))
+         (plain-image (expand-file-name "plain.png" root)))
+    (unwind-protect
+        (progn
+          (make-directory image-dir t)
+          (make-directory relative-dir t)
+          (dolist (file (list spaced-image relative-image plain-image))
+            (with-temp-file file
+              (insert "fake image bytes")))
+          (cl-labels
+              ((preview-file-for
+                (output)
+                (let (create-image-called)
+                  (cl-letf (((symbol-function 'display-images-p)
+                             (lambda (&optional _display) t))
+                            ((symbol-function 'create-image)
+                             (lambda (data &rest args)
+                               (setq create-image-called t)
+                               (list :image data :args args))))
+                    (with-temp-buffer
+                      (setq-local ai-code-backends-infra--session-directory root)
+                      (setq-local ai-code-backends-infra--session-terminal-backend 'ghostel)
+                      (insert output)
+                      (ai-code-session-link--linkify-session-region
+                       (point-min) (point-max))
+                      (let* ((preview-overlays
+                              (cl-remove-if-not
+                               (lambda (overlay)
+                                 (overlay-get overlay 'ai-code-session-image-preview))
+                               (overlays-in (point-min) (point-max))))
+                             (preview-count (length preview-overlays))
+                             (preview-file
+                              (and create-image-called
+                                   (overlay-get (car preview-overlays)
+                                                'ai-code-session-image-file))))
+                        (cons preview-file preview-count)))))))
+            (let ((cases
+                   (list
+                    (list (format "![preview](file://%s)\n"
+                                  (replace-regexp-in-string " " "%20" spaced-image))
+                          spaced-image)
+                    (list (format "[[file:%s][preview]]\n" plain-image)
+                          plain-image)
+                    (list (format "file://localhost%s\n" plain-image)
+                          plain-image)
+                    (list (format "Saved to: \"%s\"\n" spaced-image)
+                          spaced-image)
+                    (list (format "Saved to: %s\n"
+                                  (replace-regexp-in-string " " "\\\\ " spaced-image))
+                          spaced-image)
+                    (list "![preview](relative output/Relative Image.png)\n"
+                          relative-image))))
+              (dolist (case cases)
+                (let ((result (preview-file-for (car case))))
+                  (should (equal (car result) (cadr case)))
+                  (should (= (cdr result) 1)))))))
+      (when (file-directory-p root)
+        (delete-directory root t)))))
+
+(ert-deftest ai-code-session-link-test-image-preview-skips-non-ghostel-session ()
+  "Image preview overlays should not be added for non-Ghostel terminals."
+  (let* ((root (make-temp-file "ai-code-session-image-preview-skip-" t))
+         (image-file (expand-file-name "screenshot.png" root))
+         (create-image-called nil))
+    (unwind-protect
+        (progn
+          (with-temp-file image-file
+            (insert "fake image bytes"))
+          (cl-letf (((symbol-function 'display-images-p)
+                     (lambda (&optional _display) t))
+                    ((symbol-function 'create-image)
+                     (lambda (&rest _args)
+                       (setq create-image-called t)
+                       'image)))
+            (with-temp-buffer
+              (setq-local ai-code-backends-infra--session-directory root)
+              (setq-local ai-code-backends-infra--session-terminal-backend 'vterm)
+              (insert "Saved screenshot.png\n")
+              (ai-code-session-link--linkify-session-region (point-min) (point-max))
+              (should-not create-image-called)
+              (should-not
+               (cl-some
+                (lambda (overlay)
+                  (overlay-get overlay 'ai-code-session-image-preview))
+                (overlays-in (point-min) (point-max)))))))
+      (when (file-directory-p root)
+        (delete-directory root t)))))
+
+(ert-deftest ai-code-session-link-test-image-preview-respects-size-limit ()
+  "Image previews should skip files over the configured byte limit."
+  (let* ((root (make-temp-file "ai-code-session-image-preview-size-" t))
+         (image-file (expand-file-name "large.png" root))
+         (create-image-called nil)
+         (ai-code-session-link-ghostel-image-preview-max-bytes 1))
+    (unwind-protect
+        (progn
+          (with-temp-file image-file
+            (insert "too large"))
+          (cl-letf (((symbol-function 'display-images-p)
+                     (lambda (&optional _display) t))
+                    ((symbol-function 'create-image)
+                     (lambda (&rest _args)
+                       (setq create-image-called t)
+                       'image)))
+            (with-temp-buffer
+              (setq-local ai-code-backends-infra--session-directory root)
+              (setq-local ai-code-backends-infra--session-terminal-backend 'ghostel)
+              (insert "Saved large.png\n")
+              (ai-code-session-link--linkify-session-region (point-min) (point-max))
+              (should-not create-image-called))))
       (when (file-directory-p root)
         (delete-directory root t)))))
 

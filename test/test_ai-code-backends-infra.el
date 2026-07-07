@@ -707,6 +707,29 @@ The prefix argument should also force instance-name prompting."
         (funcall (cdr (assq 'window-width captured-entry)) 'fake-window)
         (should (equal resize-call '(fake-window 4 t)))))))
 
+(ert-deftest test-ai-code-backends-infra-display-buffer-linkifies-visible-ghostel-images ()
+  "Displaying a Ghostel session should scan only visible text for images."
+  (let ((ai-code-backends-infra-use-side-window nil)
+        (ai-code-backends-infra-focus-on-open nil)
+        displayed-buffer
+        display-linkified-window)
+    (with-temp-buffer
+      (setq-local ai-code-backends-infra--session-terminal-backend 'ghostel)
+      (cl-letf (((symbol-function 'display-buffer)
+                 (lambda (buffer &rest _args)
+                   (setq displayed-buffer buffer)
+                   (selected-window)))
+                ((symbol-function 'ai-code-backends-infra--sync-terminal-dimensions)
+                 (lambda (&rest _args) nil))
+                ((symbol-function
+                  'ai-code-backends-infra-ghostel-schedule-visible-image-linkify)
+                 (lambda (window)
+                   (setq display-linkified-window window))))
+        (ai-code-backends-infra--display-buffer-in-side-window
+         (current-buffer))
+        (should (eq displayed-buffer (current-buffer)))
+        (should (eq display-linkified-window (selected-window)))))))
+
 (ert-deftest test-ai-code-backends-infra-terminal-reflow-filter-ignores-non-ai-vterm-buffer ()
   "The reflow filter should pass through non-session vterm buffers."
   (with-temp-buffer
@@ -1437,7 +1460,7 @@ The prefix argument should also force instance-name prompting."
        saved-default))))
 
 (ert-deftest test-ai-code-backends-infra-create-terminal-session-ghostel-wraps-output-filter ()
-  "Ghostel session creation should track meaningful output and linkify output."
+  "Ghostel session creation should track output and schedule linkification."
   (let* ((buffer-name "*test-ai-code-ghostel-output*")
          (buffer (get-buffer-create buffer-name))
          (proc (make-process :name "ai-code-ghostel-output"
@@ -1446,13 +1469,13 @@ The prefix argument should also force instance-name prompting."
                              :noquery t))
          (orig-outputs nil)
          (meaningful-outputs nil)
-         (linkify-outputs nil)
+         (scheduled-outputs nil)
          (ai-code-backends-infra-terminal-backend 'ghostel)
          (note-advice (lambda (&rest _args)
                         (push 'noted meaningful-outputs)))
-         (linkify-advice (lambda (orig-fun output)
-                           (push output linkify-outputs)
-                           (funcall orig-fun output))))
+         (schedule-advice (lambda (_orig-fun target-buffer output &optional delay)
+                            (push (list target-buffer output delay)
+                                  scheduled-outputs))))
     (unwind-protect
         (progn
           (set-process-filter
@@ -1461,8 +1484,8 @@ The prefix argument should also force instance-name prompting."
              (push output orig-outputs)))
           (advice-add 'ai-code-backends-infra--note-meaningful-output
                       :before note-advice)
-          (advice-add 'ai-code-session-link--linkify-recent-output
-                      :around linkify-advice)
+          (advice-add 'ai-code-session-link--schedule-linkify-recent-output
+                      :around schedule-advice)
           (cl-letf (((symbol-function 'ai-code-backends-infra--terminal-ensure-backend)
                      (lambda () nil))
                     ((symbol-function 'ghostel-exec)
@@ -1478,9 +1501,11 @@ The prefix argument should also force instance-name prompting."
           (funcall (process-filter proc) proc "src/foo.el:12\n")
           (should (equal orig-outputs '("src/foo.el:12\n")))
           (should (equal meaningful-outputs '(noted)))
-          (should (equal linkify-outputs '("src/foo.el:12\n"))))
+          (should (equal scheduled-outputs
+                         (list (list buffer "src/foo.el:12\n" 0.05)))))
       (advice-remove 'ai-code-backends-infra--note-meaningful-output note-advice)
-      (advice-remove 'ai-code-session-link--linkify-recent-output linkify-advice)
+      (advice-remove 'ai-code-session-link--schedule-linkify-recent-output
+                     schedule-advice)
       (when (process-live-p proc)
         (delete-process proc))
       (when (buffer-live-p buffer)
@@ -1492,7 +1517,7 @@ The prefix argument should also force instance-name prompting."
          (buffer (get-buffer-create buffer-name))
          (orig-filter-called nil)
          (note-called nil)
-         (linkify-called nil)
+         (schedule-called nil)
          (wrapped-filter nil)
          (ai-code-backends-infra-terminal-backend 'ghostel))
     (unwind-protect
@@ -1523,9 +1548,9 @@ The prefix argument should also force instance-name prompting."
                     ((symbol-function 'ai-code-backends-infra--note-meaningful-output)
                      (lambda (&rest _args)
                        (setq note-called t)))
-                    ((symbol-function 'ai-code-session-link--linkify-recent-output)
+                    ((symbol-function 'ai-code-session-link--schedule-linkify-recent-output)
                      (lambda (&rest _args)
-                       (setq linkify-called t))))
+                       (setq schedule-called t))))
             (ai-code-backends-infra--create-terminal-session
              buffer-name
              default-directory
@@ -1540,7 +1565,7 @@ The prefix argument should also force instance-name prompting."
              (error t)))
           (should-not orig-filter-called)
           (should-not note-called)
-          (should-not linkify-called))
+          (should-not schedule-called))
       (when (buffer-live-p buffer)
         (kill-buffer buffer)))))
 
