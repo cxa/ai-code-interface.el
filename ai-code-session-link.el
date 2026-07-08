@@ -130,6 +130,12 @@ impose a fixed hard cap instead."
   "[-[:alnum:]_./~%+:\\\\]+"
   "Regexp matching one terminal row fragment of a local path.")
 
+(defconst ai-code-session-link--wrapped-path-seed-regexp
+  "@?\\(?:file:\\(?://localhost\\|//\\)?\\)?[-[:alnum:]_./~%+:\\\\]*[./][-[:alnum:]_./~%+:\\\\]*"
+  "Regexp matching a first-row path fragment that may wrap.
+Unlike `ai-code-session-link--path-base-regexp', this accepts fragments
+ending at a directory separator, such as \"src/\".")
+
 (defconst ai-code-session-link--wrapped-path-max-lines 8
   "Maximum number of terminal rows inspected for one wrapped path.")
 
@@ -1018,6 +1024,14 @@ Optional NEXT-FILE-START caps the scan boundary."
     (skip-chars-forward " \t" end)
     (>= (point) end)))
 
+(defun ai-code-session-link--wrapped-suffix-prefix-between-p (start end)
+  "Return non-nil when text between START and END may precede a wrapped suffix."
+  (let ((suffix-prefix
+         (string-trim
+          (buffer-substring-no-properties start end))))
+    (or (string-empty-p suffix-prefix)
+        (member suffix-prefix '(":" ":L" "#" "#L")))))
+
 (defun ai-code-session-link--line-path-fragment-bounds (start end)
   "Return path fragment bounds between START and END after indentation."
   (save-excursion
@@ -1062,7 +1076,8 @@ search, and ROOT is the session project root."
           (continued-lines 0)
           (scan t))
       (setq current-line-end first-line-end)
-      (when (ai-code-session-link--blank-between-p match-end first-line-end)
+      (when (ai-code-session-link--wrapped-suffix-prefix-between-p
+             match-end first-line-end)
         (while (and scan
                     (< continued-lines ai-code-session-link--wrapped-path-max-lines)
                     (< current-line-end scan-end)
@@ -1103,7 +1118,7 @@ search, and ROOT is the session project root."
   (let (file-links)
     (save-excursion
       (goto-char start)
-      (while (re-search-forward ai-code-session-link--path-base-regexp end t)
+      (while (re-search-forward ai-code-session-link--wrapped-path-seed-regexp end t)
         (when-let* ((file-link
                      (ai-code-session-link--wrapped-file-link-at
                       (match-beginning 0)
