@@ -229,16 +229,19 @@ STATE and PROGRESS use the signature of `ghostel-progress-function'."
 
 (defun ai-code-backends-infra-ghostel--linkify-visible-image-previews
     (buffer window)
-  "Linkify image previews for visible text in BUFFER shown by WINDOW."
+  "Linkify session links and image previews in BUFFER shown by WINDOW."
   (when (and (buffer-live-p buffer)
              (window-live-p window)
              (eq (window-buffer window) buffer))
     (with-current-buffer buffer
       (ai-code-backends-infra-ghostel--prune-visible-image-linkify-timers)
-      (when (ai-code-backends-infra-ghostel--trusted-local-session-p)
-        (when-let* ((region
-                     (ai-code-backends-infra-ghostel--visible-image-region
-                      window)))
+      (when-let* ((region
+                   (ai-code-backends-infra-ghostel--visible-image-region
+                    window)))
+        (ai-code-session-link--linkify-session-region
+         (car region)
+         (cdr region))
+        (when (ai-code-backends-infra-ghostel--trusted-local-session-p)
           (ai-code-session-link--linkify-strict-image-preview-region
            (car region)
            (cdr region)))))))
@@ -274,15 +277,14 @@ STATE and PROGRESS use the signature of `ghostel-progress-function'."
 
 (defun ai-code-backends-infra-ghostel--linkify-image-preview-region
     (buffer start end)
-  "Linkify image previews in BUFFER between START and END.
+  "Linkify session links and image previews in BUFFER between START and END.
 The region is bounded so Ghostel redraw/link-detection advice cannot
 accidentally scan an entire scrollback buffer."
   (when (and (buffer-live-p buffer)
              (integer-or-marker-p start)
              (integer-or-marker-p end))
     (with-current-buffer buffer
-      (when (and (ai-code-backends-infra-ghostel--ai-session-buffer-p)
-                 (ai-code-backends-infra-ghostel--trusted-local-session-p))
+      (when (ai-code-backends-infra-ghostel--ai-session-buffer-p)
         (save-restriction
           (widen)
           (let ((start (if (markerp start) (marker-position start) start))
@@ -308,12 +310,14 @@ accidentally scan an entire scrollback buffer."
                              (- end
                                 ai-code-backends-infra-ghostel-visible-image-linkify-max-chars))))
                 (when (< start end)
-                  (ai-code-session-link--linkify-strict-image-preview-region
-                   start end))))))))))
+                  (ai-code-session-link--linkify-session-region start end)
+                  (when (ai-code-backends-infra-ghostel--trusted-local-session-p)
+                    (ai-code-session-link--linkify-strict-image-preview-region
+                     start end)))))))))))
 
 (defun ai-code-backends-infra-ghostel-schedule-visible-image-linkify
     (window &optional delays)
-  "Schedule image preview linkification for visible Ghostel text in WINDOW.
+  "Schedule visible session link and image preview linkification for WINDOW.
 Optional DELAYS overrides
 `ai-code-backends-infra-ghostel-visible-image-linkify-delays'."
   (when (and (window-live-p window)
@@ -324,22 +328,21 @@ Optional DELAYS overrides
           (ai-code-backends-infra-ghostel--prune-visible-image-linkify-timers)
           (ai-code-backends-infra-ghostel--cancel-visible-image-linkify-timers
            window)
-          (when (ai-code-backends-infra-ghostel--trusted-local-session-p)
-            (let ((timers
-                   (mapcar
-                    (lambda (delay)
-                      (run-at-time
-                       delay nil
-                       #'ai-code-backends-infra-ghostel--linkify-visible-image-previews
-                       buffer window))
-                    (or delays
-                        ai-code-backends-infra-ghostel-visible-image-linkify-delays))))
-              (ai-code-backends-infra-ghostel--register-visible-image-linkify-timers
-               window timers))))))))
+          (let ((timers
+                 (mapcar
+                  (lambda (delay)
+                    (run-at-time
+                     delay nil
+                     #'ai-code-backends-infra-ghostel--linkify-visible-image-previews
+                     buffer window))
+                  (or delays
+                      ai-code-backends-infra-ghostel-visible-image-linkify-delays))))
+            (ai-code-backends-infra-ghostel--register-visible-image-linkify-timers
+             window timers)))))))
 
 (defun ai-code-backends-infra-ghostel-schedule-visible-image-linkify-for-buffer
     (&optional buffer delays)
-  "Schedule visible image preview linkification for BUFFER's live windows.
+  "Schedule visible session link and image preview linkification for BUFFER.
 Optional DELAYS overrides the default visible image linkification delays."
   (let ((buffer (or buffer (current-buffer))))
     (when (buffer-live-p buffer)
@@ -348,19 +351,19 @@ Optional DELAYS overrides the default visible image linkification delays."
          window delays)))))
 
 (defun ai-code-backends-infra-ghostel--window-scroll (window _display-start)
-  "Schedule visible image preview linkification after WINDOW scrolls."
+  "Schedule visible session link and image preview linkification for WINDOW."
   (ai-code-backends-infra-ghostel-schedule-visible-image-linkify
    window
    (list ai-code-backends-infra-ghostel-scroll-image-linkify-delay)))
 
 (defun ai-code-backends-infra-ghostel--after-readonly-command (&rest _args)
-  "Schedule visible image preview linkification after Ghostel mode changes."
+  "Schedule visible session link and image preview linkification."
   (when (ai-code-backends-infra-ghostel--ai-session-buffer-p)
     (ai-code-backends-infra-ghostel-schedule-visible-image-linkify-for-buffer
      (current-buffer))))
 
 (defun ai-code-backends-infra-ghostel--after-redispatch-scroll-event (event)
-  "Schedule visible image preview linkification after Ghostel scroll EVENT."
+  "Schedule visible session link and image preview linkification after EVENT."
   (when-let* ((window (ignore-errors (posn-window (event-start event))))
               ((window-live-p window)))
     (ai-code-backends-infra-ghostel-schedule-visible-image-linkify

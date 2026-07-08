@@ -100,6 +100,22 @@ impose a fixed hard cap instead."
     map)
   "Keymap used to keep inline image previews from opening file links.")
 
+(defconst ai-code-session-link--managed-properties
+  '(ai-code-session-link nil
+    ai-code-session-symbol-link nil
+    ai-code-session-symbol-file nil
+    ai-code-session-hover-link nil
+    mouse-face nil
+    help-echo nil
+    keymap nil
+    follow-link nil
+    font-lock-face nil
+    face nil)
+  "Text properties managed by AI Code session linkification.")
+
+(defconst ai-code-session-link--linkify-rules-version 1
+  "Version of session linkification rules used by unchanged-region caching.")
+
 (defconst ai-code-session-link--linkify-min-tail-width 512
   "Minimum number of tail characters to rescan for session links.")
 
@@ -109,6 +125,33 @@ impose a fixed hard cap instead."
 (defconst ai-code-session-link--url-pattern-regexp
   "\\(https?://[^][(){}<>\"' \t\n]+\\)"
   "Regexp matching http/https URLs in session buffers.")
+
+(defconst ai-code-session-link--url-fragment-regexp
+  "[^][(){}<>\"' \t\n\r]+"
+  "Regexp matching one terminal row fragment of a URL.")
+
+(defconst ai-code-session-link--url-continuation-end-cue-regexp
+  "[?#&=._%+-]"
+  "Regexp matching URL punctuation that can end a wrapped row.")
+
+(defconst ai-code-session-link--url-continuation-start-cue-regexp
+  "[/?#&=._%+-]"
+  "Regexp matching URL punctuation that can start a wrapped row.")
+
+(defconst ai-code-session-link--url-query-fragment-regexp
+  "[?#&=]"
+  "Regexp matching query punctuation inside a wrapped URL fragment.")
+
+(defconst ai-code-session-link--url-mid-token-cue-regexp
+  "[-._~%]"
+  "Regexp matching path token punctuation that suggests a URL wraps mid-token.")
+
+(defconst ai-code-session-link--url-mid-token-fragment-regexp
+  "\\`[[:alnum:]][[:alnum:]._~%-]*\\'"
+  "Regexp matching a URL path token fragment split across terminal rows.")
+
+(defconst ai-code-session-link--wrapped-url-max-lines 8
+  "Maximum number of terminal rows inspected for one wrapped URL.")
 
 (defconst ai-code-session-link--symbol-neighborhood-max-width 168
   "Maximum number of characters to scan for symbols near a file link.")
@@ -340,6 +383,9 @@ Tolerates Ghostel hard-wrapping via
 (defvar-local ai-code-session-link--last-region-text nil
   "Last relinkified region text used to skip unchanged property churn.")
 
+(defvar-local ai-code-session-link--last-region-rules-version nil
+  "Linkification rules version used for the last relinkified region.")
+
 (defvar ai-code-session-link--project-files-cache nil
   "Dynamic cache of project file lists used during one linkify pass.")
 
@@ -380,6 +426,11 @@ Tolerates Ghostel hard-wrapping via
   (when (stringp text)
     (replace-regexp-in-string "[\n\r][ \t]*" "" text)))
 
+(defun ai-code-session-link--normalize-url-link-text (text)
+  "Normalize visible URL TEXT across terminal-wrapped rows."
+  (when (stringp text)
+    (replace-regexp-in-string "[ \t]*[\n\r][ \t]*" "" text)))
+
 (defun ai-code-session-link--cache-get-or-compute (cache key compute)
   "Return cached value from CACHE for KEY, or call COMPUTE and store it."
   (if cache
@@ -400,6 +451,8 @@ Tolerates Ghostel hard-wrapping via
 (defun ai-code-session-link--unchanged-region-p (bounds region-text)
   "Return non-nil when BOUNDS and REGION-TEXT match the last relinkified region."
   (and (equal ai-code-session-link--last-region-bounds bounds)
+       (equal ai-code-session-link--last-region-rules-version
+              ai-code-session-link--linkify-rules-version)
        (equal ai-code-session-link--last-region-text region-text)))
 
 (defun ai-code-session-link--project-files (root)
@@ -473,21 +526,42 @@ Optional PROJECT-FILES supplies the project file list."
                    (file-exists-p candidate)))
             (ai-code-session-link--local-path-candidates path root)))
 
-(defun ai-code-session-link--cheap-file-link-candidate-p (path &optional root)
+(defun ai-code-session-link--syntactic-file-link-candidate-p (path)
+  "Return non-nil when PATH is syntactically file-like."
+  (when-let* ((normalized (ai-code-session-link--normalize-file path)))
+    (let ((extension (file-name-extension normalized)))
+      (or (string-match-p "\\`file:" normalized)
+          (file-name-absolute-p normalized)
+          (string-prefix-p "~/" normalized)
+          (string-prefix-p "./" normalized)
+          (string-prefix-p "../" normalized)
+          (string-match-p "[/\\\\]" normalized)
+          (and extension
+               (member (downcase extension)
+                       ai-code-session-link--basename-file-extensions))))))
+
+(defun ai-code-session-link--cheap-file-link-candidate-p
+    (path &optional root allow-local-probing)
   "Return non-nil when PATH is worth linkifying without project scans.
 Optional ROOT is the session project root used for bounded local existence
-checks.  Expensive project-wide resolution stays in
+checks.  When ALLOW-LOCAL-PROBING is nil, only syntactic checks are used.
+Expensive project-wide resolution stays in
 `ai-code-session-link--resolve-session-file' on activation."
   (when-let* ((normalized (ai-code-session-link--normalize-file path)))
     (let ((extension (file-name-extension normalized)))
-      (or (ai-code-session-link--resolve-existing-local-path normalized root)
+      (or (and allow-local-probing
+               (ai-code-session-link--resolve-existing-local-path
+                normalized root))
           (and (not (file-name-absolute-p normalized))
                (or (string-prefix-p "./" normalized)
                    (string-prefix-p "../" normalized)
                    (string-match-p "[/\\\\]" normalized)
                    (and extension
                         (member (downcase extension)
-                                ai-code-session-link--basename-file-extensions))))))))
+                                ai-code-session-link--basename-file-extensions))))
+          (and (not allow-local-probing)
+               (ai-code-session-link--syntactic-file-link-candidate-p
+                normalized))))))
 
 (defun ai-code-session-link--resolve-session-file (path)
   "Resolve PATH to an existing local path or a matching project file."
@@ -714,7 +788,8 @@ INDENT is inserted before the image on the preview line."
            (ai-code-session-link--buffer-project-files-cache))
           (ai-code-session-link--resolved-path-cache
            (make-hash-table :test 'equal)))
-      (dolist (file-link (ai-code-session-link--collect-file-links start end))
+      (dolist (file-link (ai-code-session-link--collect-file-links
+                          start end t))
         (let ((link-start (plist-get file-link :start))
               (link-end (plist-get file-link :end))
               (link-text (plist-get file-link :text)))
@@ -841,7 +916,16 @@ Optional HELP-ECHO overrides the hover help text."
 
 (defun ai-code-session-link--apply-link-properties-to-visible-text
     (start end properties)
-  "Apply PROPERTIES from START to END, skipping wrapped-line indentation."
+  "Apply PROPERTIES from START to END, skipping wrapped-line indentation.
+
+The visual link face is applied only to visible path fragments, but
+`mouse-face' spans the full wrapped range so hovering any fragment highlights
+the complete path."
+  (when-let* ((mouse-face (plist-get properties 'mouse-face)))
+    (add-text-properties
+     start end
+     (list 'ai-code-session-hover-link t
+           'mouse-face mouse-face)))
   (save-excursion
     (goto-char start)
     (let ((segment-start start)
@@ -851,12 +935,37 @@ Optional HELP-ECHO overrides the hover help text."
         (skip-chars-forward " \t" (min end (line-end-position)))
         (setq segment-start (point)
               segment-end (min end (line-end-position)))
-        (when (< segment-start segment-end)
-          (add-text-properties segment-start segment-end properties))
+        (let ((visible-end segment-end))
+          (while (and (< segment-start visible-end)
+                      (memq (char-before visible-end) '(?\s ?\t)))
+            (setq visible-end (1- visible-end)))
+          (when (< segment-start visible-end)
+            (add-text-properties segment-start visible-end properties)))
         (setq segment-start
               (if (< segment-end end)
                   (1+ segment-end)
                 end))))))
+
+(defun ai-code-session-link--remove-managed-properties-in-spans
+    (start end property)
+  "Remove managed properties from START to END in spans carrying PROPERTY."
+  (let ((pos start))
+    (while (< pos end)
+      (let ((next (or (next-single-property-change pos property nil end)
+                      end)))
+        (when (get-text-property pos property)
+          (remove-text-properties
+           pos next ai-code-session-link--managed-properties))
+        (setq pos next)))))
+
+(defun ai-code-session-link--remove-managed-properties (start end)
+  "Remove managed session link properties from START to END."
+  (ai-code-session-link--remove-managed-properties-in-spans
+   start end 'ai-code-session-hover-link)
+  ;; Keep removing older linkified regions that predate
+  ;; `ai-code-session-hover-link'.
+  (ai-code-session-link--remove-managed-properties-in-spans
+   start end 'ai-code-session-link))
 
 (defun ai-code-session-link--apply-symbol-properties (start end symbol file-link)
   "Apply clickable SYMBOL properties from START to END using FILE-LINK."
@@ -993,10 +1102,10 @@ Optional NEXT-FILE-START caps the scan boundary."
                  symbol-start symbol-end candidate file-link)
                 (setq link-count (1+ link-count))))))))))
 
-(defun ai-code-session-link--sort-and-prune-file-links (file-links)
-  "Return FILE-LINKS ordered by start, with contained links removed."
+(defun ai-code-session-link--sort-and-prune-links (links)
+  "Return LINKS ordered by start, with contained links removed."
   (let ((sorted
-         (sort file-links
+         (sort links
                (lambda (left right)
                  (let ((left-start (plist-get left :start))
                        (right-start (plist-get right :start))
@@ -1023,6 +1132,24 @@ Optional NEXT-FILE-START caps the scan boundary."
     (goto-char start)
     (skip-chars-forward " \t" end)
     (>= (point) end)))
+
+(defun ai-code-session-link--blank-or-url-closer-between-p (start end)
+  "Return non-nil when START to END is blank or URL closing syntax."
+  (save-excursion
+    (goto-char start)
+    (skip-chars-forward " \t" end)
+    (while (and (< (point) end)
+                (memq (char-after) '(?\" ?' ?\) ?\] ?\})))
+      (forward-char 1)
+      (skip-chars-forward " \t" end))
+    (>= (point) end)))
+
+(defun ai-code-session-link--path-token-separator-at-p (position limit)
+  "Return non-nil when POSITION is a path token separator before LIMIT."
+  (save-excursion
+    (goto-char position)
+    (and (< (point) limit)
+         (memq (char-after) '(?\s ?\t)))))
 
 (defun ai-code-session-link--wrapped-suffix-prefix-between-p (start end)
   "Return non-nil when text between START and END may precede a wrapped suffix."
@@ -1056,18 +1183,23 @@ Optional NEXT-FILE-START caps the scan boundary."
   (or (ai-code-session-link--file-suffix-end-at base-end line-end)
       base-end))
 
-(defun ai-code-session-link--wrapped-file-link-candidate-p (text root)
-  "Return non-nil when wrapped link TEXT resolves to a local file for ROOT."
+(defun ai-code-session-link--wrapped-file-link-candidate-p
+    (text root allow-local-probing)
+  "Return non-nil when wrapped link TEXT is a file reference.
+ROOT is used for local existence checks when ALLOW-LOCAL-PROBING is non-nil."
   (when-let* ((parsed (ai-code-session-link--parse-file-link-text text))
               (file (plist-get parsed :file))
               (normalized (ai-code-session-link--normalize-file file)))
-    (ai-code-session-link--resolve-existing-local-path normalized root)))
+    (if allow-local-probing
+        (ai-code-session-link--resolve-existing-local-path normalized root)
+      (ai-code-session-link--syntactic-file-link-candidate-p normalized))))
 
 (defun ai-code-session-link--wrapped-file-link-at
-    (match-start match-end scan-end root)
+    (match-start match-end scan-end root allow-local-probing)
   "Return a wrapped file link candidate starting at MATCH-START.
 MATCH-END is the end of the first-row path match.  SCAN-END bounds the
-search, and ROOT is the session project root."
+search, and ROOT is the session project root.  ALLOW-LOCAL-PROBING
+controls whether local existence checks are allowed."
   (save-excursion
     (goto-char match-start)
     (let ((first-line-end (min scan-end (line-end-position)))
@@ -1095,9 +1227,14 @@ search, and ROOT is the session project root."
               (let* ((base-end (cdr fragment))
                      (link-end
                       (ai-code-session-link--file-link-end-at
-                       base-end next-line-end)))
-                (if (not (ai-code-session-link--blank-between-p
-                          link-end next-line-end))
+                       base-end next-line-end))
+                     (blank-after-link
+                      (ai-code-session-link--blank-between-p
+                       link-end next-line-end))
+                     (token-ends-after-link
+                      (ai-code-session-link--path-token-separator-at-p
+                       link-end next-line-end)))
+                (if (not (or blank-after-link token-ends-after-link))
                     (setq scan nil)
                   (cl-incf continued-lines)
                   (let ((link-text
@@ -1105,16 +1242,19 @@ search, and ROOT is the session project root."
                           (buffer-substring-no-properties
                            match-start link-end))))
                     (when (ai-code-session-link--wrapped-file-link-candidate-p
-                           link-text root)
+                           link-text root allow-local-probing)
                       (setq best-link
                             (list :start match-start
                                   :end link-end
                                   :text link-text))))
-                  (setq current-line-end next-line-end)))))))
+                  (setq current-line-end next-line-end
+                        scan blank-after-link)))))))
       best-link)))
 
-(defun ai-code-session-link--collect-wrapped-file-links (start end root)
-  "Return hard-wrapped file link matches between START and END for ROOT."
+(defun ai-code-session-link--collect-wrapped-file-links
+    (start end root allow-local-probing)
+  "Return hard-wrapped file link matches between START and END for ROOT.
+ALLOW-LOCAL-PROBING controls whether local existence checks are allowed."
   (let (file-links)
     (save-excursion
       (goto-char start)
@@ -1124,23 +1264,27 @@ search, and ROOT is the session project root."
                       (match-beginning 0)
                       (match-end 0)
                       end
-                      root)))
+                      root
+                      allow-local-probing)))
           (push file-link file-links))))
     (nreverse file-links)))
 
-(defun ai-code-session-link--collect-file-links (start end)
-  "Return file link matches between START and END without eager resolution."
+(defun ai-code-session-link--collect-file-links
+    (start end allow-local-probing)
+  "Return file link matches between START and END.
+When ALLOW-LOCAL-PROBING is nil, only syntactic checks are used."
   (let ((root (ai-code-session-link--project-root-for-paths))
         (seen-starts (make-hash-table :test 'eql))
         file-links)
     (setq file-links
-          (ai-code-session-link--collect-wrapped-file-links start end root))
+          (ai-code-session-link--collect-wrapped-file-links
+           start end root allow-local-probing))
     (cl-labels
         ((add-link
           (match-start match-end link-text &optional candidate-text)
           (unless (gethash match-start seen-starts)
             (when (ai-code-session-link--cheap-file-link-candidate-p
-                   (or candidate-text link-text) root)
+                   (or candidate-text link-text) root allow-local-probing)
               (puthash match-start t seen-starts)
               (push (list :start match-start
                           :end match-end
@@ -1165,22 +1309,163 @@ search, and ROOT is the session project root."
                match-start match-end
                (buffer-substring-no-properties match-start match-end)
                path))))))
-    (ai-code-session-link--sort-and-prune-file-links file-links)))
+    (ai-code-session-link--sort-and-prune-links file-links)))
+
+(defun ai-code-session-link--trim-url-end (start end)
+  "Return URL end from START to END without terminal punctuation."
+  (while (and (< start end)
+              (memq (char-before end) '(?. ?, ?\; ?: ?! ??)))
+    (setq end (1- end)))
+  end)
+
+(defun ai-code-session-link--line-hard-wrapped-p (start end)
+  "Return non-nil when START to END appears to fill the session window."
+  (when-let* ((window (get-buffer-window (current-buffer) t)))
+    (>= (string-width (buffer-substring-no-properties start end))
+        (max 1 (window-body-width window)))))
+
+(defun ai-code-session-link--line-url-fragment-bounds (start end)
+  "Return URL fragment bounds between START and END after indentation."
+  (save-excursion
+    (goto-char start)
+    (skip-chars-forward " \t" end)
+    (let ((fragment-start (point)))
+      (when (looking-at ai-code-session-link--url-fragment-regexp)
+        (let ((fragment-end (min (match-end 0) end)))
+          (when (< fragment-start fragment-end)
+            (cons fragment-start fragment-end)))))))
+
+(defun ai-code-session-link--url-path-tail (url)
+  "Return the final path token in URL, or nil when URL has no path."
+  (when (string-match "\\`https?://[^/]+/\\(.+\\)\\'" url)
+    (let* ((path (replace-regexp-in-string "[?#].*\\'" "" (match-string 1 url)))
+           (tail (car (last (split-string path "/" t)))))
+      (and (not (string-empty-p tail)) tail))))
+
+(defun ai-code-session-link--url-mid-token-continuation-p
+    (fragment previous-fragment)
+  "Return non-nil when FRAGMENT continues PREVIOUS-FRAGMENT mid-token."
+  (when-let* ((tail (ai-code-session-link--url-path-tail previous-fragment)))
+    (and (not (string-suffix-p "/" previous-fragment))
+         (string-match-p ai-code-session-link--url-mid-token-cue-regexp tail)
+         (string-match-p ai-code-session-link--url-mid-token-fragment-regexp
+                         fragment))))
+
+(defun ai-code-session-link--url-continuation-fragment-p
+    (fragment previous-fragment hard-wrap-p)
+  "Return non-nil when FRAGMENT can continue PREVIOUS-FRAGMENT.
+HARD-WRAP-P means the previous terminal row appears to fill the window."
+  (or hard-wrap-p
+      (string-match-p
+       (concat ai-code-session-link--url-continuation-end-cue-regexp "\\'")
+       previous-fragment)
+      (string-match-p
+       (concat "\\`" ai-code-session-link--url-continuation-start-cue-regexp)
+       fragment)
+      (string-match-p ai-code-session-link--url-query-fragment-regexp
+                      fragment)
+      (ai-code-session-link--url-mid-token-continuation-p
+       fragment previous-fragment)))
+
+(defun ai-code-session-link--wrapped-url-at (match-start match-end scan-end)
+  "Return a wrapped URL candidate starting at MATCH-START.
+MATCH-END is the end of the first-row URL match.  SCAN-END bounds the search."
+  (save-excursion
+    (goto-char match-start)
+    (let* ((current-line-start (line-beginning-position))
+           (current-line-end (min scan-end (line-end-position)))
+           (current-line-hard-wrap
+            (ai-code-session-link--line-hard-wrapped-p
+             current-line-start current-line-end))
+           (first-link-end
+            (ai-code-session-link--trim-url-end match-start match-end))
+           (previous-fragment
+            (buffer-substring-no-properties match-start first-link-end))
+           (continued-lines 0)
+           (best-link nil)
+           (scan (and (= first-link-end match-end)
+                      (ai-code-session-link--blank-between-p
+                       match-end current-line-end))))
+      (while (and scan
+                  (< continued-lines ai-code-session-link--wrapped-url-max-lines)
+                  (< current-line-end scan-end)
+                  (eq (char-after current-line-end) ?\n))
+        (let* ((next-line-start (1+ current-line-end))
+               (next-line-end
+                (save-excursion
+                  (goto-char next-line-start)
+                  (min scan-end (line-end-position))))
+               (fragment
+                (ai-code-session-link--line-url-fragment-bounds
+                 next-line-start next-line-end)))
+          (if (not fragment)
+              (setq scan nil)
+            (let* ((fragment-start (car fragment))
+                   (fragment-end (cdr fragment))
+                   (trimmed-end
+                    (ai-code-session-link--trim-url-end
+                     fragment-start fragment-end))
+                   (fragment-text
+                    (buffer-substring-no-properties
+                     fragment-start fragment-end)))
+              (if (or (not (ai-code-session-link--blank-or-url-closer-between-p
+                            fragment-end next-line-end))
+                      (not
+                       (ai-code-session-link--url-continuation-fragment-p
+                        fragment-text previous-fragment current-line-hard-wrap)))
+                  (setq scan nil)
+                (cl-incf continued-lines)
+                (setq best-link
+                      (list :start match-start
+                            :end trimmed-end
+                            :text
+                            (ai-code-session-link--normalize-url-link-text
+                             (buffer-substring-no-properties
+                              match-start trimmed-end))))
+                (setq previous-fragment fragment-text
+                      current-line-start next-line-start
+                      current-line-end next-line-end
+                      current-line-hard-wrap
+                      (ai-code-session-link--line-hard-wrapped-p
+                       current-line-start current-line-end)))))))
+      best-link)))
+
+(defun ai-code-session-link--collect-url-links (start end)
+  "Return URL link matches between START and END."
+  (let (url-links)
+    (save-excursion
+      (goto-char start)
+      (while (re-search-forward ai-code-session-link--url-pattern-regexp end t)
+        (let* ((match-start (match-beginning 1))
+               (match-end (match-end 1))
+               (wrapped-link
+                (ai-code-session-link--wrapped-url-at
+                 match-start match-end end))
+               (link-end (or (plist-get wrapped-link :end)
+                             (ai-code-session-link--trim-url-end
+                              match-start match-end)))
+               (link-text
+                (or (plist-get wrapped-link :text)
+                    (buffer-substring-no-properties match-start link-end))))
+          (push (list :start match-start
+                      :end link-end
+                      :text link-text)
+                url-links))))
+    (ai-code-session-link--sort-and-prune-links url-links)))
 
 (defun ai-code-session-link--linkify-url-region (start end)
   "Apply URL session links between START and END."
-  (save-excursion
-    (goto-char start)
-    (while (re-search-forward ai-code-session-link--url-pattern-regexp end t)
-      (let* ((url-start (match-beginning 1))
-             (raw-url (match-string-no-properties 1))
-             (trimmed-url (replace-regexp-in-string "[.,;:!?]+\\'" "" raw-url))
-             (url-end (+ url-start (length trimmed-url))))
-        (ai-code-session-link--apply-properties
-         url-start url-end trimmed-url "mouse-1: Open URL")))))
+  (dolist (url-link (ai-code-session-link--collect-url-links start end))
+    (ai-code-session-link--apply-properties
+     (plist-get url-link :start)
+     (plist-get url-link :end)
+     (plist-get url-link :text)
+     "mouse-1: Open URL")))
 
-(defun ai-code-session-link--linkify-file-region (start end)
-  "Apply file session links between START and END."
+(defun ai-code-session-link--linkify-file-region
+    (start end allow-local-probing)
+  "Apply file session links between START and END.
+ALLOW-LOCAL-PROBING controls local existence checks and image previews."
   (let ((inhibit-read-only t)
         (inhibit-modification-hooks t))
     (ai-code-session-link--delete-image-preview-overlays start end)
@@ -1188,7 +1473,8 @@ search, and ROOT is the session project root."
            (ai-code-session-link--buffer-project-files-cache))
           (ai-code-session-link--resolved-path-cache
            (make-hash-table :test 'equal)))
-      (let ((file-links (ai-code-session-link--collect-file-links start end)))
+      (let ((file-links (ai-code-session-link--collect-file-links
+                         start end allow-local-probing)))
         (while file-links
           (let* ((file-link (car file-links))
                  (next-file-link (cadr file-links))
@@ -1196,7 +1482,9 @@ search, and ROOT is the session project root."
                  (match-end (plist-get file-link :end))
                  (link-text (plist-get file-link :text))
                  (image-link-file
-                  (ai-code-session-link--image-preview-link-file link-text)))
+                  (and allow-local-probing
+                       (ai-code-session-link--image-preview-link-file
+                        link-text))))
             (if image-link-file
                 (ai-code-session-link--apply-properties
                  match-start match-end link-text
@@ -1207,8 +1495,9 @@ search, and ROOT is the session project root."
                 (ai-code-session-link--linkify-symbols-near-file
                  link-text match-end end
                  (and next-file-link (plist-get next-file-link :start)))))
-            (ai-code-session-link--apply-image-preview
-             match-start match-end link-text)
+            (when allow-local-probing
+              (ai-code-session-link--apply-image-preview
+               match-start match-end link-text))
             (setq file-links (cdr file-links))))))))
 
 (defun ai-code-session-link--strict-image-candidate-bounds (match-start match-end)
@@ -1511,29 +1800,16 @@ visible-window recovery in large terminal scrollback."
                             region-text)
                            (ai-code-session-link--image-preview-refresh-needed-p
                             start end))
-                  (ai-code-session-link--linkify-file-region start end))
-              (let ((pos start))
-                (while (< pos end)
-                  (let ((next (or (next-single-property-change
-                                   pos 'ai-code-session-link nil end)
-                                  end)))
-                    (when (get-text-property pos 'ai-code-session-link)
-                      (remove-text-properties
-                       pos next
-                       '(ai-code-session-link nil
-                         ai-code-session-symbol-link nil
-                         ai-code-session-symbol-file nil
-                         mouse-face nil
-                         help-echo nil
-                         keymap nil
-                         follow-link nil
-                         font-lock-face nil
-                         face nil)))
-                    (setq pos next))))
+                  (ai-code-session-link--linkify-file-region start end t))
+              (ai-code-session-link--remove-managed-properties start end)
               (ai-code-session-link--linkify-url-region start end)
-              (ai-code-session-link--linkify-file-region start end)
+              (ai-code-session-link--linkify-file-region
+               start end
+               (ai-code-session-link--trusted-local-session-p))
               (setq ai-code-session-link--last-region-bounds bounds
-                    ai-code-session-link--last-region-text region-text))))))))
+                    ai-code-session-link--last-region-text region-text
+                    ai-code-session-link--last-region-rules-version
+                    ai-code-session-link--linkify-rules-version))))))))
 
 (defun ai-code-session-link--recent-output-tail-width (output)
   "Return the tail width to rescan after OUTPUT."

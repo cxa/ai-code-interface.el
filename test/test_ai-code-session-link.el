@@ -33,9 +33,15 @@
   (should (equal (ai-code-session-link--normalize-file
                   "file:///tmp/project/image-\nwrapped.png")
                  "/tmp/project/image-wrapped.png"))
+  (should (equal (ai-code-session-link--normalize-link-text
+                  "/tmp/project/My \n Image.png")
+                 "/tmp/project/My Image.png"))
+  (should (equal (ai-code-session-link--normalize-url-link-text
+                  "https://example.com/app-   \n  page=true")
+                 "https://example.com/app-page=true"))
   (should (equal (ai-code-session-link--normalize-file
-                  "/tmp/sloth-\nlayout-check/\nsloth-window-\nafter-53660.png")
-                 "/tmp/sloth-layout-check/sloth-window-after-53660.png"))
+                  "/tmp/layout-\ncheck/window-\nafter-53660.png")
+                 "/tmp/layout-check/window-after-53660.png"))
   (should (equal (ai-code-session-link--normalize-file
                   "<file:///tmp/project/My%20Image.png>")
                  "/tmp/project/My Image.png"))
@@ -141,6 +147,205 @@
         (delete-file outside-file))
       (when (file-directory-p root)
         (delete-directory root t)))))
+
+(ert-deftest ai-code-session-link-test-linkify-session-region-supports-wrapped-url ()
+  "Linkify all terminal rows of a hard-wrapped URL."
+  (with-temp-buffer
+    (insert "https://chatgpt.com/codex?app-landing-\npage=true\n")
+    (ai-code-session-link--linkify-session-region (point-min) (point-max))
+    (goto-char (point-min))
+    (search-forward "https://chatgpt.com/codex?app-landing-")
+    (let ((url "https://chatgpt.com/codex?app-landing-page=true")
+          (first-row-pos (match-beginning 0))
+          (newline-pos (line-end-position)))
+      (should (equal (get-text-property first-row-pos 'ai-code-session-link)
+                     url))
+      (should (eq (get-text-property first-row-pos 'face) 'link))
+      (should (eq (get-text-property newline-pos 'mouse-face)
+                  'highlight))
+      (search-forward "page=true")
+      (let ((second-row-pos (match-beginning 0)))
+        (should (equal (get-text-property second-row-pos
+                                          'ai-code-session-link)
+                       url))
+        (should (eq (get-text-property second-row-pos 'face) 'link))))))
+
+(ert-deftest ai-code-session-link-test-linkify-session-region-supports-mid-token-url-wrap ()
+  "Linkify URLs split in the middle of a path token."
+  (with-temp-buffer
+    (insert "origin\n")
+    (insert "https://example.com/repo/project-int\n")
+    (insert "erface.el\n")
+    (insert "HEAD\n")
+    (ai-code-session-link--linkify-session-region (point-min) (point-max))
+    (goto-char (point-min))
+    (search-forward "https://example.com/repo/project-int")
+    (let ((url "https://example.com/repo/project-interface.el")
+          (first-row-pos (match-beginning 0))
+          (newline-pos (line-end-position)))
+      (should (equal (get-text-property first-row-pos 'ai-code-session-link)
+                     url))
+      (should (eq (get-text-property newline-pos 'mouse-face) 'highlight))
+      (search-forward "erface.el")
+      (let ((second-row-pos (match-beginning 0)))
+        (should (equal (get-text-property second-row-pos
+                                          'ai-code-session-link)
+                       url))
+        (should (eq (get-text-property second-row-pos 'face) 'link)))
+      (search-forward "HEAD")
+      (should-not (get-text-property (match-beginning 0)
+                                     'ai-code-session-link)))))
+
+(ert-deftest ai-code-session-link-test-linkify-session-region-supports-url-wrap-after-padding ()
+  "Linkify wrapped URLs when terminal rows contain trailing padding."
+  (with-temp-buffer
+    (insert "origin\n")
+    (insert "https://example.com/repo/project-int   \n")
+    (insert "erface.el\n")
+    (insert "HEAD\n")
+    (ai-code-session-link--linkify-session-region (point-min) (point-max))
+    (goto-char (point-min))
+    (search-forward "https://example.com/repo/project-int")
+    (let ((url "https://example.com/repo/project-interface.el")
+          (first-row-pos (match-beginning 0))
+          (padding-pos (match-end 0)))
+      (should (equal (get-text-property first-row-pos 'ai-code-session-link)
+                     url))
+      (should-not (get-text-property padding-pos 'ai-code-session-link))
+      (should (eq (get-text-property padding-pos 'mouse-face) 'highlight))
+      (search-forward "erface.el")
+      (should (equal (get-text-property (match-beginning 0)
+                                        'ai-code-session-link)
+                     url)))))
+
+(ert-deftest ai-code-session-link-test-linkify-session-region-supports-quoted-url-wrap ()
+  "Linkify wrapped URLs terminated by a closing quote."
+  (with-temp-buffer
+    (insert "(use-package ai-code\n")
+    (insert "  :vc (:url\n")
+    (insert "\"https://example.com/repo/pkg\n")
+    (insert "-interface.el\"\n")
+    (insert "      :rev \"1.88\"))\n")
+    (ai-code-session-link--linkify-session-region (point-min) (point-max))
+    (goto-char (point-min))
+    (search-forward "https://example.com/repo/pkg")
+    (let ((url "https://example.com/repo/pkg-interface.el")
+          (first-row-pos (match-beginning 0))
+          (newline-pos (line-end-position)))
+      (should (equal (get-text-property first-row-pos
+                                        'ai-code-session-link)
+                     url))
+      (should (eq (get-text-property newline-pos 'mouse-face)
+                  'highlight))
+      (search-forward "-interface.el")
+      (let ((second-row-pos (match-beginning 0))
+            (closing-quote-pos (match-end 0)))
+        (should (equal (get-text-property second-row-pos
+                                          'ai-code-session-link)
+                       url))
+        (should (eq (get-text-property second-row-pos 'mouse-face)
+                    'highlight))
+        (should-not (get-text-property closing-quote-pos
+                                       'ai-code-session-link))
+        (should-not (get-text-property closing-quote-pos 'mouse-face))))))
+
+(ert-deftest ai-code-session-link-test-linkify-session-region-rejects-url-wrap-with-suffix ()
+  "Do not wrap URL fragments when a continuation row has trailing prose."
+  (with-temp-buffer
+    (insert "https://example.com/repo/pkg\n")
+    (insert "-interface.el suffix\n")
+    (ai-code-session-link--linkify-session-region (point-min) (point-max))
+    (goto-char (point-min))
+    (search-forward "https://example.com/repo/pkg")
+    (should (equal (get-text-property (match-beginning 0)
+                                      'ai-code-session-link)
+                   "https://example.com/repo/pkg"))
+    (search-forward "-interface.el")
+    (should-not (equal (get-text-property (match-beginning 0)
+                                          'ai-code-session-link)
+                       "https://example.com/repo/pkg-interface.el"))))
+
+(ert-deftest ai-code-session-link-test-linkify-session-region-supports-indented-wrapped-url ()
+  "Linkify wrapped URL continuations while leaving indentation unstyled."
+  (with-temp-buffer
+    (insert "https://example.com/app-\n  page=true.\n")
+    (ai-code-session-link--linkify-session-region (point-min) (point-max))
+    (goto-char (point-min))
+    (let ((url "https://example.com/app-page=true"))
+      (search-forward "https://example.com/app-")
+      (should (equal (get-text-property (match-beginning 0)
+                                        'ai-code-session-link)
+                     url))
+      (search-forward "  page=true")
+      (let ((indent-pos (match-beginning 0))
+            (path-pos (+ (match-beginning 0) 2))
+            (punctuation-pos (1- (line-end-position))))
+        (should-not (get-text-property indent-pos 'ai-code-session-link))
+        (should-not (get-text-property indent-pos 'face))
+        (should (eq (get-text-property indent-pos 'mouse-face)
+                    'highlight))
+        (should (equal (get-text-property path-pos 'ai-code-session-link)
+                       url))
+        (should-not (get-text-property punctuation-pos
+                                       'ai-code-session-link))))))
+
+(ert-deftest ai-code-session-link-test-linkify-session-region-does-not-wrap-url-into-prose ()
+  "Do not merge an ordinary following prose line into a URL."
+  (with-temp-buffer
+    (insert "Visit https://example.com/path\nnext line\n")
+    (ai-code-session-link--linkify-session-region (point-min) (point-max))
+    (goto-char (point-min))
+    (search-forward "https://example.com/path")
+    (should (equal (get-text-property (match-beginning 0)
+                                      'ai-code-session-link)
+                   "https://example.com/path"))
+    (forward-line 1)
+    (should-not (get-text-property (point) 'ai-code-session-link))
+    (should-not (get-text-property (point) 'mouse-face))))
+
+(ert-deftest ai-code-session-link-test-linkify-session-region-does-not-wrap-url-into-word ()
+  "Do not merge a single ordinary following word into a URL."
+  (with-temp-buffer
+    (insert "Visit https://example.com/path\ndone\n")
+    (ai-code-session-link--linkify-session-region (point-min) (point-max))
+    (goto-char (point-min))
+    (search-forward "https://example.com/path")
+    (should (equal (get-text-property (match-beginning 0)
+                                      'ai-code-session-link)
+                   "https://example.com/path"))
+    (forward-line 1)
+    (should-not (get-text-property (point) 'ai-code-session-link))
+    (should-not (get-text-property (point) 'mouse-face))))
+
+(ert-deftest ai-code-session-link-test-linkify-session-region-does-not-wrap-url-after-slash ()
+  "Do not merge prose after an ordinary URL ending in a slash."
+  (with-temp-buffer
+    (insert "Visit https://example.com/path/\ndone\n")
+    (ai-code-session-link--linkify-session-region (point-min) (point-max))
+    (goto-char (point-min))
+    (search-forward "https://example.com/path/")
+    (should (equal (get-text-property (match-beginning 0)
+                                      'ai-code-session-link)
+                   "https://example.com/path/"))
+    (forward-line 1)
+    (should-not (get-text-property (point) 'ai-code-session-link))
+    (should-not (get-text-property (point) 'mouse-face))))
+
+(ert-deftest ai-code-session-link-test-linkify-session-region-does-not-wrap-url-after-sentence-punctuation ()
+  "Do not merge prose after a URL with trailing sentence punctuation."
+  (with-temp-buffer
+    (insert "See https://example.com/path.\nDone\n")
+    (ai-code-session-link--linkify-session-region (point-min) (point-max))
+    (goto-char (point-min))
+    (search-forward "https://example.com/path")
+    (should (equal (get-text-property (match-beginning 0)
+                                      'ai-code-session-link)
+                   "https://example.com/path"))
+    (goto-char (match-end 0))
+    (should-not (get-text-property (point) 'ai-code-session-link))
+    (forward-line 1)
+    (should-not (get-text-property (point) 'ai-code-session-link))
+    (should-not (get-text-property (point) 'mouse-face))))
 
 (ert-deftest ai-code-session-link-test-linkify-session-region-matches-unique-project-basename ()
   "Linkify basename references when they uniquely match a project file."
@@ -728,11 +933,11 @@
 (ert-deftest ai-code-session-link-test-linkify-session-region-supports-wrapped-local-file ()
   "Linkify all terminal rows of a hard-wrapped local file path."
   (let* ((root (make-temp-file "ai-code-session-links-wrapped-path-" t))
-         (dir (expand-file-name "sloth-layout-check" root))
-         (file (expand-file-name "sloth-window-after-53660.png" dir))
+         (dir (expand-file-name "layout-check" root))
+         (file (expand-file-name "window-after-53660.png" dir))
          (wrapped-file
           (concat (file-name-as-directory root)
-                  "sloth-\n  layout-check/\n  sloth-window-\n  after-53660.png")))
+                  "layout-\n  check/\n  window-\n  after-53660.png")))
     (unwind-protect
         (progn
           (make-directory dir t)
@@ -749,7 +954,7 @@
               (should (equal (get-text-property first-row-pos 'ai-code-session-link)
                              file))
               (should (eq (get-text-property first-row-pos 'face) 'link)))
-            (search-forward "  layout-check/")
+            (search-forward "  check/")
             (let ((indent-pos (match-beginning 0))
                   (second-row-pos (+ (match-beginning 0) 2)))
               (should-not (get-text-property indent-pos 'ai-code-session-link))
@@ -757,7 +962,7 @@
               (should (equal (get-text-property second-row-pos 'ai-code-session-link)
                              file))
               (should (eq (get-text-property second-row-pos 'face) 'link)))
-            (search-forward "  sloth-window-")
+            (search-forward "  window-")
             (let ((indent-pos (match-beginning 0))
                   (third-row-pos (+ (match-beginning 0) 2)))
               (should-not (get-text-property indent-pos 'ai-code-session-link))
@@ -773,6 +978,111 @@
               (should (equal (get-text-property last-row-pos 'ai-code-session-link)
                              file))
               (should (eq (get-text-property last-row-pos 'face) 'link)))))
+      (when (file-directory-p root)
+        (delete-directory root t)))))
+
+(ert-deftest ai-code-session-link-test-linkify-session-region-supports-wrapped-file-before-argument ()
+  "Linkify a hard-wrapped file path followed by another command argument."
+  (let* ((root (make-temp-file "ai-code-session-links-wrapped-arg-" t))
+         (dir (expand-file-name "tmp/config" root))
+         (file (expand-file-name "init.el" dir))
+         (prefix (file-name-as-directory root))
+         (suffix (file-relative-name file prefix)))
+    (unwind-protect
+        (progn
+          (make-directory dir t)
+          (with-temp-file file
+            (insert ";;; init.el\n"))
+          (with-temp-buffer
+            (setq-local ai-code-backends-infra--session-directory root)
+            (insert "emacs -Q --batch -l ")
+            (insert prefix)
+            (insert "\n")
+            (insert suffix)
+            (insert " --eval\n")
+            (ai-code-session-link--linkify-session-region (point-min) (point-max))
+            (goto-char (point-min))
+            (search-forward prefix)
+            (let ((first-row-pos (match-beginning 0))
+                  (newline-pos (line-end-position)))
+              (should (equal (get-text-property first-row-pos
+                                                'ai-code-session-link)
+                             file))
+              (should (eq (get-text-property newline-pos 'mouse-face)
+                          'highlight)))
+            (search-forward suffix)
+            (let ((second-row-pos (match-beginning 0))
+                  (argument-pos (match-end 0)))
+              (should (equal (get-text-property second-row-pos
+                                                'ai-code-session-link)
+                             file))
+              (should (eq (get-text-property second-row-pos 'face)
+                          'link))
+              (should-not (get-text-property argument-pos
+                                             'ai-code-session-link))
+              (should-not (get-text-property argument-pos 'mouse-face)))))
+      (when (file-directory-p root)
+        (delete-directory root t)))))
+
+(ert-deftest ai-code-session-link-test-linkify-session-region-rejects-missing-wrapped-file-before-argument ()
+  "Do not merge missing hard-wrapped file paths before arguments."
+  (let* ((root (make-temp-file "ai-code-session-links-missing-arg-" t))
+         (prefix (file-name-as-directory root))
+         (suffix "tmp/config/missing.el"))
+    (unwind-protect
+        (with-temp-buffer
+          (setq-local ai-code-backends-infra--session-directory root)
+          (insert "emacs -Q --batch -l ")
+          (insert prefix)
+          (insert "\n")
+          (insert suffix)
+          (insert " --eval\n")
+          (ai-code-session-link--linkify-session-region (point-min) (point-max))
+          (goto-char (point-min))
+          (search-forward prefix)
+          (should-not (equal (get-text-property (match-beginning 0)
+                                                'ai-code-session-link)
+                             (concat prefix suffix)))
+          (search-forward suffix)
+          (should-not (equal (get-text-property (match-beginning 0)
+                                                'ai-code-session-link)
+                             (concat prefix suffix))))
+      (when (file-directory-p root)
+        (delete-directory root t)))))
+
+(ert-deftest ai-code-session-link-test-linkify-session-region-connects-wrapped-hover ()
+  "Hover properties should span wrapped path gaps without underlining them."
+  (let* ((root (make-temp-file "ai-code-session-links-wrapped-hover-" t))
+         (src-dir (expand-file-name "src" root))
+         (file (expand-file-name "feature.el" src-dir)))
+    (unwind-protect
+        (progn
+          (make-directory src-dir t)
+          (with-temp-file file
+            (insert ";;; feature.el\n"))
+          (with-temp-buffer
+            (setq-local ai-code-backends-infra--session-directory root)
+            (insert "src/\n  feature.el\n")
+            (ai-code-session-link--linkify-session-region (point-min) (point-max))
+            (goto-char (point-min))
+            (search-forward "src/")
+            (let ((first-row-pos (match-beginning 0))
+                  (newline-pos (line-end-position)))
+              (should (eq (get-text-property first-row-pos 'mouse-face)
+                          'highlight))
+              (should (eq (get-text-property newline-pos 'mouse-face)
+                          'highlight)))
+            (search-forward "  feature.el")
+            (let ((indent-pos (match-beginning 0))
+                  (file-pos (+ (match-beginning 0) 2)))
+              (should-not (get-text-property indent-pos 'ai-code-session-link))
+              (should-not (get-text-property indent-pos 'face))
+              (should (eq (get-text-property indent-pos 'mouse-face)
+                          'highlight))
+              (should (equal (get-text-property file-pos 'ai-code-session-link)
+                             "src/feature.el"))
+              (should (eq (get-text-property file-pos 'mouse-face)
+                          'highlight)))))
       (when (file-directory-p root)
         (delete-directory root t)))))
 
@@ -1072,6 +1382,11 @@
         (insert "Saved ./remote.png\n")
         (ai-code-session-link--linkify-session-region
          (point-min) (point-max))
+        (goto-char (point-min))
+        (search-forward "./remote.png")
+        (should (equal (get-text-property (match-beginning 0)
+                                          'ai-code-session-link)
+                       "./remote.png"))
         (should-not file-exists-called)
         (should-not create-image-called)
         (should-not
@@ -1231,7 +1546,8 @@ detection regexp must stitch those rows back together."
               (search-forward "screenshot.png")
               (should (get-text-property (match-beginning 0)
                                          'ai-code-session-link))
-              (ai-code-session-link--linkify-file-region (point-min) (point-max))
+              (ai-code-session-link--linkify-file-region
+               (point-min) (point-max) t)
               (should
                (= (length
                    (cl-remove-if-not
@@ -1502,9 +1818,9 @@ Bare wrapped paths -- as printed by tools such as Claude, which omit the
   "Strict visible scanning should rejoin bare paths wrapped over three rows."
   (let* ((root (make-temp-file
                 "ai-code-session-image-preview-visible-wrap-three-" t))
-         (dir (expand-file-name "sloth-layout-check" root))
-         (image-file (expand-file-name "sloth-window-after-53660.png" dir))
-         (needle "sloth-layout-check/sloth-window-after-53660.png")
+         (dir (expand-file-name "layout-check" root))
+         (image-file (expand-file-name "window-after-53660.png" dir))
+         (needle "layout-check/window-after-53660.png")
          (needle-start (string-match (regexp-quote needle) image-file))
          (path-prefix (substring image-file 0 needle-start)))
     (unwind-protect
@@ -1523,7 +1839,7 @@ Bare wrapped paths -- as printed by tools such as Claude, which omit the
                           'ghostel)
               (insert "  ")
               (insert path-prefix)
-              (insert "sloth-layout-\n    check/sloth-window-after-\n    53660.png\n")
+              (insert "layout-\n    check/window-after-\n    53660.png\n")
               (setq buffer-read-only t)
               (ai-code-session-link--linkify-strict-image-preview-region
                (point-min) (point-max))
@@ -1533,6 +1849,24 @@ Bare wrapped paths -- as printed by tools such as Claude, which omit the
                         (overlay-get overlay 'ai-code-session-image-preview))
                       (overlays-in (point-min) (point-max)))))
                 (should (= (length preview-overlays) 1))
+                (goto-char (point-min))
+                (search-forward "layout-")
+                (should (eq (get-text-property (match-beginning 0)
+                                               'mouse-face)
+                            'highlight))
+                (search-forward "    check/")
+                (let ((indent-pos (match-beginning 0))
+                      (path-pos (+ (match-beginning 0) 4)))
+                  (should-not (get-text-property indent-pos
+                                                 'ai-code-session-link))
+                  (should-not (get-text-property indent-pos 'face))
+                  (should (eq (get-text-property indent-pos 'mouse-face)
+                              'highlight))
+                  (should (equal (get-text-property path-pos
+                                                    'ai-code-session-link)
+                                 image-file))
+                  (should (eq (get-text-property path-pos 'mouse-face)
+                              'highlight)))
                 (should (equal (overlay-get (car preview-overlays)
                                             'ai-code-session-image-file)
                                image-file))))))

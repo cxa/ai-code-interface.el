@@ -187,7 +187,97 @@
           (ai-code-backends-infra-ghostel-schedule-visible-image-linkify
            (selected-window))
           (should (equal (mapcar #'car (reverse scheduled))
-                         '(0.1 0.5))))))))
+                          '(0.1 0.5))))))))
+
+(ert-deftest test-ai-code-backends-infra-ghostel-schedules-visible-linkify-remotely ()
+  "Visible linkification should still refresh URL links for remote sessions."
+  (let (scheduled)
+    (with-temp-buffer
+      (set-window-buffer (selected-window) (current-buffer))
+      (setq-local default-directory "/ssh:example:/repo/")
+      (setq-local ai-code-backends-infra--session-directory default-directory)
+      (setq-local ai-code-backends-infra--session-terminal-backend 'ghostel)
+      (let ((ai-code-backends-infra-ghostel-visible-image-linkify-delays
+             '(0.1)))
+        (cl-letf (((symbol-function 'run-at-time)
+                   (lambda (delay _repeat function &rest args)
+                     (push (list delay function args) scheduled)
+                     'mock-timer)))
+          (ai-code-backends-infra-ghostel-schedule-visible-image-linkify
+           (selected-window))
+          (should (= (length scheduled) 1))
+          (should (equal (caar scheduled) 0.1)))))))
+
+(ert-deftest test-ai-code-backends-infra-ghostel-visible-linkify-wraps-url ()
+  "Visible Ghostel linkification should relinkify wrapped URLs."
+  (with-temp-buffer
+    (set-window-buffer (selected-window) (current-buffer))
+    (setq-local ai-code-backends-infra--session-terminal-backend 'ghostel)
+    (insert "origin\n")
+    (insert "https://example.com/repo/project-int   \n")
+    (insert "erface.el\n")
+    (insert "HEAD\n")
+    (goto-char (point-min))
+    (set-window-start (selected-window) (point-min) t)
+    (ai-code-backends-infra-ghostel--linkify-visible-image-previews
+     (current-buffer)
+     (selected-window))
+    (goto-char (point-min))
+    (search-forward "https://example.com/repo/project-int")
+    (let ((url "https://example.com/repo/project-interface.el"))
+      (should (equal (get-text-property (match-beginning 0)
+                                        'ai-code-session-link)
+                     url))
+      (search-forward "erface.el")
+      (should (equal (get-text-property (match-beginning 0)
+                                        'ai-code-session-link)
+                     url)))))
+
+(ert-deftest test-ai-code-backends-infra-ghostel-visible-linkify-remote-url ()
+  "Visible Ghostel linkification should linkify URLs for remote sessions."
+  (with-temp-buffer
+    (set-window-buffer (selected-window) (current-buffer))
+    (setq-local default-directory "/ssh:example:/repo/")
+    (setq-local ai-code-backends-infra--session-directory default-directory)
+    (setq-local ai-code-backends-infra--session-terminal-backend 'ghostel)
+    (insert "https://example.com/repo/project-int   \n")
+    (insert "erface.el\n")
+    (goto-char (point-min))
+    (set-window-start (selected-window) (point-min) t)
+    (cl-letf (((symbol-function
+                'ai-code-session-link--linkify-strict-image-preview-region)
+               (lambda (&rest _args)
+                 (error "Strict image previews should be skipped remotely"))))
+      (ai-code-backends-infra-ghostel--linkify-visible-image-previews
+       (current-buffer)
+       (selected-window)))
+    (goto-char (point-min))
+    (search-forward "erface.el")
+    (should (equal (get-text-property (match-beginning 0)
+                                      'ai-code-session-link)
+                   "https://example.com/repo/project-interface.el"))))
+
+(ert-deftest test-ai-code-backends-infra-ghostel-region-linkify-remote-url ()
+  "Queued Ghostel region linkification should linkify remote URLs only."
+  (with-temp-buffer
+    (setq-local default-directory "/ssh:example:/repo/")
+    (setq-local ai-code-backends-infra--session-directory default-directory)
+    (setq-local ai-code-backends-infra--session-terminal-backend 'ghostel)
+    (insert "https://example.com/repo/project-int   \n")
+    (insert "erface.el\n")
+    (cl-letf (((symbol-function
+                'ai-code-session-link--linkify-strict-image-preview-region)
+               (lambda (&rest _args)
+                 (error "Strict image previews should be skipped remotely"))))
+      (ai-code-backends-infra-ghostel--linkify-image-preview-region
+       (current-buffer)
+       (point-min)
+       (point-max)))
+    (goto-char (point-min))
+    (search-forward "erface.el")
+    (should (equal (get-text-property (match-beginning 0)
+                                      'ai-code-session-link)
+                   "https://example.com/repo/project-interface.el"))))
 
 (ert-deftest test-ai-code-backends-infra-ghostel-schedules-visible-linkify-per-window ()
   "Visible image linkification timers should be isolated per window."
@@ -281,7 +371,7 @@
       (setq-local ai-code-backends-infra--session-directory
                   "/ssh:example:/repo/")
       (setq-local ai-code-backends-infra--session-terminal-backend 'ghostel)
-      (insert "remote.png\n")
+      (insert "./remote.png\n")
       (goto-char (point-min))
       (set-window-start (selected-window) (point-min) t)
       (cl-letf (((symbol-function
@@ -303,6 +393,11 @@
          (current-buffer)
          (point-min)
          (point-max))
+        (goto-char (point-min))
+        (search-forward "./remote.png")
+        (should (equal (get-text-property (match-beginning 0)
+                                          'ai-code-session-link)
+                       "./remote.png"))
         (should-not strict-linkify-called)
         (should-not path-resolution-called)))))
 
