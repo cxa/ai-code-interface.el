@@ -122,6 +122,16 @@ impose a fixed hard cap instead."
 (defconst ai-code-session-link--linkify-redraw-delay 0
   "Seconds to wait before relinkifying recent terminal output.")
 
+(defconst ai-code-session-link--linkify-inhibited-retry-delay 0.05
+  "Seconds to wait before retrying linkification after inhibition.")
+
+(defvar-local ai-code-session-link-inhibit-functions nil
+  "Abnormal hook run before delayed session linkification.
+
+Each function is called with the current buffer.  If any function
+returns non-nil, delayed linkification is retried later instead of
+touching text properties immediately.")
+
 (defconst ai-code-session-link--url-pattern-regexp
   "\\(https?://[^][(){}<>\"' \t\n]+\\)"
   "Regexp matching http/https URLs in session buffers.")
@@ -1838,16 +1848,43 @@ visible-window recovery in large terminal scrollback."
        (buffer-live-p buffer)
        (ai-code-session-link--recent-output-may-contain-links-p output)))
 
+(defun ai-code-session-link--linkify-inhibited-p (&optional buffer)
+  "Return non-nil when BUFFER should defer delayed linkification."
+  (let ((buffer (or buffer (current-buffer))))
+    (and (buffer-live-p buffer)
+         (with-current-buffer buffer
+           (with-demoted-errors "ai-code-session-link-inhibit-functions error: %S"
+             (run-hook-with-args-until-success
+              'ai-code-session-link-inhibit-functions buffer))))))
+
+(defun ai-code-session-link--schedule-pending-linkify (buffer delay)
+  "Schedule delayed linkification for BUFFER after DELAY seconds."
+  (when (buffer-live-p buffer)
+    (with-current-buffer buffer
+      (unless ai-code-session-link--linkify-timer
+        (setq ai-code-session-link--linkify-timer
+              (run-at-time
+               delay nil
+               (lambda (buf)
+                 (when (buffer-live-p buf)
+                   (with-current-buffer buf
+                     (ai-code-session-link--flush-scheduled-linkify))))
+               buffer))))))
+
 (defun ai-code-session-link--flush-scheduled-linkify ()
   "Apply any delayed session linkification pending in the current buffer."
   (let ((tail-width ai-code-session-link--pending-tail-width))
-    (setq ai-code-session-link--pending-tail-width 0
-          ai-code-session-link--linkify-timer nil)
+    (setq ai-code-session-link--linkify-timer nil)
     (when (> tail-width 0)
-      (let ((end (point-max)))
-        (ai-code-session-link--linkify-session-region
-         (max (point-min) (- end tail-width))
-         end)))))
+      (if (ai-code-session-link--linkify-inhibited-p)
+          (ai-code-session-link--schedule-pending-linkify
+           (current-buffer)
+           ai-code-session-link--linkify-inhibited-retry-delay)
+        (setq ai-code-session-link--pending-tail-width 0)
+        (let ((end (point-max)))
+          (ai-code-session-link--linkify-session-region
+           (max (point-min) (- end tail-width))
+           end))))))
 
 (defun ai-code-session-link--schedule-linkify-recent-output (buffer output &optional delay)
   "Linkify recent OUTPUT in BUFFER after terminal redraw settles.
@@ -1857,15 +1894,9 @@ Optional DELAY overrides the default redraw delay in seconds."
       (setq ai-code-session-link--pending-tail-width
             (max ai-code-session-link--pending-tail-width
                  (ai-code-session-link--recent-output-tail-width output)))
-      (unless ai-code-session-link--linkify-timer
-        (setq ai-code-session-link--linkify-timer
-              (run-at-time
-               (or delay ai-code-session-link--linkify-redraw-delay) nil
-               (lambda (buf)
-                 (when (buffer-live-p buf)
-                   (with-current-buffer buf
-                     (ai-code-session-link--flush-scheduled-linkify))))
-               buffer))))))
+      (ai-code-session-link--schedule-pending-linkify
+       buffer
+       (or delay ai-code-session-link--linkify-redraw-delay)))))
 
 (defun ai-code-session-link--linkify-recent-output (output)
   "Linkify the recent tail of the current session buffer after OUTPUT."

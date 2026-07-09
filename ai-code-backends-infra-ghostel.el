@@ -50,11 +50,14 @@ enabled by default because it widens the terminal's local resource access."
 (declare-function ghostel--redispatch-scroll-event "ghostel" (event))
 (declare-function ghostel-copy-mode "ghostel" ())
 (declare-function ghostel-emacs-mode "ghostel" ())
+(declare-function ghostel-ime-mode "ghostel-ime" (&optional arg))
 (declare-function ai-code-session-link--linkify-strict-image-preview-region
                   "ai-code-session-link" (start end))
 
 (defvar ai-code-backends-infra--session-terminal-backend)
 (defvar ai-code-backends-infra--session-directory)
+(defvar ai-code-session-link-inhibit-functions)
+(defvar ghostel-inhibit-redraw-functions)
 (defvar ghostel-kitty-graphics-mediums)
 (eval-when-compile
   (defvar ghostel-command-finish-functions)
@@ -63,6 +66,7 @@ enabled by default because it widens the terminal's local resource access."
   (defvar ghostel-progress-function)
   (defvar ghostel-set-title-function)
   (defvar ghostel--copy-mode-active)
+  (defvar ghostel--fake-cursor-overlay)
   (defvar ghostel--input-mode)
   (defvar ghostel--plain-link-detection-begin)
   (defvar ghostel--plain-link-detection-end))
@@ -92,6 +96,34 @@ history responsive even when Ghostel has a large scrollback."
   "Debounce delay before scanning visible Ghostel text after scrolling."
   :type 'number
   :group 'ai-code-backends-infra)
+
+(defcustom ai-code-backends-infra-ghostel-enable-ime-integration t
+  "Enable Ghostel IME integration in AI Code Ghostel sessions.
+
+When available, `ghostel-ime-mode' defers Ghostel redraws while an
+Emacs Lisp input-method composition is active, preventing active TUI
+redraws from clobbering in-progress preedit text."
+  :type 'boolean
+  :group 'ai-code-backends-infra)
+
+(defcustom ai-code-backends-infra-ghostel-inhibit-redraw-during-native-preedit t
+  "Defer Ghostel redraws while a GUI-native preedit overlay is active.
+
+This covers native input-method preedit paths that do not go through
+`ghostel-ime-mode', such as GUI framework preedit overlays."
+  :type 'boolean
+  :group 'ai-code-backends-infra)
+
+(defcustom ai-code-backends-infra-ghostel-native-preedit-overlay-symbols
+  '(x-preedit-overlay pgtk-preedit-overlay ns-preedit-overlay
+                      mac-preedit-overlay)
+  "Overlay variables that may hold an active GUI-native preedit overlay."
+  :type '(repeat symbol)
+  :group 'ai-code-backends-infra)
+
+(defconst ai-code-backends-infra-ghostel--preedit-properties
+  '(preedit preedit-text input-method)
+  "Text and overlay properties that identify in-progress preedit text.")
 
 (defvar-local ai-code-backends-infra-ghostel--visible-image-linkify-timers nil
   "Alist of (WINDOW . TIMERS) for visible image preview scans.")
@@ -227,24 +259,166 @@ STATE and PROGRESS use the signature of `ghostel-progress-function'."
         (or ai-code-backends-infra--session-directory
             default-directory))))
 
+(defun ai-code-backends-infra-ghostel--active-preedit-overlay-p
+    (overlay buffer)
+  "Return non-nil when OVERLAY is an active preedit overlay in BUFFER."
+  (and (overlayp overlay)
+       (eq (overlay-buffer overlay) buffer)
+       (overlay-start overlay)
+       (overlay-end overlay)
+       (or (< (overlay-start overlay) (overlay-end overlay))
+           (overlay-get overlay 'after-string)
+           (overlay-get overlay 'before-string)
+           (overlay-get overlay 'display))))
+
+(defun ai-code-backends-infra-ghostel--preedit-value-active-p (value)
+  "Return non-nil when VALUE represents active preedit state."
+  (cond
+   ((stringp value) (> (length value) 0))
+   ((overlayp value) (overlay-buffer value))
+   ((consp value) t)
+   (t value)))
+
+(defun ai-code-backends-infra-ghostel--preedit-property-active-p
+    (getter object)
+  "Return non-nil when GETTER finds a preedit property on OBJECT."
+  (cl-some
+   (lambda (property)
+     (ai-code-backends-infra-ghostel--preedit-value-active-p
+      (funcall getter object property)))
+   ai-code-backends-infra-ghostel--preedit-properties))
+
+(defun ai-code-backends-infra-ghostel--overlay-near-point-p
+    (overlay point)
+  "Return non-nil when OVERLAY is attached near POINT."
+  (let ((start (overlay-start overlay))
+        (end (overlay-end overlay)))
+    (and start
+         end
+         (<= (1- start) point)
+         (<= point (1+ end)))))
+
+(defun ai-code-backends-infra-ghostel--known-non-preedit-overlay-p
+    (overlay)
+  "Return non-nil when OVERLAY is known not to represent preedit text."
+  (or (overlay-get overlay 'ai-code-session-image-preview)
+      (and (boundp 'ghostel--fake-cursor-overlay)
+           (eq overlay ghostel--fake-cursor-overlay))))
+
+(defun ai-code-backends-infra-ghostel--point-preedit-overlay-p
+    (overlay buffer point)
+  "Return non-nil when OVERLAY looks like preedit text near POINT in BUFFER."
+  (and (ai-code-backends-infra-ghostel--active-preedit-overlay-p
+        overlay buffer)
+       (ai-code-backends-infra-ghostel--overlay-near-point-p
+        overlay point)
+       (not
+        (ai-code-backends-infra-ghostel--known-non-preedit-overlay-p
+         overlay))
+       (or (ai-code-backends-infra-ghostel--preedit-property-active-p
+            #'overlay-get overlay)
+           (overlay-get overlay 'after-string)
+           (overlay-get overlay 'before-string)
+           (overlay-get overlay 'display))))
+
+(defun ai-code-backends-infra-ghostel--point-preedit-overlays-p
+    (buffer)
+  "Return non-nil when BUFFER has preedit overlays around point."
+  (when (buffer-live-p buffer)
+    (with-current-buffer buffer
+      (let* ((point (point))
+             (start (max (point-min) (1- point)))
+             (end (min (point-max) (1+ point)))
+             (overlays (delete-dups
+                        (append (overlays-at point)
+                                (overlays-in start end)))))
+        (cl-some
+         (lambda (overlay)
+           (ai-code-backends-infra-ghostel--point-preedit-overlay-p
+            overlay buffer point))
+         overlays)))))
+
+(defun ai-code-backends-infra-ghostel--point-preedit-properties-p
+    (buffer)
+  "Return non-nil when BUFFER has preedit text properties around point."
+  (when (buffer-live-p buffer)
+    (with-current-buffer buffer
+      (let ((positions (delete-dups
+                        (list (point)
+                              (max (point-min) (1- (point)))))))
+        (cl-some
+         (lambda (position)
+           (and (<= (point-min) position)
+                (< position (point-max))
+                (ai-code-backends-infra-ghostel--preedit-property-active-p
+                 #'get-text-property position)))
+         positions)))))
+
+(defun ai-code-backends-infra-ghostel--preedit-symbol-active-p ()
+  "Return non-nil when a native preedit dynamic variable is active."
+  (and (boundp 'preedit-text)
+       (ai-code-backends-infra-ghostel--preedit-value-active-p
+        (symbol-value 'preedit-text))))
+
+(defun ai-code-backends-infra-ghostel--native-preedit-active-p
+    (&optional buffer)
+  "Return non-nil when BUFFER has an active GUI-native preedit overlay.
+
+BUFFER defaults to the current buffer.  This function is installed in
+`ghostel-inhibit-redraw-functions' for AI Code Ghostel sessions."
+  (let ((buffer (or buffer (current-buffer))))
+    (and ai-code-backends-infra-ghostel-inhibit-redraw-during-native-preedit
+         (buffer-live-p buffer)
+         (ai-code-backends-infra-ghostel--ai-session-buffer-p buffer)
+         (with-current-buffer buffer
+           (or
+            (ai-code-backends-infra-ghostel--preedit-symbol-active-p)
+            (cl-some
+             (lambda (symbol)
+               (and (boundp symbol)
+                    (ai-code-backends-infra-ghostel--active-preedit-overlay-p
+                     (symbol-value symbol)
+                     buffer)))
+             ai-code-backends-infra-ghostel-native-preedit-overlay-symbols)
+            (ai-code-backends-infra-ghostel--point-preedit-overlays-p
+             buffer)
+            (ai-code-backends-infra-ghostel--point-preedit-properties-p
+             buffer))))))
+
+(defun ai-code-backends-infra-ghostel--install-preedit-redraw-inhibition ()
+  "Install native preedit redraw inhibition for the current Ghostel buffer."
+  (when ai-code-backends-infra-ghostel-inhibit-redraw-during-native-preedit
+    (add-hook 'ghostel-inhibit-redraw-functions
+              #'ai-code-backends-infra-ghostel--native-preedit-active-p
+              nil
+              t)
+    (add-hook 'ai-code-session-link-inhibit-functions
+              #'ai-code-backends-infra-ghostel--native-preedit-active-p
+              nil
+              t)))
+
 (defun ai-code-backends-infra-ghostel--linkify-visible-image-previews
     (buffer window)
   "Linkify session links and image previews in BUFFER shown by WINDOW."
   (when (and (buffer-live-p buffer)
              (window-live-p window)
              (eq (window-buffer window) buffer))
-    (with-current-buffer buffer
-      (ai-code-backends-infra-ghostel--prune-visible-image-linkify-timers)
-      (when-let* ((region
-                   (ai-code-backends-infra-ghostel--visible-image-region
-                    window)))
-        (ai-code-session-link--linkify-session-region
-         (car region)
-         (cdr region))
-        (when (ai-code-backends-infra-ghostel--trusted-local-session-p)
-          (ai-code-session-link--linkify-strict-image-preview-region
+    (if (ai-code-backends-infra-ghostel--native-preedit-active-p buffer)
+        (ai-code-backends-infra-ghostel-schedule-visible-image-linkify
+         window
+         (list ai-code-session-link--linkify-inhibited-retry-delay))
+      (with-current-buffer buffer
+        (ai-code-backends-infra-ghostel--prune-visible-image-linkify-timers)
+        (when-let* ((region
+                     (ai-code-backends-infra-ghostel--visible-image-region
+                      window)))
+          (ai-code-session-link--linkify-session-region
            (car region)
-           (cdr region)))))))
+           (cdr region))
+          (when (ai-code-backends-infra-ghostel--trusted-local-session-p)
+            (ai-code-session-link--linkify-strict-image-preview-region
+             (car region)
+             (cdr region))))))))
 
 (defun ai-code-backends-infra-ghostel--cancel-visible-image-linkify-timers
     (window)
@@ -284,7 +458,10 @@ accidentally scan an entire scrollback buffer."
              (integer-or-marker-p start)
              (integer-or-marker-p end))
     (with-current-buffer buffer
-      (when (ai-code-backends-infra-ghostel--ai-session-buffer-p)
+      (when (and (ai-code-backends-infra-ghostel--ai-session-buffer-p)
+                 (not
+                  (ai-code-backends-infra-ghostel--native-preedit-active-p
+                   buffer)))
         (save-restriction
           (widen)
           (let ((start (if (markerp start) (marker-position start) start))
@@ -431,6 +608,13 @@ Optional DELAYS overrides the default visible image linkification delays."
     (setq-local ghostel-kitty-graphics-mediums
                 (ai-code-backends-infra-ghostel--effective-kitty-graphics-mediums))))
 
+(defun ai-code-backends-infra-ghostel--enable-ime-integration ()
+  "Enable Ghostel IME integration for the current AI Code session."
+  (when (and ai-code-backends-infra-ghostel-enable-ime-integration
+             (require 'ghostel-ime nil t)
+             (fboundp 'ghostel-ime-mode))
+    (ghostel-ime-mode 1)))
+
 (defun ai-code-backends-infra-ghostel-send-string (string &optional paste)
   "Send STRING to the current Ghostel process.
 If PASTE is non-nil, send it as a pasted string."
@@ -461,6 +645,8 @@ Ghostel owns terminal-model resizing through its mode-local window hooks."
   (setq-local ghostel-set-title-function nil)
   (setq-local ghostel-kill-buffer-on-exit nil)
   (ai-code-backends-infra-ghostel--configure-image-support)
+  (ai-code-backends-infra-ghostel--enable-ime-integration)
+  (ai-code-backends-infra-ghostel--install-preedit-redraw-inhibition)
   (ai-code-backends-infra-ghostel--install-lifecycle-hooks)
   (ai-code-backends-infra-ghostel--install-image-preview-advice)
   (add-hook 'window-scroll-functions

@@ -18,9 +18,13 @@
 (defvar ghostel-set-title-function)
 (defvar ghostel-kill-buffer-on-exit)
 (defvar ghostel-kitty-graphics-mediums)
+(defvar ghostel-inhibit-redraw-functions)
+(defvar ai-code-session-link-inhibit-functions)
+(defvar ai-code-backends-infra--session-directory)
+(defvar ghostel--fake-cursor-overlay)
 (defvar ghostel--plain-link-detection-begin)
 (defvar ghostel--plain-link-detection-end)
-(defvar ai-code-backends-infra--session-directory)
+(defvar x-preedit-overlay)
 
 (ert-deftest test-ai-code-backends-infra-ghostel-create-session-restores-ai-state ()
   "Ghostel session creation should restore AI Code local state after mode reset."
@@ -81,6 +85,103 @@
                 #'ai-code-backends-infra-ghostel--progress))
     (should (eq ai-code-backends-infra-ghostel--progress-function
                 #'ignore))))
+
+(ert-deftest test-ai-code-backends-infra-ghostel-configures-ime-redraw-inhibition ()
+  "Ghostel AI session configuration should enable IME redraw inhibition."
+  (let (enabled)
+    (with-temp-buffer
+      (setq-local ai-code-backends-infra--session-terminal-backend 'ghostel)
+      (cl-letf (((symbol-function 'ai-code-backends-infra--configure-session-input-shortcuts)
+                 (lambda () nil))
+                ((symbol-function 'ai-code-backends-infra--install-navigation-cursor-sync)
+                 (lambda () nil))
+                ((symbol-function 'require)
+                 (lambda (feature &optional _filename _noerror)
+                   (when (eq feature 'ghostel-ime)
+                     t)))
+                ((symbol-function 'ghostel-ime-mode)
+                 (lambda (arg)
+                   (setq enabled arg))))
+        (ai-code-backends-infra--configure-ghostel-buffer))
+      (should (equal enabled 1)))))
+
+(ert-deftest test-ai-code-backends-infra-ghostel-detects-native-preedit-overlay ()
+  "Native GUI preedit overlays should inhibit Ghostel redraws."
+  (with-temp-buffer
+    (insert "prompt")
+    (let ((overlay (make-overlay (point-min) (point-min) (current-buffer))))
+      (unwind-protect
+          (progn
+            (overlay-put overlay 'after-string "拼")
+            (setq-local ai-code-backends-infra--session-terminal-backend
+                        'ghostel)
+            (setq-local x-preedit-overlay overlay)
+            (should
+             (ai-code-backends-infra-ghostel--native-preedit-active-p
+              (current-buffer))))
+        (delete-overlay overlay)))))
+
+(ert-deftest test-ai-code-backends-infra-ghostel-detects-unbound-preedit-overlay-at-point ()
+  "Native preedit overlays at point may not be reachable from a symbol."
+  (with-temp-buffer
+    (insert "prompt")
+    (goto-char (point-max))
+    (let ((overlay (make-overlay (point) (point) (current-buffer))))
+      (unwind-protect
+          (progn
+            (overlay-put overlay 'after-string "zhong")
+            (setq-local ai-code-backends-infra--session-terminal-backend
+                        'ghostel)
+            (should
+             (ai-code-backends-infra-ghostel--native-preedit-active-p
+              (current-buffer))))
+        (delete-overlay overlay)))))
+
+(ert-deftest test-ai-code-backends-infra-ghostel-ignores-fake-cursor-overlay ()
+  "Ghostel's fake cursor overlay should not inhibit redraws."
+  (with-temp-buffer
+    (insert "prompt")
+    (goto-char (point-max))
+    (let ((overlay (make-overlay (point) (point) (current-buffer))))
+      (unwind-protect
+          (progn
+            (overlay-put overlay 'after-string " ")
+            (setq-local ai-code-backends-infra--session-terminal-backend
+                        'ghostel)
+            (setq-local ghostel--fake-cursor-overlay overlay)
+            (should-not
+             (ai-code-backends-infra-ghostel--native-preedit-active-p
+              (current-buffer))))
+        (delete-overlay overlay)))))
+
+(ert-deftest test-ai-code-backends-infra-ghostel-ignores-composition-at-point ()
+  "Ordinary composed text at point should not inhibit Ghostel redraws."
+  (with-temp-buffer
+    (insert "zhong")
+    (put-text-property (point-min) (point-max) 'composition t)
+    (goto-char (point-max))
+    (setq-local ai-code-backends-infra--session-terminal-backend 'ghostel)
+    (should-not
+     (ai-code-backends-infra-ghostel--native-preedit-active-p
+      (current-buffer)))))
+
+(ert-deftest test-ai-code-backends-infra-ghostel-configures-native-preedit-redraw-inhibition ()
+  "Ghostel AI session configuration should defer redraw during GUI preedit."
+  (with-temp-buffer
+    (setq-local ai-code-backends-infra--session-terminal-backend 'ghostel)
+    (setq-local ghostel-inhibit-redraw-functions nil)
+    (setq-local ai-code-session-link-inhibit-functions nil)
+    (cl-letf (((symbol-function 'ai-code-backends-infra--configure-session-input-shortcuts)
+               (lambda () nil))
+              ((symbol-function 'ai-code-backends-infra--install-navigation-cursor-sync)
+               (lambda () nil)))
+      (ai-code-backends-infra--configure-ghostel-buffer))
+    (should
+     (memq #'ai-code-backends-infra-ghostel--native-preedit-active-p
+           ghostel-inhibit-redraw-functions))
+    (should
+     (memq #'ai-code-backends-infra-ghostel--native-preedit-active-p
+           ai-code-session-link-inhibit-functions))))
 
 (ert-deftest test-ai-code-backends-infra-ghostel-configures-visible-image-hook ()
   "Ghostel AI session configuration should install visible image recovery."
@@ -207,6 +308,38 @@
            (selected-window))
           (should (= (length scheduled) 1))
           (should (equal (caar scheduled) 0.1)))))))
+
+(ert-deftest test-ai-code-backends-infra-ghostel-visible-linkify-retries-during-preedit ()
+  "Visible linkification should retry instead of touching text during preedit."
+  (let (rescheduled linkified)
+    (with-temp-buffer
+      (set-window-buffer (selected-window) (current-buffer))
+      (setq-local ai-code-backends-infra--session-terminal-backend 'ghostel)
+      (insert "src/File.el:1\n")
+      (goto-char (point-max))
+      (let ((overlay (make-overlay (point) (point) (current-buffer))))
+        (unwind-protect
+            (progn
+              (overlay-put overlay 'after-string "zhong")
+              (cl-letf (((symbol-function
+                          'ai-code-backends-infra-ghostel-schedule-visible-image-linkify)
+                         (lambda (window delays)
+                           (setq rescheduled (list window delays))))
+                        ((symbol-function
+                          'ai-code-session-link--linkify-session-region)
+                         (lambda (&rest _args)
+                           (setq linkified t))))
+                (ai-code-backends-infra-ghostel--linkify-visible-image-previews
+                 (current-buffer)
+                 (selected-window)))
+              (should
+               (equal rescheduled
+                      (list
+                       (selected-window)
+                       (list
+                        ai-code-session-link--linkify-inhibited-retry-delay))))
+              (should-not linkified))
+          (delete-overlay overlay))))))
 
 (ert-deftest test-ai-code-backends-infra-ghostel-visible-linkify-wraps-url ()
   "Visible Ghostel linkification should relinkify wrapped URLs."

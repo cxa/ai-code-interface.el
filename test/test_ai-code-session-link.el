@@ -2021,6 +2021,36 @@ Bare wrapped paths -- as printed by tools such as Claude, which omit the
       (should-not ai-code-session-link--linkify-timer)
       (should (zerop ai-code-session-link--pending-tail-width)))))
 
+(ert-deftest ai-code-session-link-test-scheduled-linkify-defers-while-inhibited ()
+  "Delayed linkification should wait while a buffer-local inhibit hook is active."
+  (let (called rescheduled)
+    (with-temp-buffer
+      (insert "src/File.el:12\n")
+      (let ((inhibited t)
+            (ai-code-session-link--linkify-inhibited-retry-delay 3600))
+        (setq-local ai-code-session-link--pending-tail-width 20)
+        (setq-local ai-code-session-link-inhibit-functions
+                    (list (lambda (_buffer) inhibited)))
+        (cl-letf (((symbol-function
+                    'ai-code-session-link--linkify-session-region)
+                   (lambda (start end)
+                     (setq called (cons start end)))))
+          (unwind-protect
+              (progn
+                (ai-code-session-link--flush-scheduled-linkify)
+                (setq rescheduled ai-code-session-link--linkify-timer)
+                (should rescheduled)
+                (should (= ai-code-session-link--pending-tail-width 20))
+                (should-not called)
+                (cancel-timer rescheduled)
+                (setq ai-code-session-link--linkify-timer nil
+                      inhibited nil)
+                (ai-code-session-link--flush-scheduled-linkify)
+                (should called)
+                (should (= ai-code-session-link--pending-tail-width 0)))
+            (when (timerp ai-code-session-link--linkify-timer)
+              (cancel-timer ai-code-session-link--linkify-timer))))))))
+
 (provide 'test_ai-code-session-link)
 
 ;;; test_ai-code-session-link.el ends here
