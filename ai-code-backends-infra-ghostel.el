@@ -47,6 +47,7 @@ enabled by default because it widens the terminal's local resource access."
 (declare-function ghostel-paste-string "ghostel" (string))
 (declare-function ghostel--schedule-link-detection
                   "ghostel" (&optional begin end))
+(declare-function ghostel--viewport-start "ghostel" ())
 (declare-function ghostel--run-queued-plain-link-detection
                   "ghostel" (buffer))
 (declare-function ghostel--redispatch-scroll-event "ghostel" (event))
@@ -62,6 +63,7 @@ enabled by default because it widens the terminal's local resource access."
 (defvar ai-code-backends-infra--session-directory)
 (defvar ai-code-session-link--path-base-regexp)
 (defvar ai-code-session-link--url-pattern-regexp)
+(defvar ai-code-session-link--image-preview-position-function)
 (defvar ai-code-session-link-inhibit-functions)
 (defvar ghostel-inhibit-redraw-functions)
 (defvar ghostel-kitty-graphics-mediums)
@@ -167,6 +169,9 @@ This is disabled by default because it can make interactive echo feel laggy."
 
 (defvar-local ai-code-backends-infra-ghostel--visible-image-linkify-timers nil
   "Alist of (WINDOW . TIMERS) for visible image preview scans.")
+
+(defvar-local ai-code-backends-infra-ghostel--last-live-viewport-start nil
+  "Marker at the previous start of Ghostel's mutable live viewport.")
 
 (defvar-local ai-code-backends-infra-ghostel--render-queue nil
   "Queued Ghostel output waiting for anti-flicker rendering.")
@@ -337,6 +342,41 @@ STATE and PROGRESS use the signature of `ghostel-progress-function'."
   (not (file-remote-p
         (or ai-code-backends-infra--session-directory
             default-directory))))
+
+(defun ai-code-backends-infra-ghostel--live-viewport-start ()
+  "Return the start of Ghostel's mutable live viewport, or nil."
+  (when (fboundp 'ghostel--viewport-start)
+    (when-let* ((start (ignore-errors (ghostel--viewport-start)))
+                ((integer-or-marker-p start)))
+      (max (point-min) (min (point-max) start)))))
+
+(defun ai-code-backends-infra-ghostel--stable-image-preview-position-p
+    (_start end)
+  "Return non-nil when an image ending at END is in stable scrollback."
+  (when-let* ((viewport-start
+               (ai-code-backends-infra-ghostel--live-viewport-start)))
+    (<= end viewport-start)))
+
+(defun ai-code-backends-infra-ghostel--newly-stable-image-region
+    (viewport-start)
+  "Return rows made stable by VIEWPORT-START since the previous redraw.
+Remember VIEWPORT-START for the next redraw."
+  (let* ((viewport-start
+          (max (point-min) (min (point-max) viewport-start)))
+         (previous-marker
+          ai-code-backends-infra-ghostel--last-live-viewport-start)
+         (previous-start
+          (and (markerp previous-marker)
+               (marker-position previous-marker)))
+         (region
+          (and previous-start
+               (< previous-start viewport-start)
+               (cons previous-start viewport-start))))
+    (if (markerp previous-marker)
+        (set-marker previous-marker viewport-start (current-buffer))
+      (setq ai-code-backends-infra-ghostel--last-live-viewport-start
+            (copy-marker viewport-start)))
+    region))
 
 (defun ai-code-backends-infra-ghostel--active-preedit-overlay-p
     (overlay buffer)
@@ -848,9 +888,28 @@ Optional DELAYS overrides the default visible image linkification delays."
                 end (and (boundp 'ghostel--plain-link-detection-end)
                          ghostel--plain-link-detection-end)))))
     (prog1 (funcall original buffer)
-      (when (and start end)
-        (ai-code-backends-infra-ghostel--linkify-image-preview-region
-         buffer start end)))))
+      (when (and start end (buffer-live-p buffer))
+        (with-current-buffer buffer
+          (let* ((queued-detection-start
+                  (if (markerp start) (marker-position start) start))
+                 (live-viewport-start
+                  (or (ai-code-backends-infra-ghostel--live-viewport-start)
+                      queued-detection-start))
+                 (configured-position-function
+                  ai-code-session-link--image-preview-position-function))
+            (when-let* ((stable-region
+                         (ai-code-backends-infra-ghostel--newly-stable-image-region
+                          live-viewport-start)))
+              (ai-code-backends-infra-ghostel--linkify-image-preview-region
+               buffer (car stable-region) (cdr stable-region)))
+            (let ((ai-code-session-link--image-preview-position-function
+                   (lambda (preview-start preview-end)
+                     (and (<= preview-end live-viewport-start)
+                          (or (not configured-position-function)
+                              (funcall configured-position-function
+                                       preview-start preview-end))))))
+              (ai-code-backends-infra-ghostel--linkify-image-preview-region
+               buffer start end))))))))
 
 (defun ai-code-backends-infra-ghostel--install-image-preview-advice ()
   "Install Ghostel advice used to add and refresh image previews."
@@ -1134,6 +1193,8 @@ Ghostel owns terminal-model resizing through its mode-local window hooks."
 (defun ai-code-backends-infra--configure-ghostel-buffer ()
   "Configure the current Ghostel buffer for AI Code sessions."
   (setq-local ai-code-backends-infra--session-terminal-backend 'ghostel)
+  (setq-local ai-code-session-link--image-preview-position-function
+              #'ai-code-backends-infra-ghostel--stable-image-preview-position-p)
   (setq-local ghostel-set-title-function nil)
   (setq-local ghostel-kill-buffer-on-exit nil)
   (ai-code-backends-infra-ghostel--configure-image-support)

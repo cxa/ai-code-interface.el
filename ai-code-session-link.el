@@ -39,7 +39,9 @@ terminal output redraw."
 
 This only affects AI session buffers managed by the Ghostel terminal backend.
 It complements Ghostel's native Kitty graphics support by previewing image
-files when an AI CLI prints a local image path such as screenshot.png."
+files when an AI CLI prints a local image path such as screenshot.png.
+The Ghostel integration keeps previews out of its mutable live viewport and
+shows them after their link has moved into stable scrollback."
   :type 'boolean
   :group 'ai-code)
 
@@ -131,6 +133,11 @@ impose a fixed hard cap instead."
 Each function is called with the current buffer.  If any function
 returns non-nil, delayed linkification is retried later instead of
 touching text properties immediately.")
+
+(defvar-local ai-code-session-link--image-preview-position-function nil
+  "Optional function deciding whether an image preview may occupy a region.
+The function receives the preview's START and END buffer positions.  A nil
+value means every otherwise valid image position is allowed.")
 
 (defconst ai-code-session-link--url-pattern-regexp
   "\\(https?://[^][(){}<>\"' \t\n]+\\)"
@@ -662,8 +669,8 @@ Expensive project-wide resolution stays in
               ((ai-code-session-link--safe-local-image-file-p abs-file)))
     abs-file))
 
-(defun ai-code-session-link--delete-image-preview-overlays (start end)
-  "Delete image preview overlays touching START through END."
+(defun ai-code-session-link--image-preview-overlays-touching-region (start end)
+  "Return image preview overlays touching START through END."
   (let* ((line-start (save-excursion
                        (goto-char start)
                        (line-beginning-position)))
@@ -671,15 +678,30 @@ Expensive project-wide resolution stays in
                      (goto-char end)
                      (line-end-position)))
          (scan-end (min (point-max) (1+ line-end))))
-    (dolist (overlay (delete-dups
-                      (append (overlays-in line-start scan-end)
-                              (overlays-at line-start)
-                              (overlays-at start)
-                              (overlays-at end)
-                              (overlays-at line-end)
-                              (overlays-at scan-end))))
-      (when (overlay-get overlay 'ai-code-session-image-preview)
-        (delete-overlay overlay)))))
+    (cl-remove-if-not
+     (lambda (overlay)
+       (overlay-get overlay 'ai-code-session-image-preview))
+     (delete-dups
+      (append (overlays-in line-start scan-end)
+              (overlays-at line-start)
+              (overlays-at start)
+              (overlays-at end)
+              (overlays-at line-end)
+              (overlays-at scan-end))))))
+
+(defun ai-code-session-link--delete-image-preview-overlays (start end)
+  "Delete image preview overlays touching START through END."
+  (mapc #'delete-overlay
+        (ai-code-session-link--image-preview-overlays-touching-region
+         start end)))
+
+(defun ai-code-session-link--delete-stale-image-preview-overlays (start end)
+  "Delete invalid image preview overlays touching START through END."
+  (dolist (overlay
+           (ai-code-session-link--image-preview-overlays-touching-region
+            start end))
+    (unless (ai-code-session-link--live-image-preview-overlay-p overlay)
+      (delete-overlay overlay))))
 
 (defun ai-code-session-link--image-preview-indent (match-start)
   "Return indentation for an image preview after MATCH-START's line.
@@ -744,6 +766,12 @@ INDENT is inserted before the image on the preview line."
   (when (ai-code-session-link--image-preview-enabled-p)
     (ai-code-session-link--image-preview-file link-text)))
 
+(defun ai-code-session-link--image-preview-position-allowed-p (start end)
+  "Return non-nil when an image preview may occupy START through END."
+  (or (not ai-code-session-link--image-preview-position-function)
+      (funcall ai-code-session-link--image-preview-position-function
+               start end)))
+
 (defun ai-code-session-link--live-image-preview-overlay-p (overlay)
   "Return non-nil when OVERLAY is still anchored to its image link text."
   (and (overlayp overlay)
@@ -803,7 +831,9 @@ INDENT is inserted before the image on the preview line."
         (let ((link-start (plist-get file-link :start))
               (link-end (plist-get file-link :end))
               (link-text (plist-get file-link :text)))
-          (when (and (ai-code-session-link--image-preview-link-file link-text)
+          (when (and (ai-code-session-link--image-preview-position-allowed-p
+                      link-start link-end)
+                     (ai-code-session-link--image-preview-link-file link-text)
                      (not (ai-code-session-link--image-preview-overlay-present-p
                            link-start link-end link-text)))
             (throw 'missing-preview t)))))
@@ -879,7 +909,7 @@ stable when `image-mode' opens and flushes the same image file."
 
 (defun ai-code-session-link--apply-image-preview-for-file
     (match-start match-end link-text file &optional display-text)
-  "Display FILE preview for LINK-TEXT after MATCH-START through MATCH-END."
+  "Keep FILE preview for LINK-TEXT after MATCH-START through MATCH-END."
   (when (ai-code-session-link--image-preview-enabled-p)
     (let* ((anchor-end
             (ai-code-session-link--image-preview-anchor-end match-end))
@@ -890,22 +920,33 @@ stable when `image-mode' opens and flushes the same image file."
             (if (> anchor-end match-end)
                 (concat display-text
                         (buffer-substring-no-properties match-end anchor-end))
-              display-text))
-           (indent (ai-code-session-link--image-preview-indent match-start))
-           (dimensions (ai-code-session-link--image-preview-max-dimensions indent))
-           (image (ai-code-session-link--create-image-preview
-                   file (car dimensions) (cdr dimensions))))
-      (when image
-        (let ((overlay (make-overlay match-start anchor-end nil nil nil)))
-          (overlay-put overlay 'ai-code-session-image-preview t)
-          (overlay-put overlay 'ai-code-session-image-file file)
-          (overlay-put overlay 'ai-code-session-image-link-text link-text)
-          (overlay-put overlay 'ai-code-session-image-display-text
-                       (or display-text link-text))
-          (overlay-put overlay 'after-string
-                       (ai-code-session-link--image-preview-string
-                        image file indent))
-          overlay)))))
+              display-text)))
+      (cond
+       ((not (ai-code-session-link--image-preview-position-allowed-p
+              match-start match-end))
+        (ai-code-session-link--delete-image-preview-overlays
+         match-start match-end))
+       ((ai-code-session-link--image-preview-overlay-present-p
+         match-start match-end display-text)
+        nil)
+       (t
+        (let* ((indent
+                (ai-code-session-link--image-preview-indent match-start))
+               (dimensions
+                (ai-code-session-link--image-preview-max-dimensions indent))
+               (image (ai-code-session-link--create-image-preview
+                       file (car dimensions) (cdr dimensions))))
+          (when image
+            (let ((overlay (make-overlay match-start anchor-end nil nil nil)))
+              (overlay-put overlay 'ai-code-session-image-preview t)
+              (overlay-put overlay 'ai-code-session-image-file file)
+              (overlay-put overlay 'ai-code-session-image-link-text link-text)
+              (overlay-put overlay 'ai-code-session-image-display-text
+                           (or display-text link-text))
+              (overlay-put overlay 'after-string
+                           (ai-code-session-link--image-preview-string
+                            image file indent))
+              overlay))))))))
 
 (defun ai-code-session-link--apply-properties (start end &optional text help-echo)
   "Apply session link properties from START to END.
@@ -1658,7 +1699,7 @@ visible-window recovery in large terminal scrollback."
   (when (ai-code-session-link--image-preview-enabled-p)
     (let ((inhibit-read-only t)
           (inhibit-modification-hooks t))
-      (ai-code-session-link--delete-image-preview-overlays start end)
+      (ai-code-session-link--delete-stale-image-preview-overlays start end)
       (save-excursion
         (let ((case-fold-search t)
               (candidate-count 0)

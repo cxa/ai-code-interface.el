@@ -1634,6 +1634,49 @@ detection regexp must stitch those rows back together."
       (when (file-directory-p root)
         (delete-directory root t)))))
 
+(ert-deftest test-ai-code-session-link--linkify-strict-image-preview-region-keeps-visible-rescan-stable ()
+  "Repeated visible scans should keep an existing image preview in place."
+  (let* ((root (make-temp-file "ai-code-session-image-preview-rescan-" t))
+         (image-file (expand-file-name "input.png" root))
+         (create-count 0)
+         first-preview)
+    (unwind-protect
+        (progn
+          (with-temp-file image-file
+            (insert "fake image bytes"))
+          (cl-letf (((symbol-function 'display-images-p)
+                     (lambda (&optional _display) t))
+                    ((symbol-function 'create-image)
+                     (lambda (data &rest args)
+                       (setq create-count (1+ create-count))
+                       (list :image data :args args))))
+            (with-temp-buffer
+              (setq-local ai-code-backends-infra--session-directory root)
+              (setq-local ai-code-backends-infra--session-terminal-backend
+                          'ghostel)
+              (insert "Reading input.png\n")
+              (setq buffer-read-only t)
+              (ai-code-session-link--linkify-strict-image-preview-region
+               (point-min) (point-max))
+              (setq first-preview
+                    (cl-find-if
+                     (lambda (overlay)
+                       (overlay-get overlay 'ai-code-session-image-preview))
+                     (overlays-in (point-min) (point-max))))
+              (should first-preview)
+              (ai-code-session-link--linkify-strict-image-preview-region
+               (point-min) (point-max))
+              (should (overlay-buffer first-preview))
+              (should
+               (eq first-preview
+                   (cl-find-if
+                    (lambda (overlay)
+                      (overlay-get overlay 'ai-code-session-image-preview))
+                    (overlays-in (point-min) (point-max)))))
+              (should (= create-count 1)))))
+      (when (file-directory-p root)
+        (delete-directory root t)))))
+
 (ert-deftest ai-code-session-link-test-ghostel-image-preview-strict-visible-scan ()
   "Strict visible image scanning should preview local images without project scans."
   (let* ((root (make-temp-file "ai-code-session-image-preview-visible-" t))
