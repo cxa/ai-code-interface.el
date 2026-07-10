@@ -377,12 +377,26 @@ STATE and PROGRESS use the signature of `ghostel-progress-function'."
          (<= (1- start) point)
          (<= point (1+ end)))))
 
+(defun ai-code-backends-infra-ghostel--margin-display-string-p (string)
+  "Return non-nil when STRING is a margin display spec, not preedit text."
+  (and (stringp string)
+       (> (length string) 0)
+       (let ((disp (get-text-property 0 'display string)))
+         (and (consp disp)
+              (or (eq (car disp) 'margin)
+                  (and (consp (car disp))
+                       (eq (caar disp) 'margin)))))))
+
 (defun ai-code-backends-infra-ghostel--known-non-preedit-overlay-p
     (overlay)
   "Return non-nil when OVERLAY is known not to represent preedit text."
   (or (overlay-get overlay 'ai-code-session-image-preview)
       (and (boundp 'ghostel--fake-cursor-overlay)
-           (eq overlay ghostel--fake-cursor-overlay))))
+           (eq overlay ghostel--fake-cursor-overlay))
+      (ai-code-backends-infra-ghostel--margin-display-string-p
+       (overlay-get overlay 'before-string))
+      (ai-code-backends-infra-ghostel--margin-display-string-p
+       (overlay-get overlay 'after-string))))
 
 (defun ai-code-backends-infra-ghostel--point-preedit-overlay-p
     (overlay buffer point)

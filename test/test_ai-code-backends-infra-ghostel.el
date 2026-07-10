@@ -1160,5 +1160,26 @@
         (should (eq (plist-get (car updates) :ghostel-progress-state) 'remove))
         (should (eq (plist-get (car updates) :ghostel-status) 'idle))))))
 
+(ert-deftest test-ai-code-backends-infra-ghostel-linum-overlay-does-not-inhibit-redraw ()
+  "Linum margin display overlays should not inhibit Ghostel redraws.
+Regression test for issue #430: linum overlays with margin display specs
+in `before-string' were misidentified as IME preedit overlays."
+  (with-temp-buffer
+    (insert "prompt line\n")
+    (goto-char (point-min))
+    (let ((overlay (make-overlay (point) (1+ (point)) (current-buffer)))
+          (margin-string (propertize " " 'display
+                                     '((margin left-margin)
+                                       #("57" 0 2 (face linum))))))
+      (unwind-protect
+          (progn
+            (overlay-put overlay 'before-string margin-string)
+            (setq-local ai-code-backends-infra--session-terminal-backend
+                        'ghostel)
+            (should-not
+             (ai-code-backends-infra-ghostel--redraw-inhibited-p
+              (current-buffer))))
+        (delete-overlay overlay)))))
+
 (provide 'test_ai-code-backends-infra-ghostel)
 ;;; test_ai-code-backends-infra-ghostel.el ends here
