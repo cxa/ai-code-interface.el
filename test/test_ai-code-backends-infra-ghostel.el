@@ -12,6 +12,9 @@
 (require 'cl-lib)
 (require 'ai-code-backends-infra-ghostel)
 
+(declare-function ghostel--send-encoded "ghostel" (key-name modifiers))
+(declare-function ghostel--send-string "ghostel" (string))
+
 (defvar ghostel-command-finish-functions)
 (defvar ghostel-command-start-functions)
 (defvar ghostel-progress-function)
@@ -296,6 +299,282 @@
         (should (equal restored-before-scan
                        "fileref:/tmp/src/foo.el:1"))))))
 
+(ert-deftest test-ai-code-backends-infra-ghostel-redraw-preserves-image-overlay-identity ()
+  "Ghostel native redraws should preserve an image overlay before anchoring."
+  (let* ((root (make-temp-file "ai-code-ghostel-preserved-image-" t))
+         (image-file (expand-file-name "history.png" root))
+         (create-count 0))
+    (unwind-protect
+        (progn
+          (with-temp-file image-file
+            (insert "fake image bytes"))
+          (with-temp-buffer
+            (setq-local ai-code-backends-infra--session-directory root)
+            (setq-local ai-code-backends-infra--session-terminal-backend
+                        'ghostel)
+            (insert "Working (9s)\n")
+            (insert "Saved history.png\n")
+            (let ((mutable-start (point-max))
+                  original-preview
+                  original-after-string)
+              (cl-letf (((symbol-function 'display-images-p)
+                         (lambda (&optional _display) t))
+                        ((symbol-function 'create-image)
+                         (lambda (_data &rest _args)
+                           (setq create-count (1+ create-count))
+                           'fake-image))
+                        ((symbol-function 'ghostel-cursor-point)
+                         (lambda () mutable-start))
+                        ((symbol-function 'ghostel--viewport-start)
+                         (lambda () mutable-start)))
+                (ai-code-session-link--linkify-strict-image-preview-region
+                 (point-min) (point-max))
+                (setq original-preview
+                      (cl-find-if
+                       (lambda (overlay)
+                         (and (overlay-get overlay
+                                           'ai-code-session-image-preview)
+                              (< (overlay-start overlay)
+                                 (overlay-end overlay))))
+                       (overlays-in (point-min) (point-max))))
+                (should original-preview)
+                (setq original-after-string
+                      (overlay-get original-preview 'after-string))
+                (dotimes (frame 10)
+                  (ai-code-backends-infra-ghostel--around-redraw-preserving-image-previews
+                   (lambda (&rest _args)
+                     (let ((inhibit-read-only t))
+                       (goto-char (point-min))
+                       (re-search-forward "Working ([0-9]+s)")
+                       (replace-match (format "Working (%ds)" (+ 9 frame)))
+                       (let ((text (buffer-string)))
+                         (delete-region (point-min) (point-max))
+                         (insert text))
+                       (setq mutable-start (point-max))))
+                   'fake-terminal)
+                  (let ((preview
+                         (cl-find-if
+                          (lambda (overlay)
+                            (and (overlay-get
+                                  overlay 'ai-code-session-image-preview)
+                                 (< (overlay-start overlay)
+                                    (overlay-end overlay))))
+                          (overlays-in (point-min) (point-max)))))
+                    (should (eq preview original-preview))
+                    (should
+                     (eq (overlay-get preview 'after-string)
+                         original-after-string))))
+                (should (= create-count 1))))))
+      (when (file-directory-p root)
+        (delete-directory root t)))))
+
+(ert-deftest test-ai-code-backends-infra-ghostel--untouched-image-redraw-skips-scrollback-index ()
+  "A status-only redraw should reuse its image without scanning scrollback."
+  (with-temp-buffer
+    (setq-local ai-code-backends-infra--session-terminal-backend 'ghostel)
+    (insert "Saved history.png\nWorking (1s)\n")
+    (let ((preview (make-overlay 7 18 (current-buffer))))
+      (overlay-put preview 'ai-code-session-image-preview t)
+      (overlay-put preview 'ai-code-session-image-file "/tmp/history.png")
+      (overlay-put preview 'ai-code-session-image-link-text "history.png")
+      (overlay-put preview 'ai-code-session-image-display-text "history.png")
+      (overlay-put preview 'after-string "\n[preview]\n")
+      (cl-letf (((symbol-function
+                  'ai-code-session-link--refresh-image-preview-overlay)
+                 (lambda (overlay) overlay))
+                ((symbol-function
+                  'ai-code-backends-infra-ghostel--image-preview-logical-row-index)
+                 (lambda ()
+                   (ert-fail "untouched redraw scanned scrollback"))))
+        (ai-code-backends-infra-ghostel--around-redraw-preserving-image-previews
+         (lambda (&rest _args)
+           (goto-char (point-min))
+           (re-search-forward "Working ([0-9]+s)")
+           (replace-match "Working (2s)"))
+         'fake-terminal))
+      (should (eq (overlay-buffer preview) (current-buffer)))
+      (should (equal (cons (overlay-start preview) (overlay-end preview))
+                     '(7 . 18))))))
+
+(ert-deftest test-ai-code-backends-infra-ghostel-redraw-refits-image-after-resize ()
+  "A smaller viewport should resize the same image overlay exactly once."
+  (let* ((root (make-temp-file "ai-code-ghostel-resized-image-" t))
+         (image-file (expand-file-name "history.png" root))
+         (buffer (generate-new-buffer " *ai-code-ghostel-resized-image*"))
+         (viewport-height 800)
+         (create-count 0)
+         max-heights)
+    (unwind-protect
+        (progn
+          (with-temp-file image-file
+            (insert "fake image bytes"))
+          (save-window-excursion
+            (switch-to-buffer buffer)
+            (setq-local ai-code-backends-infra--session-directory root)
+            (setq-local ai-code-backends-infra--session-terminal-backend
+                        'ghostel)
+            (insert "Saved history.png\n")
+            (cl-letf (((symbol-function 'display-images-p)
+                       (lambda (&optional _display) t))
+                      ((symbol-function 'window-body-width)
+                       (lambda (_window pixelwise)
+                         (should pixelwise)
+                         1200))
+                      ((symbol-function 'window-body-height)
+                       (lambda (_window pixelwise)
+                         (should pixelwise)
+                         viewport-height))
+                      ((symbol-function 'create-image)
+                       (lambda (_data _type _data-p &rest properties)
+                         (setq create-count (1+ create-count))
+                         (push (plist-get properties :max-height) max-heights)
+                         'fake-image)))
+              (ai-code-session-link--linkify-strict-image-preview-region
+               (point-min) (point-max))
+              (let ((preview
+                     (cl-find-if
+                      (lambda (overlay)
+                        (overlay-get overlay 'ai-code-session-image-preview))
+                      (overlays-in (point-min) (point-max)))))
+                (should preview)
+                (setq viewport-height 600)
+                (ai-code-backends-infra-ghostel--around-redraw-preserving-image-previews
+                 (lambda (&rest _args) nil)
+                 'fake-terminal)
+                (should
+                 (eq preview
+                     (cl-find-if
+                      (lambda (overlay)
+                        (overlay-get overlay 'ai-code-session-image-preview))
+                      (overlays-in (point-min) (point-max)))))
+                (ai-code-backends-infra-ghostel--around-redraw-preserving-image-previews
+                 (lambda (&rest _args) nil)
+                 'fake-terminal)
+                (should (= create-count 2))
+                (should (equal (nreverse max-heights) '(400 300)))))))
+      (when (buffer-live-p buffer)
+        (kill-buffer buffer))
+      (when (file-directory-p root)
+        (delete-directory root t)))))
+
+(ert-deftest test-ai-code-backends-infra-ghostel--redraw-preserves-image-across-reflow ()
+  "A soft-wrap reflow should keep the same image overlay object."
+  (let* ((root (make-temp-file "ai-code-ghostel-reflowed-image-" t))
+         (image-file (expand-file-name "history.png" root))
+         (create-count 0))
+    (unwind-protect
+        (progn
+          (with-temp-file image-file
+            (insert "fake image bytes"))
+          (with-temp-buffer
+            (setq-local ai-code-backends-infra--session-directory root)
+            (setq-local ai-code-backends-infra--session-terminal-backend
+                        'ghostel)
+            (insert "Saved history.png\n")
+            (cl-letf (((symbol-function 'display-images-p)
+                       (lambda (&optional _display) t))
+                      ((symbol-function 'create-image)
+                       (lambda (_data &rest _args)
+                         (setq create-count (1+ create-count))
+                         'fake-image)))
+              (ai-code-session-link--linkify-strict-image-preview-region
+               (point-min) (point-max))
+              (let ((preview
+                     (cl-find-if
+                      (lambda (overlay)
+                        (overlay-get overlay 'ai-code-session-image-preview))
+                      (overlays-in (point-min) (point-max)))))
+                (should preview)
+                (ai-code-backends-infra-ghostel--around-redraw-preserving-image-previews
+                 (lambda (&rest _args)
+                   (let ((inhibit-read-only t))
+                     (delete-region (point-min) (point-max))
+                     (insert "Saved history.")
+                     (let ((wrap-position (point)))
+                       (insert "\npng\n")
+                       (put-text-property wrap-position (1+ wrap-position)
+                                          'ghostel-wrap t))))
+                 'fake-terminal)
+                (should (eq preview
+                            (cl-find-if
+                             (lambda (overlay)
+                               (overlay-get
+                                overlay 'ai-code-session-image-preview))
+                             (overlays-in (point-min) (point-max)))))
+                (should
+                 (equal
+                  (ai-code-session-link--image-preview-anchor-text
+                   (overlay-start preview) (overlay-end preview))
+                  "history.png"))
+                (should (= create-count 1))))))
+      (when (file-directory-p root)
+        (delete-directory root t)))))
+
+(ert-deftest test-ai-code-backends-infra-ghostel-redraw-drops-removed-image-preview ()
+  "Ghostel redraw should not restore a preview whose image row disappeared."
+  (with-temp-buffer
+    (setq-local ai-code-backends-infra--session-terminal-backend 'ghostel)
+    (insert "Saved history.png\n")
+    (let ((preview (make-overlay 7 18 (current-buffer))))
+      (overlay-put preview 'ai-code-session-image-preview t)
+      (overlay-put preview 'ai-code-session-image-file "/tmp/history.png")
+      (overlay-put preview 'ai-code-session-image-link-text "history.png")
+      (overlay-put preview 'ai-code-session-image-display-text "history.png")
+      (overlay-put preview 'after-string "\n[preview]\n")
+      (ai-code-backends-infra-ghostel--around-redraw-preserving-image-previews
+       (lambda (&rest _args)
+         (let ((inhibit-read-only t))
+           (delete-region (point-min) (point-max))
+           (insert "No image here\n")))
+       'fake-terminal)
+      (should-not (overlay-buffer preview)))))
+
+(ert-deftest test-ai-code-backends-infra-ghostel-redraw-does-not-misattach-image-preview ()
+  "Ghostel redraw should not move a preview to another same-basename row."
+  (with-temp-buffer
+    (setq-local ai-code-backends-infra--session-terminal-backend 'ghostel)
+    (insert "Saved history.png\nOther history.png\n")
+    (let ((preview (make-overlay 7 18 (current-buffer))))
+      (overlay-put preview 'ai-code-session-image-preview t)
+      (overlay-put preview 'ai-code-session-image-file "/tmp/history.png")
+      (overlay-put preview 'ai-code-session-image-link-text "history.png")
+      (overlay-put preview 'ai-code-session-image-display-text "history.png")
+      (overlay-put preview 'after-string "\n[preview]\n")
+      (ai-code-backends-infra-ghostel--around-redraw-preserving-image-previews
+       (lambda (&rest _args)
+         (let ((inhibit-read-only t))
+           (goto-char (point-min))
+           (forward-line 1)
+           (delete-region (point-min) (point))))
+       'fake-terminal)
+      (should-not (overlay-buffer preview)))))
+
+(ert-deftest test-ai-code-backends-infra-ghostel--redraw-keeps-identical-images-one-to-one ()
+  "Removing one identical row should not stack old previews on the survivor."
+  (with-temp-buffer
+    (setq-local ai-code-backends-infra--session-terminal-backend 'ghostel)
+    (insert "Saved history.png\nSaved history.png\n")
+    (let ((first (make-overlay 7 18 (current-buffer)))
+          (second (make-overlay 25 36 (current-buffer))))
+      (dolist (preview (list first second))
+        (overlay-put preview 'ai-code-session-image-preview t)
+        (overlay-put preview 'ai-code-session-image-file "/tmp/history.png")
+        (overlay-put preview 'ai-code-session-image-link-text "history.png")
+        (overlay-put preview 'ai-code-session-image-display-text "history.png")
+        (overlay-put preview 'after-string "\n[preview]\n"))
+      (cl-letf (((symbol-function
+                  'ai-code-session-link--refresh-image-preview-overlay)
+                 (lambda (overlay) overlay)))
+        (ai-code-backends-infra-ghostel--around-redraw-preserving-image-previews
+         (lambda (&rest _args)
+           (let ((inhibit-read-only t))
+             (delete-region (point-min) 19)))
+         'fake-terminal))
+      (should-not (overlay-buffer first))
+      (should (eq (overlay-buffer second) (current-buffer)))
+      (should (equal (cons (overlay-start second) (overlay-end second))
+                     '(7 . 18))))))
+
 (ert-deftest test-ai-code-backends-infra-ghostel-working-redraw-keeps-cached-links ()
   "Working animation redraws should not refresh already detected links."
   (let ((link-keymap (make-sparse-keymap))
@@ -438,6 +717,82 @@
     (should (memq #'ai-code-backends-infra-ghostel--window-scroll
                   window-scroll-functions))))
 
+(ert-deftest test-ai-code-backends-infra-ghostel-installs-native-redraw-image-advice ()
+  "Ghostel image setup should preserve previews around native redraws."
+  (cl-letf (((symbol-function 'ghostel--redraw)
+             (lambda (&rest _args) nil))
+            ((symbol-function 'ghostel--send-encoded)
+             (lambda (&rest _args) nil))
+            ((symbol-function 'ghostel--send-string)
+             (lambda (&rest _args) nil))
+            ((symbol-function 'ghostel--paste-text)
+             (lambda (&rest _args) nil)))
+    (ai-code-backends-infra-ghostel--install-image-preview-advice)
+    (should
+     (advice-member-p
+      #'ai-code-backends-infra-ghostel--around-redraw-preserving-image-previews
+      'ghostel--redraw))
+    (should
+     (advice-member-p
+      #'ai-code-backends-infra-ghostel--around-send-encoded
+      'ghostel--send-encoded))
+    (dolist (target '(ghostel--send-string ghostel--paste-text))
+      (should
+       (advice-member-p
+        #'ai-code-backends-infra-ghostel--before-send-string
+        target)))))
+
+(ert-deftest test-ai-code-backends-infra-ghostel--encoded-return-fallback-keeps-submit-candidate ()
+  "Encoded Return fallback should not clear its own submit candidate."
+  (with-temp-buffer
+    (setq-local ai-code-backends-infra--session-terminal-backend 'ghostel)
+    (insert "❯ input.png")
+    (let ((cursor (copy-marker (point))))
+      (cl-letf (((symbol-function 'ghostel-cursor-point)
+                 (lambda () cursor))
+                ((symbol-function 'ghostel--send-string)
+                 (lambda (&rest _args) nil))
+                ((symbol-function 'ghostel--send-encoded)
+                 (lambda (_key-name _modifiers)
+                   (ghostel--send-string "\r")))
+                ((symbol-function 'ghostel--paste-text)
+                 (lambda (&rest _args) nil)))
+        (ai-code-backends-infra-ghostel--install-image-preview-advice)
+        (ghostel--send-encoded "return" "")
+        (should
+         ai-code-backends-infra-ghostel--image-submission-pending)))))
+
+(ert-deftest test-ai-code-backends-infra-ghostel--unload-removes-native-redraw-image-advice ()
+  "Unloading Ghostel integration should remove its native redraw advice."
+  (cl-letf (((symbol-function 'ghostel--schedule-link-detection)
+             (lambda (&rest _args) nil))
+            ((symbol-function 'ghostel--run-queued-plain-link-detection)
+             (lambda (&rest _args) nil))
+            ((symbol-function 'ghostel--redraw)
+             (lambda (&rest _args) nil))
+            ((symbol-function 'ghostel--send-encoded)
+             (lambda (&rest _args) nil))
+            ((symbol-function 'ghostel--send-string)
+             (lambda (&rest _args) nil))
+            ((symbol-function 'ghostel--paste-text)
+             (lambda (&rest _args) nil))
+            ((symbol-function 'ghostel--redispatch-scroll-event)
+             (lambda (&rest _args) nil))
+            ((symbol-function 'ghostel-copy-mode)
+             (lambda (&rest _args) nil))
+            ((symbol-function 'ghostel-emacs-mode)
+             (lambda (&rest _args) nil)))
+    (ai-code-backends-infra-ghostel--install-image-preview-advice)
+    (should
+     (advice-member-p
+      #'ai-code-backends-infra-ghostel--around-redraw-preserving-image-previews
+      'ghostel--redraw))
+    (ai-code-backends-infra-ghostel-unload-function)
+    (should-not
+     (advice-member-p
+      #'ai-code-backends-infra-ghostel--around-redraw-preserving-image-previews
+      'ghostel--redraw))))
+
 (ert-deftest test-ai-code-backends-infra-ghostel-configures-image-mediums ()
   "Ghostel AI session configuration should enable local image mediums."
   (with-temp-buffer
@@ -531,8 +886,10 @@
             (setq-local ai-code-backends-infra--session-terminal-backend
                         'ghostel)
             (insert "Stable scrollback\n")
-            (let ((viewport-start (copy-marker (point))))
+            (let ((viewport-start (copy-marker (point)))
+                  input-cursor)
               (insert "Working...\n")
+              (setq input-cursor (copy-marker (point)))
               (insert "❯ input.png 这不对呢\n")
               (insert "  ⏵⏵ bypass permissions on\n")
               (setq-local ghostel--plain-link-detection-begin viewport-start)
@@ -544,6 +901,8 @@
                          (lambda (&optional _display) t))
                         ((symbol-function 'create-image)
                          (lambda (_data &rest _args) 'fake-image))
+                        ((symbol-function 'ghostel-cursor-point)
+                         (lambda () input-cursor))
                         ((symbol-function
                           'ai-code-session-link--image-preview-string)
                          (lambda (_image _file _indent)
@@ -623,6 +982,59 @@
       (when (file-directory-p root)
         (delete-directory root t)))))
 
+(ert-deftest test-ai-code-backends-infra-ghostel--run-queued-link-detection-around-previews-submitted-input ()
+  "A submitted image should preview while it remains in the terminal viewport."
+  (let* ((root (make-temp-file "ai-code-ghostel-submitted-image-" t))
+         (image-file (expand-file-name "input.png" root))
+         (buffer (generate-new-buffer " *ai-code-ghostel-submitted-image*")))
+    (unwind-protect
+        (progn
+          (with-temp-file image-file
+            (insert "fake image bytes"))
+          (save-window-excursion
+            (switch-to-buffer buffer)
+            (setq-local ai-code-backends-infra--session-directory root)
+            (setq-local ai-code-backends-infra--session-terminal-backend
+                        'ghostel)
+            (setq-local ai-code-session-link--image-preview-position-function
+                        #'ai-code-backends-infra-ghostel--stable-image-preview-position-p)
+            (let ((viewport-start (copy-marker (point))))
+              (insert "❯ input.png 请检查\n")
+              (let ((cursor-start (copy-marker (point))))
+                (insert "Working...\n")
+                (setq-local ghostel--plain-link-detection-begin viewport-start)
+                (setq-local ghostel--plain-link-detection-end
+                            (copy-marker (point-max) t))
+                (setq buffer-read-only t)
+                (set-window-start (selected-window) (point-min) t)
+                (cl-letf (((symbol-function 'display-images-p)
+                           (lambda (&optional _display) t))
+                          ((symbol-function 'create-image)
+                           (lambda (data &rest args)
+                             (list :image data :args args)))
+                          ((symbol-function 'ghostel--viewport-start)
+                           (lambda () viewport-start))
+                          ((symbol-function 'ghostel-cursor-point)
+                           (lambda () cursor-start)))
+                  (ai-code-backends-infra-ghostel--run-queued-link-detection-around
+                   (lambda (_buffer) nil)
+                   buffer)
+                  (let ((previews
+                         (cl-remove-if-not
+                          (lambda (overlay)
+                            (overlay-get overlay
+                                         'ai-code-session-image-preview))
+                          (overlays-in (point-min) (point-max)))))
+                    (should (= (length previews) 1))
+                    (should
+                     (equal (overlay-get (car previews)
+                                         'ai-code-session-image-file)
+                            image-file))))))))
+      (when (buffer-live-p buffer)
+        (kill-buffer buffer))
+      (when (file-directory-p root)
+        (delete-directory root t)))))
+
 (ert-deftest test-ai-code-backends-infra-ghostel--stable-image-preview-position-p-uses-scrollback ()
   "Image previews should occupy scrollback, not the mutable live viewport."
   (let* ((root (make-temp-file "ai-code-ghostel-stable-image-" t))
@@ -671,6 +1083,181 @@
                   (lambda (overlay)
                     (overlay-get overlay 'ai-code-session-image-preview))
                   (overlays-in (point-min) (point-max))))))))
+      (when (file-directory-p root)
+        (delete-directory root t)))))
+
+(ert-deftest test-ai-code-backends-infra-ghostel--soft-wrapped-input-stays-preview-free-until-submitted ()
+  "Soft-wrapped input images should preview only after the cursor moves on."
+  (let* ((root (make-temp-file "ai-code-ghostel-wrapped-input-image-" t))
+         (image-file (expand-file-name "input.png" root))
+         cursor)
+    (unwind-protect
+        (progn
+          (with-temp-file image-file
+            (insert "fake image bytes"))
+          (with-temp-buffer
+            (setq-local ai-code-backends-infra--session-directory root)
+            (setq-local ai-code-backends-infra--session-terminal-backend
+                        'ghostel)
+            (setq-local ai-code-session-link--image-preview-position-function
+                        #'ai-code-backends-infra-ghostel--stable-image-preview-position-p)
+            (insert "❯ input.png\n")
+            (put-text-property (1- (point)) (point) 'ghostel-wrap t)
+            (insert "continued input")
+            (setq cursor (copy-marker (point)))
+            (cl-letf (((symbol-function 'display-images-p)
+                       (lambda (&optional _display) t))
+                      ((symbol-function 'create-image)
+                       (lambda (_data &rest _args) 'fake-image))
+                      ((symbol-function 'ghostel--viewport-start)
+                       (lambda () (point-min)))
+                      ((symbol-function 'ghostel-cursor-point)
+                       (lambda () cursor)))
+              (ai-code-session-link--linkify-strict-image-preview-region
+               (point-min) (point-max))
+              (should-not
+               (cl-some
+                (lambda (overlay)
+                  (overlay-get overlay 'ai-code-session-image-preview))
+                (overlays-in (point-min) (point-max))))
+              (goto-char (point-max))
+              (insert "\nWorking...\n")
+              (set-marker cursor (- (point-max) (length "Working...\n")))
+              (ai-code-session-link--linkify-strict-image-preview-region
+               (point-min) (point-max))
+              (should
+               (= (length
+                   (cl-remove-if-not
+                    (lambda (overlay)
+                      (overlay-get overlay 'ai-code-session-image-preview))
+                    (overlays-in (point-min) (point-max))))
+                  1)))))
+      (when (file-directory-p root)
+        (delete-directory root t)))))
+
+(ert-deftest test-ai-code-backends-infra-ghostel--hard-multiline-input-stays-preview-free-until-submitted ()
+  "A real multiline input should stay preview-free until Return moves on."
+  (let* ((root (make-temp-file "ai-code-ghostel-multiline-input-image-" t))
+         (image-file (expand-file-name "input.png" root))
+         cursor)
+    (unwind-protect
+        (progn
+          (with-temp-file image-file
+            (insert "fake image bytes"))
+          (with-temp-buffer
+            (setq-local ai-code-backends-infra--session-directory root)
+            (setq-local ai-code-backends-infra--session-terminal-backend
+                        'ghostel)
+            (setq-local ai-code-session-link--image-preview-position-function
+                        #'ai-code-backends-infra-ghostel--stable-image-preview-position-p)
+            (insert "❯ input.png")
+            (setq cursor (copy-marker (point)))
+            (cl-letf (((symbol-function 'display-images-p)
+                       (lambda (&optional _display) t))
+                      ((symbol-function 'create-image)
+                       (lambda (_data &rest _args) 'fake-image))
+                      ((symbol-function 'ghostel--viewport-start)
+                       (lambda () (point-min)))
+                      ((symbol-function 'ghostel-cursor-point)
+                       (lambda () cursor)))
+              (ai-code-backends-infra-ghostel--before-send-string "input.png")
+              (goto-char (point-max))
+              (insert "\nstill editing")
+              (set-marker cursor (point-max))
+              (ai-code-backends-infra-ghostel--before-send-string "still editing")
+              (ai-code-session-link--linkify-strict-image-preview-region
+               (point-min) (point-max))
+              (should-not
+               (cl-some
+                (lambda (overlay)
+                  (overlay-get overlay 'ai-code-session-image-preview))
+                (overlays-in (point-min) (point-max))))
+              (ai-code-backends-infra-ghostel--before-send-encoded
+               "return" "")
+              ;; Accepting an in-input popup can redraw without moving the
+              ;; cursor.  That is not submission and must remain suppressed.
+              (ai-code-backends-infra-ghostel--around-redraw-preserving-image-previews
+               (lambda (&rest _args) nil)
+               'fake-terminal)
+              (should-not
+               ai-code-backends-infra-ghostel--image-submission-pending)
+              (should
+               (ai-code-backends-infra-ghostel--active-image-input-boundary))
+              (should-not
+               (cl-some
+                (lambda (overlay)
+                  (overlay-get overlay 'ai-code-session-image-preview))
+                (overlays-in (point-min) (point-max))))
+              (ai-code-backends-infra-ghostel--before-send-encoded
+               "return" "")
+              (goto-char (point-max))
+              (insert "\nWorking...\n")
+              (set-marker cursor (- (point-max) (length "Working...\n")))
+              (ai-code-backends-infra-ghostel--around-redraw-preserving-image-previews
+               (lambda (&rest _args) nil)
+               'fake-terminal)
+              (should-not
+               ai-code-backends-infra-ghostel--image-submission-pending)
+              ;; The redraw wrapper creates the first submitted preview before
+              ;; Ghostel's outer `ghostel--anchor-window' call can run.
+              (should
+               (= (length
+                   (cl-remove-if-not
+                    (lambda (overlay)
+                      (overlay-get overlay 'ai-code-session-image-preview))
+                    (overlays-in (point-min) (point-max))))
+                  1)))))
+      (when (file-directory-p root)
+        (delete-directory root t)))))
+
+(ert-deftest test-ai-code-backends-infra-ghostel--composer-shift-keeps-active-image-suppressed ()
+  "A redraw that moves the composer should expand its protected input epoch."
+  (let* ((root (make-temp-file "ai-code-ghostel-shifted-input-image-" t))
+         (image-file (expand-file-name "input.png" root))
+         cursor)
+    (unwind-protect
+        (progn
+          (with-temp-file image-file
+            (insert "fake image bytes"))
+          (with-temp-buffer
+            (setq-local ai-code-backends-infra--session-directory root)
+            (setq-local ai-code-backends-infra--session-terminal-backend
+                        'ghostel)
+            (setq-local ai-code-session-link--image-preview-position-function
+                        #'ai-code-backends-infra-ghostel--stable-image-preview-position-p)
+            (insert (make-string 80 ?x) "\n❯ input.png")
+            (setq cursor (copy-marker (point)))
+            (cl-letf (((symbol-function 'display-images-p)
+                       (lambda (&optional _display) t))
+                      ((symbol-function 'create-image)
+                       (lambda (_data &rest _args) 'fake-image))
+                      ((symbol-function 'ghostel--viewport-start)
+                       (lambda () (point-min)))
+                      ((symbol-function 'ghostel-cursor-point)
+                       (lambda () cursor)))
+              (ai-code-backends-infra-ghostel--before-send-string "input.png")
+              (goto-char (point-max))
+              (insert "\nstill editing")
+              (set-marker cursor (point-max))
+              (ai-code-backends-infra-ghostel--before-send-string "still editing")
+              (ai-code-backends-infra-ghostel--before-send-encoded
+               "return" "")
+              (ai-code-backends-infra-ghostel--around-redraw-preserving-image-previews
+               (lambda (&rest _args)
+                 (let ((inhibit-read-only t))
+                   (delete-region (point-min) (point-max))
+                   (insert "❯ input.png\nstill editing selected")
+                   (set-marker cursor (point-max))))
+               'fake-terminal)
+              (should
+               ai-code-backends-infra-ghostel--image-submission-pending)
+              (ai-code-session-link--linkify-strict-image-preview-region
+               (point-min) (point-max))
+              (should-not
+               (cl-some
+                (lambda (overlay)
+                  (overlay-get overlay 'ai-code-session-image-preview))
+                (overlays-in (point-min) (point-max)))))))
       (when (file-directory-p root)
         (delete-directory root t)))))
 

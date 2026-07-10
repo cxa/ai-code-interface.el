@@ -9,6 +9,7 @@
 ;;; Code:
 
 (require 'cl-lib)
+(require 'subr-x)
 (require 'ai-code-session-link)
 
 ;; Prefer `ghostel-exec' for Ghostel backend startup when available, as
@@ -47,6 +48,11 @@ enabled by default because it widens the terminal's local resource access."
 (declare-function ghostel-paste-string "ghostel" (string))
 (declare-function ghostel--schedule-link-detection
                   "ghostel" (&optional begin end))
+(declare-function ghostel--redraw "ghostel-module" (term &optional full))
+(declare-function ghostel--send-encoded "ghostel" (key-name mods))
+(declare-function ghostel--send-string "ghostel" (string))
+(declare-function ghostel--paste-text "ghostel" (string))
+(declare-function ghostel-cursor-point "ghostel" ())
 (declare-function ghostel--viewport-start "ghostel" ())
 (declare-function ghostel--run-queued-plain-link-detection
                   "ghostel" (buffer))
@@ -58,6 +64,14 @@ enabled by default because it widens the terminal's local resource access."
                   "ai-code-session-link" (start end))
 (declare-function ai-code-session-link--recent-output-plain-text
                   "ai-code-session-link" (output))
+(declare-function ai-code-session-link--image-preview-overlay-anchor-valid-p
+                  "ai-code-session-link" (overlay))
+(declare-function ai-code-session-link--image-preview-anchor-text
+                  "ai-code-session-link" (start end))
+(declare-function ai-code-session-link--image-preview-position-allowed-p
+                  "ai-code-session-link" (start end))
+(declare-function ai-code-session-link--refresh-image-preview-overlay
+                  "ai-code-session-link" (overlay))
 
 (defvar ai-code-backends-infra--session-terminal-backend)
 (defvar ai-code-backends-infra--session-directory)
@@ -77,6 +91,7 @@ enabled by default because it widens the terminal's local resource access."
   (defvar ghostel--copy-mode-active)
   (defvar ghostel--fake-cursor-overlay)
   (defvar ghostel--input-mode)
+  (defvar ghostel--line-input-start)
   (defvar ghostel--plain-link-detection-begin)
   (defvar ghostel--plain-link-detection-end))
 
@@ -85,6 +100,29 @@ enabled by default because it widens the terminal's local resource access."
 
 (defconst ai-code-backends-infra-ghostel--linkify-redraw-delay 0.05
   "Seconds to wait before relinkifying recent Ghostel output.")
+
+(defconst ai-code-backends-infra-ghostel--global-advice-specs
+  '((ghostel--schedule-link-detection
+     . ai-code-backends-infra-ghostel--around-schedule-link-detection)
+    (ghostel--run-queued-plain-link-detection
+     . ai-code-backends-infra-ghostel--around-run-queued-link-detection)
+    (ghostel--redraw
+     . ai-code-backends-infra-ghostel--around-redraw-preserving-image-previews)
+    (ghostel--send-encoded
+     . ai-code-backends-infra-ghostel--around-send-encoded)
+    (ghostel--send-string
+     . ai-code-backends-infra-ghostel--before-send-string)
+    (ghostel--paste-text
+     . ai-code-backends-infra-ghostel--before-send-string)
+    (ghostel--run-queued-plain-link-detection
+     . ai-code-backends-infra-ghostel--run-queued-link-detection-around)
+    (ghostel--redispatch-scroll-event
+     . ai-code-backends-infra-ghostel--after-redispatch-scroll-event)
+    (ghostel-copy-mode
+     . ai-code-backends-infra-ghostel--after-readonly-command)
+    (ghostel-emacs-mode
+     . ai-code-backends-infra-ghostel--after-readonly-command))
+  "Global Ghostel advice installed by this integration.")
 
 (defcustom ai-code-backends-infra-ghostel-visible-image-linkify-delays
   '(0.15 0.5)
@@ -170,8 +208,20 @@ This is disabled by default because it can make interactive echo feel laggy."
 (defvar-local ai-code-backends-infra-ghostel--visible-image-linkify-timers nil
   "Alist of (WINDOW . TIMERS) for visible image preview scans.")
 
-(defvar-local ai-code-backends-infra-ghostel--last-live-viewport-start nil
-  "Marker at the previous start of Ghostel's mutable live viewport.")
+(defvar-local ai-code-backends-infra-ghostel--last-image-preview-boundary nil
+  "Marker at the previous boundary before which previews are stable.")
+
+(defvar-local ai-code-backends-infra-ghostel--active-image-input-start nil
+  "Marker at the first row of the current unsubmitted terminal input.")
+
+(defvar-local ai-code-backends-infra-ghostel--active-image-input-end nil
+  "Marker after the furthest row observed in current terminal input.")
+
+(defvar-local ai-code-backends-infra-ghostel--image-submission-pending nil
+  "Old input range after Return was sent, pending redraw confirmation.")
+
+(defvar ai-code-backends-infra-ghostel--inside-encoded-send nil
+  "Non-nil while Ghostel's encoded-key path forwards its encoded string.")
 
 (defvar-local ai-code-backends-infra-ghostel--render-queue nil
   "Queued Ghostel output waiting for anti-flicker rendering.")
@@ -350,33 +400,510 @@ STATE and PROGRESS use the signature of `ghostel-progress-function'."
                 ((integer-or-marker-p start)))
       (max (point-min) (min (point-max) start)))))
 
+(defun ai-code-backends-infra-ghostel--logical-row-bounds (position)
+  "Return bounds of the soft-wrapped terminal row at POSITION."
+  (save-excursion
+    (goto-char (max (point-min) (min (point-max) position)))
+    (beginning-of-line)
+    (while (and (> (point) (point-min))
+                (eq (char-before) ?\n)
+                (get-text-property (1- (point)) 'ghostel-wrap))
+      (forward-line -1))
+    (let ((start (point)))
+      (while (and (< (line-end-position) (point-max))
+                  (get-text-property (line-end-position) 'ghostel-wrap))
+        (forward-line 1))
+      (cons start (line-end-position)))))
+
+(defun ai-code-backends-infra-ghostel--logical-row-start (position)
+  "Return the first physical row of the logical terminal row at POSITION."
+  (car (ai-code-backends-infra-ghostel--logical-row-bounds position)))
+
+(defun ai-code-backends-infra-ghostel--logical-row-text (start end)
+  "Return logical terminal text from START through END without soft wraps."
+  (ai-code-session-link--image-preview-anchor-text start end))
+
+(defun ai-code-backends-infra-ghostel--logical-row-offset (start position)
+  "Return unwrapped character offset from START to POSITION."
+  (length (ai-code-backends-infra-ghostel--logical-row-text start position)))
+
+(defun ai-code-backends-infra-ghostel--logical-row-position
+    (start end offset)
+  "Return buffer position at unwrapped OFFSET between START and END."
+  (let ((position start)
+        (logical-offset 0))
+    (while (and (< position end) (< logical-offset offset))
+      (unless (and (eq (char-after position) ?\n)
+                   (get-text-property position 'ghostel-wrap))
+        (setq logical-offset (1+ logical-offset)))
+      (setq position (1+ position)))
+    (and (= logical-offset offset) position)))
+
+(defun ai-code-backends-infra-ghostel--active-image-input-boundary ()
+  "Return the first row of any known unsubmitted Ghostel input."
+  (let (positions)
+    (when (and (markerp
+                ai-code-backends-infra-ghostel--active-image-input-start)
+               (marker-position
+                ai-code-backends-infra-ghostel--active-image-input-start))
+      (push (marker-position
+             ai-code-backends-infra-ghostel--active-image-input-start)
+            positions))
+    (when (and (boundp 'ghostel--line-input-start)
+               (markerp ghostel--line-input-start)
+               (marker-position ghostel--line-input-start))
+      (push (marker-position ghostel--line-input-start) positions))
+    (when positions
+      (ai-code-backends-infra-ghostel--logical-row-start
+       (apply #'min positions)))))
+
+(defun ai-code-backends-infra-ghostel--remember-active-image-input ()
+  "Remember the first row of terminal input before forwarding a key."
+  (when (ai-code-backends-infra-ghostel--ai-session-buffer-p)
+    (when-let* ((cursor (or (and (fboundp 'ghostel-cursor-point)
+                                 (ignore-errors (ghostel-cursor-point)))
+                            (point-max)))
+                ((integer-or-marker-p cursor))
+                (row-bounds
+                 (ai-code-backends-infra-ghostel--logical-row-bounds cursor)))
+      (if (and (markerp
+                ai-code-backends-infra-ghostel--active-image-input-start)
+               (marker-position
+                ai-code-backends-infra-ghostel--active-image-input-start))
+          (when (> (marker-position
+                    ai-code-backends-infra-ghostel--active-image-input-start)
+                   (car row-bounds))
+            (set-marker
+             ai-code-backends-infra-ghostel--active-image-input-start
+             (car row-bounds)))
+        (setq ai-code-backends-infra-ghostel--active-image-input-start
+              (copy-marker (car row-bounds))))
+      (if (and (markerp
+                ai-code-backends-infra-ghostel--active-image-input-end)
+               (marker-position
+                ai-code-backends-infra-ghostel--active-image-input-end))
+          (when (< (marker-position
+                    ai-code-backends-infra-ghostel--active-image-input-end)
+                   (cdr row-bounds))
+            (set-marker
+             ai-code-backends-infra-ghostel--active-image-input-end
+             (cdr row-bounds)))
+        (setq ai-code-backends-infra-ghostel--active-image-input-end
+              (copy-marker (cdr row-bounds)))))))
+
+(defun ai-code-backends-infra-ghostel--active-image-input-range ()
+  "Return the observed current-input range, or nil."
+  (when (and (markerp
+              ai-code-backends-infra-ghostel--active-image-input-start)
+             (marker-position
+              ai-code-backends-infra-ghostel--active-image-input-start)
+             (markerp
+              ai-code-backends-infra-ghostel--active-image-input-end)
+             (marker-position
+              ai-code-backends-infra-ghostel--active-image-input-end))
+    (cons (marker-position
+           ai-code-backends-infra-ghostel--active-image-input-start)
+          (marker-position
+           ai-code-backends-infra-ghostel--active-image-input-end))))
+
+(defun ai-code-backends-infra-ghostel--active-image-input-row-texts ()
+  "Return logical row texts observed in the current input range."
+  (when-let* ((range
+               (ai-code-backends-infra-ghostel--active-image-input-range)))
+    (let ((position (car range))
+          texts)
+      (save-excursion
+        (while (<= position (cdr range))
+          (goto-char position)
+          (let* ((row-bounds
+                  (ai-code-backends-infra-ghostel--logical-row-bounds (point)))
+                 (row-end (cdr row-bounds)))
+            (push (ai-code-backends-infra-ghostel--logical-row-text
+                   (car row-bounds) row-end)
+                  texts)
+            (setq position (if (< row-end (cdr range))
+                               (1+ row-end)
+                             (1+ (cdr range)))))))
+      (delete-dups texts))))
+
+(defun ai-code-backends-infra-ghostel--before-send-string (&rest _args)
+  "Remember active input before Ghostel sends a string or paste."
+  (unless ai-code-backends-infra-ghostel--inside-encoded-send
+    (setq ai-code-backends-infra-ghostel--image-submission-pending nil)
+    (ai-code-backends-infra-ghostel--remember-active-image-input)))
+
+(defun ai-code-backends-infra-ghostel--before-send-encoded
+    (key-name &optional modifiers)
+  "Track Ghostel KEY-NAME with MODIFIERS for image input stability."
+  (when (ai-code-backends-infra-ghostel--ai-session-buffer-p)
+    (if (and (equal key-name "return")
+             (or (null modifiers) (equal modifiers "")))
+        (progn
+          (ai-code-backends-infra-ghostel--remember-active-image-input)
+          (setq ai-code-backends-infra-ghostel--image-submission-pending
+                (list
+                 :range
+                 (ai-code-backends-infra-ghostel--active-image-input-range)
+                 :row-texts
+                 (ai-code-backends-infra-ghostel--active-image-input-row-texts)
+                 :outside-count 0)))
+      (setq ai-code-backends-infra-ghostel--image-submission-pending nil)
+      (ai-code-backends-infra-ghostel--remember-active-image-input))))
+
+(defun ai-code-backends-infra-ghostel--around-send-encoded
+    (original key-name &optional modifiers)
+  "Call ORIGINAL for KEY-NAME and MODIFIERS while tracking input once."
+  (let ((ai-code-backends-infra-ghostel--inside-encoded-send t))
+    (ai-code-backends-infra-ghostel--before-send-encoded
+     key-name modifiers)
+    (funcall original key-name modifiers)))
+
+(defun ai-code-backends-infra-ghostel--finish-image-submission ()
+  "Release mutable input after redraw confirms the cursor left it."
+  (when-let* ((pending ai-code-backends-infra-ghostel--image-submission-pending)
+              (old-range (plist-get pending :range))
+              (cursor (and (fboundp 'ghostel-cursor-point)
+                           (ignore-errors (ghostel-cursor-point))))
+              ((integer-or-marker-p cursor))
+              (cursor-row
+               (ai-code-backends-infra-ghostel--logical-row-bounds cursor)))
+    (let* ((cursor-row-text
+            (ai-code-backends-infra-ghostel--logical-row-text
+             (car cursor-row) (cdr cursor-row)))
+           (known-input-row-p
+            (member cursor-row-text (plist-get pending :row-texts)))
+           (outside-old-range-p
+            (or (< (cdr cursor-row) (car old-range))
+                (> (car cursor-row) (cdr old-range)))))
+      (cond
+       (known-input-row-p
+        ;; Return accepted a completion or popup item.  Keep the input epoch,
+        ;; but cancel this submit candidate and follow the shifted composer.
+        (setq ai-code-backends-infra-ghostel--image-submission-pending nil)
+        (ai-code-backends-infra-ghostel--remember-active-image-input)
+        nil)
+       ((and outside-old-range-p (not known-input-row-p))
+        (let ((outside-count
+               (1+ (or (plist-get pending :outside-count) 0))))
+          (if (or (string-match-p "\\bWorking\\b" cursor-row-text)
+                  (>= outside-count 2))
+              (progn
+                (setq ai-code-backends-infra-ghostel--image-submission-pending
+                      nil)
+                (when (markerp
+                       ai-code-backends-infra-ghostel--active-image-input-start)
+                  (set-marker
+                   ai-code-backends-infra-ghostel--active-image-input-start
+                   nil))
+                (when (markerp
+                       ai-code-backends-infra-ghostel--active-image-input-end)
+                  (set-marker
+                   ai-code-backends-infra-ghostel--active-image-input-end
+                   nil))
+                (setq ai-code-backends-infra-ghostel--active-image-input-start
+                      nil
+                      ai-code-backends-infra-ghostel--active-image-input-end
+                      nil)
+                (car cursor-row))
+            (setq ai-code-backends-infra-ghostel--image-submission-pending
+                  (plist-put pending :outside-count outside-count))
+            nil)))))))
+
+(defun ai-code-backends-infra-ghostel--image-preview-boundary ()
+  "Return the boundary between submitted output and mutable terminal input.
+Rows before the entire active input block are eligible for image previews.
+When no input block is known, use the terminal cursor's logical row.  When
+Ghostel has no cursor position, conservatively fall back to physical
+scrollback before the live viewport."
+  (or (ai-code-backends-infra-ghostel--active-image-input-boundary)
+      (when (fboundp 'ghostel-cursor-point)
+        (when-let* ((cursor (ignore-errors (ghostel-cursor-point)))
+                    ((integer-or-marker-p cursor)))
+          (ai-code-backends-infra-ghostel--logical-row-start cursor)))
+      (ai-code-backends-infra-ghostel--live-viewport-start)))
+
 (defun ai-code-backends-infra-ghostel--stable-image-preview-position-p
     (_start end)
-  "Return non-nil when an image ending at END is in stable scrollback."
-  (when-let* ((viewport-start
-               (ai-code-backends-infra-ghostel--live-viewport-start)))
-    (<= end viewport-start)))
+  "Return non-nil when an image ending at END precedes mutable input."
+  (when-let* ((boundary
+               (ai-code-backends-infra-ghostel--image-preview-boundary)))
+    (<= end boundary)))
 
-(defun ai-code-backends-infra-ghostel--newly-stable-image-region
-    (viewport-start)
-  "Return rows made stable by VIEWPORT-START since the previous redraw.
-Remember VIEWPORT-START for the next redraw."
-  (let* ((viewport-start
-          (max (point-min) (min (point-max) viewport-start)))
+(defun ai-code-backends-infra-ghostel--newly-previewable-image-region
+    (boundary)
+  "Return rows made previewable by BOUNDARY since the previous redraw.
+Remember BOUNDARY for the next redraw."
+  (let* ((boundary
+          (max (point-min) (min (point-max) boundary)))
          (previous-marker
-          ai-code-backends-infra-ghostel--last-live-viewport-start)
+          ai-code-backends-infra-ghostel--last-image-preview-boundary)
          (previous-start
           (and (markerp previous-marker)
                (marker-position previous-marker)))
          (region
           (and previous-start
-               (< previous-start viewport-start)
-               (cons previous-start viewport-start))))
+               (< previous-start boundary)
+               (cons previous-start boundary))))
     (if (markerp previous-marker)
-        (set-marker previous-marker viewport-start (current-buffer))
-      (setq ai-code-backends-infra-ghostel--last-live-viewport-start
-            (copy-marker viewport-start)))
+        (set-marker previous-marker boundary (current-buffer))
+      (setq ai-code-backends-infra-ghostel--last-image-preview-boundary
+            (copy-marker boundary)))
     region))
+
+(defun ai-code-backends-infra-ghostel--image-redraw-marker
+    (position insertion-type)
+  "Return a marker at POSITION with INSERTION-TYPE."
+  (let ((marker (copy-marker position)))
+    (set-marker-insertion-type marker insertion-type)
+    marker))
+
+(defun ai-code-backends-infra-ghostel--image-preview-snapshots ()
+  "Return snapshots of image overlays that a full native redraw may replace."
+  (let (snapshots)
+    (dolist (overlay (overlays-in (point-min) (point-max)))
+      (when (ai-code-session-link--image-preview-overlay-anchor-valid-p
+             overlay)
+        (let* ((start (overlay-start overlay))
+               (end (overlay-end overlay))
+               (row-bounds
+                (ai-code-backends-infra-ghostel--logical-row-bounds start))
+               (row-start (car row-bounds))
+               (row-end (cdr row-bounds)))
+          (push (list :overlay overlay
+                      :start start
+                      :end end
+                      :start-before-marker
+                      (ai-code-backends-infra-ghostel--image-redraw-marker
+                       start nil)
+                      :start-after-marker
+                      (ai-code-backends-infra-ghostel--image-redraw-marker
+                       start t)
+                      :end-before-marker
+                      (ai-code-backends-infra-ghostel--image-redraw-marker
+                       end nil)
+                      :end-after-marker
+                      (ai-code-backends-infra-ghostel--image-redraw-marker
+                       end t)
+                      :file
+                      (overlay-get overlay 'ai-code-session-image-file)
+                      :link-text
+                      (overlay-get overlay 'ai-code-session-image-link-text)
+                      :text
+                      (ai-code-session-link--image-preview-anchor-text
+                       start end)
+                      :row-text
+                      (ai-code-backends-infra-ghostel--logical-row-text
+                       row-start row-end)
+                      :start-offset
+                      (ai-code-backends-infra-ghostel--logical-row-offset
+                       row-start start)
+                      :end-offset
+                      (ai-code-backends-infra-ghostel--logical-row-offset
+                       row-start end))
+                snapshots))))
+    snapshots))
+
+(defun ai-code-backends-infra-ghostel--image-preview-snapshot-touched-p
+    (snapshot)
+  "Return non-nil when redraw changed text across image SNAPSHOT."
+  (let ((start-before
+         (marker-position (plist-get snapshot :start-before-marker)))
+        (start-after
+         (marker-position (plist-get snapshot :start-after-marker)))
+        (end-before
+         (marker-position (plist-get snapshot :end-before-marker)))
+        (end-after
+         (marker-position (plist-get snapshot :end-after-marker))))
+    (or (null start-before)
+        (null start-after)
+        (null end-before)
+        (null end-after)
+        (/= start-before start-after)
+        (/= end-before end-after))))
+
+(defun ai-code-backends-infra-ghostel--clear-image-preview-snapshot-markers
+    (snapshot)
+  "Detach temporary redraw-detection markers from SNAPSHOT."
+  (dolist (property '(:start-before-marker :start-after-marker
+                      :end-before-marker :end-after-marker))
+    (when-let* ((marker (plist-get snapshot property))
+                ((markerp marker)))
+      (set-marker marker nil))))
+
+(defun ai-code-backends-infra-ghostel--image-preview-snapshot-signature
+    (snapshot)
+  "Return a semantic grouping key for image SNAPSHOT."
+  (list (plist-get snapshot :file)
+        (plist-get snapshot :link-text)
+        (plist-get snapshot :text)
+        (plist-get snapshot :row-text)
+        (plist-get snapshot :start-offset)
+        (plist-get snapshot :end-offset)))
+
+(defun ai-code-backends-infra-ghostel--image-preview-logical-row-index ()
+  "Return a full-buffer index of normalized logical terminal rows."
+  (let ((index (make-hash-table :test #'equal)))
+    (save-excursion
+      (goto-char (point-min))
+      (while (< (point) (point-max))
+        (let* ((row-bounds
+                (ai-code-backends-infra-ghostel--logical-row-bounds (point)))
+               (row-end (cdr row-bounds))
+               (row-text
+                (ai-code-backends-infra-ghostel--logical-row-text
+                 (car row-bounds) row-end)))
+          (puthash row-text
+                   (cons row-bounds (gethash row-text index))
+                   index)
+          (goto-char (if (< row-end (point-max))
+                         (1+ row-end)
+                       (point-max))))))
+    (maphash
+     (lambda (row-text bounds)
+       (puthash row-text (nreverse bounds) index))
+     index)
+    index))
+
+(defun ai-code-backends-infra-ghostel--image-preview-snapshot-candidates
+    (snapshot row-index)
+  "Return ranges matching image SNAPSHOT using ROW-INDEX."
+  (let ((row-text (plist-get snapshot :row-text))
+        (text (plist-get snapshot :text))
+        (start-offset (plist-get snapshot :start-offset))
+        (end-offset (plist-get snapshot :end-offset))
+        candidates)
+    (dolist (row-bounds (gethash row-text row-index))
+      (let ((row-start (car row-bounds))
+            (row-end (cdr row-bounds)))
+        (when-let* ((start
+                     (ai-code-backends-infra-ghostel--logical-row-position
+                      row-start row-end start-offset))
+                    (end
+                     (ai-code-backends-infra-ghostel--logical-row-position
+                      row-start row-end end-offset))
+                    ((equal
+                      (ai-code-session-link--image-preview-anchor-text
+                       start end)
+                      text)))
+          (push (cons start end) candidates))))
+    (nreverse candidates)))
+
+(defun ai-code-backends-infra-ghostel--image-preview-snapshot-assignments
+    (snapshots)
+  "Return safe one-to-one reanchor assignments for SNAPSHOTS.
+Identical occurrences are paired in order only when their old and new counts
+match.  A deletion or insertion makes that identity ambiguous, so every
+overlay in the ambiguous group is dropped instead of being guessed."
+  (when snapshots
+    (let ((direct-groups (make-hash-table :test #'equal))
+          (consumed-ranges (make-hash-table :test #'equal))
+          unresolved
+          assignments)
+      ;; The paired insertion-type markers diverge only when the renderer
+      ;; touched an image boundary.  Untouched overlays avoid a scrollback
+      ;; scan on ordinary status-animation frames.
+      (dolist (snapshot snapshots)
+        (let ((overlay (plist-get snapshot :overlay)))
+          (if (and (not
+                    (ai-code-backends-infra-ghostel--image-preview-snapshot-touched-p
+                     snapshot))
+                   (ai-code-session-link--image-preview-overlay-anchor-valid-p
+                    overlay))
+              (let ((position (cons (overlay-start overlay)
+                                    (overlay-end overlay))))
+                (puthash position
+                         (cons snapshot (gethash position direct-groups))
+                         direct-groups))
+            (push snapshot unresolved))))
+      (maphash
+       (lambda (position group)
+         (if (= (length group) 1)
+             (progn
+               (push (cons (car group) position) assignments)
+               (puthash position t consumed-ranges))
+           (setq unresolved (append group unresolved))))
+       direct-groups)
+      (when unresolved
+        (let ((groups (make-hash-table :test #'equal))
+              (row-index
+               (ai-code-backends-infra-ghostel--image-preview-logical-row-index)))
+          (dolist (snapshot unresolved)
+            (let ((signature
+                   (ai-code-backends-infra-ghostel--image-preview-snapshot-signature
+                    snapshot)))
+              (puthash signature
+                       (cons snapshot (gethash signature groups))
+                       groups)))
+          (maphash
+           (lambda (_signature group)
+             (let* ((ordered-snapshots
+                     (sort group
+                           (lambda (left right)
+                             (< (plist-get left :start)
+                                (plist-get right :start)))))
+                    (candidates
+                     (cl-remove-if
+                      (lambda (position)
+                        (gethash position consumed-ranges))
+                      (ai-code-backends-infra-ghostel--image-preview-snapshot-candidates
+                       (car ordered-snapshots) row-index))))
+               (when (= (length ordered-snapshots) (length candidates))
+                 (cl-mapc
+                  (lambda (snapshot position)
+                    (push (cons snapshot position) assignments))
+                  ordered-snapshots candidates))))
+           groups)))
+      assignments)))
+
+(defun ai-code-backends-infra-ghostel--restore-image-preview-snapshot
+    (snapshot position)
+  "Restore SNAPSHOT's existing image overlay at POSITION after redraw."
+  (let ((overlay (plist-get snapshot :overlay)))
+    (if (and (overlayp overlay)
+             position
+             (ai-code-session-link--image-preview-position-allowed-p
+              (car position) (cdr position)))
+        (progn
+          (move-overlay overlay (car position) (cdr position)
+                        (current-buffer))
+          (ai-code-session-link--refresh-image-preview-overlay overlay))
+      (when (overlayp overlay)
+        (delete-overlay overlay)))))
+
+(defun ai-code-backends-infra-ghostel--around-redraw-preserving-image-previews
+    (original &rest args)
+  "Call native redraw ORIGINAL with ARGS while preserving image overlays.
+The same overlay objects are restored before Ghostel anchors following
+windows, so unchanged previews never disappear for an intermediate frame."
+  (if (not (ai-code-backends-infra-ghostel--ai-session-buffer-p))
+      (apply original args)
+    (let ((snapshots
+           (ai-code-backends-infra-ghostel--image-preview-snapshots)))
+      (unwind-protect
+          (prog1 (apply original args)
+            (let* ((submitted-boundary
+                    (ai-code-backends-infra-ghostel--finish-image-submission))
+                   (assignments
+                    (ai-code-backends-infra-ghostel--image-preview-snapshot-assignments
+                     snapshots)))
+              (when (and (not submitted-boundary)
+                         (not ai-code-backends-infra-ghostel--image-submission-pending)
+                         (ai-code-backends-infra-ghostel--active-image-input-boundary))
+                (ai-code-backends-infra-ghostel--remember-active-image-input))
+              (dolist (snapshot snapshots)
+                (ai-code-backends-infra-ghostel--restore-image-preview-snapshot
+                 snapshot (cdr (assq snapshot assignments))))
+              (when submitted-boundary
+                (ai-code-backends-infra-ghostel--linkify-image-preview-region
+                 (current-buffer)
+                 (or (ai-code-backends-infra-ghostel--live-viewport-start)
+                     (max (point-min)
+                          (- submitted-boundary
+                             ai-code-backends-infra-ghostel-visible-image-linkify-max-chars)))
+                 submitted-boundary))))
+        (dolist (snapshot snapshots)
+          (ai-code-backends-infra-ghostel--clear-image-preview-snapshot-markers
+           snapshot))))))
 
 (defun ai-code-backends-infra-ghostel--active-preedit-overlay-p
     (overlay buffer)
@@ -892,19 +1419,19 @@ Optional DELAYS overrides the default visible image linkification delays."
         (with-current-buffer buffer
           (let* ((queued-detection-start
                   (if (markerp start) (marker-position start) start))
-                 (live-viewport-start
-                  (or (ai-code-backends-infra-ghostel--live-viewport-start)
+                 (preview-boundary
+                  (or (ai-code-backends-infra-ghostel--image-preview-boundary)
                       queued-detection-start))
                  (configured-position-function
                   ai-code-session-link--image-preview-position-function))
             (when-let* ((stable-region
-                         (ai-code-backends-infra-ghostel--newly-stable-image-region
-                          live-viewport-start)))
+                         (ai-code-backends-infra-ghostel--newly-previewable-image-region
+                          preview-boundary)))
               (ai-code-backends-infra-ghostel--linkify-image-preview-region
                buffer (car stable-region) (cdr stable-region)))
             (let ((ai-code-session-link--image-preview-position-function
                    (lambda (preview-start preview-end)
-                     (and (<= preview-end live-viewport-start)
+                     (and (<= preview-end preview-boundary)
                           (or (not configured-position-function)
                               (funcall configured-position-function
                                        preview-start preview-end))))))
@@ -913,6 +1440,26 @@ Optional DELAYS overrides the default visible image linkification delays."
 
 (defun ai-code-backends-infra-ghostel--install-image-preview-advice ()
   "Install Ghostel advice used to add and refresh image previews."
+  (when (and (fboundp 'ghostel--redraw)
+             (not (advice-member-p
+                   #'ai-code-backends-infra-ghostel--around-redraw-preserving-image-previews
+                   'ghostel--redraw)))
+    (advice-add 'ghostel--redraw
+                :around
+                #'ai-code-backends-infra-ghostel--around-redraw-preserving-image-previews))
+  (dolist (entry
+           '((ghostel--send-encoded :around
+              ai-code-backends-infra-ghostel--around-send-encoded)
+             (ghostel--send-string :before
+              ai-code-backends-infra-ghostel--before-send-string)
+             (ghostel--paste-text :before
+              ai-code-backends-infra-ghostel--before-send-string)))
+    (let ((target (nth 0 entry))
+          (where (nth 1 entry))
+          (advice (nth 2 entry)))
+      (when (and (fboundp target)
+                 (not (advice-member-p advice target)))
+        (advice-add target where advice))))
   (when (and (fboundp 'ghostel--run-queued-plain-link-detection)
              (not (advice-member-p
                    #'ai-code-backends-infra-ghostel--run-queued-link-detection-around
@@ -1255,6 +1802,13 @@ variables for the terminal process."
                            sentinel)))
           (ai-code-backends-infra-ghostel--wrap-process-filter buffer proc))
         (cons buffer proc)))))
+
+(defun ai-code-backends-infra-ghostel-unload-function ()
+  "Remove global Ghostel advice installed by this feature."
+  (dolist (entry ai-code-backends-infra-ghostel--global-advice-specs)
+    (when (fboundp (car entry))
+      (advice-remove (car entry) (cdr entry))))
+  nil)
 
 (provide 'ai-code-backends-infra-ghostel)
 ;;; ai-code-backends-infra-ghostel.el ends here

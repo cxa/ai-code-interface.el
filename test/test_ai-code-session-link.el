@@ -1294,7 +1294,8 @@
                 (should-not (equal (car created-image) image-file))
                 (should (nth 2 created-image))
                 (should (member :max-width created-image))
-                (should-not (member :max-height created-image))))))
+                (should (equal (cadr (memq :max-height created-image))
+                               ai-code-session-link--image-preview-fallback-max-height))))))
       (when (file-directory-p root)
         (delete-directory root t)))))
 
@@ -1634,6 +1635,51 @@ detection regexp must stitch those rows back together."
       (when (file-directory-p root)
         (delete-directory root t)))))
 
+(ert-deftest test-ai-code-session-link--neighbor-redraw-keeps-image-overlay-stable ()
+  "Changing a neighboring status row should not recreate an image preview."
+  (let* ((root (make-temp-file "ai-code-session-image-neighbor-redraw-" t))
+         (image-file (expand-file-name "history.png" root))
+         (create-count 0)
+         original-preview)
+    (unwind-protect
+        (progn
+          (with-temp-file image-file
+            (insert "fake image bytes"))
+          (cl-letf (((symbol-function 'display-images-p)
+                     (lambda (&optional _display) t))
+                    ((symbol-function 'create-image)
+                     (lambda (_data &rest _args)
+                       (setq create-count (1+ create-count))
+                       'fake-image)))
+            (with-temp-buffer
+              (setq-local ai-code-backends-infra--session-directory root)
+              (setq-local ai-code-backends-infra--session-terminal-backend
+                          'ghostel)
+              (insert "Working (42s)\nSaved history.png\n")
+              (ai-code-session-link--linkify-session-region
+               (point-min) (point-max))
+              (setq original-preview
+                    (cl-find-if
+                     (lambda (overlay)
+                       (overlay-get overlay 'ai-code-session-image-preview))
+                     (overlays-in (point-min) (point-max))))
+              (should original-preview)
+              (goto-char (point-min))
+              (search-forward "42s")
+              (let ((inhibit-read-only t))
+                (replace-match "43s"))
+              (ai-code-session-link--linkify-session-region
+               (point-min) (point-max))
+              (let ((preview
+                     (cl-find-if
+                      (lambda (overlay)
+                        (overlay-get overlay 'ai-code-session-image-preview))
+                      (overlays-in (point-min) (point-max)))))
+                (should (eq preview original-preview))
+                (should (= create-count 1))))))
+      (when (file-directory-p root)
+        (delete-directory root t)))))
+
 (ert-deftest test-ai-code-session-link--linkify-strict-image-preview-region-keeps-visible-rescan-stable ()
   "Repeated visible scans should keep an existing image preview in place."
   (let* ((root (make-temp-file "ai-code-session-image-preview-rescan-" t))
@@ -1917,21 +1963,82 @@ Bare wrapped paths -- as printed by tools such as Claude, which omit the
         (delete-directory root t)))))
 
 (ert-deftest ai-code-session-link-test-image-preview-max-dimensions ()
-  "Preview caps: integer customs are hard caps; nil height is uncapped."
-  ;; An explicit integer custom is used verbatim, regardless of any window.
+  "Preview caps should include a half-viewport height ceiling."
+  ;; A smaller explicit integer custom remains the effective hard cap.
   (let ((ai-code-session-link-ghostel-image-preview-max-width 400)
         (ai-code-session-link-ghostel-image-preview-max-height 300))
     (with-temp-buffer
       (should (equal (ai-code-session-link--image-preview-max-dimensions "")
                      '(400 . 300)))))
-  ;; With nil customs and no window showing the buffer, only the fixed width
-  ;; fallback applies.  Height remains uncapped so screenshots can fill width.
+  ;; With nil customs and no window, fixed width and height fallbacks apply.
   (let ((ai-code-session-link-ghostel-image-preview-max-width nil)
         (ai-code-session-link-ghostel-image-preview-max-height nil))
     (with-temp-buffer
       (should (equal (ai-code-session-link--image-preview-max-dimensions "  ")
                      (cons ai-code-session-link--image-preview-fallback-max-width
-                           nil))))))
+                           ai-code-session-link--image-preview-fallback-max-height))))))
+
+(ert-deftest test-ai-code-session-link--tall-image-height-capped-at-half-window ()
+  "A tall preview should occupy at most half its Ghostel window height."
+  (let* ((root (make-temp-file "ai-code-session-tall-image-" t))
+         (image-file (expand-file-name "very-tall.png" root))
+         (ai-code-session-link-ghostel-image-preview-max-height 2000)
+         created-properties)
+    (unwind-protect
+        (progn
+          (with-temp-file image-file
+            (insert "fake tall image bytes"))
+          (save-window-excursion
+            (with-temp-buffer
+              (switch-to-buffer (current-buffer))
+              (setq-local ai-code-backends-infra--session-directory root)
+              (setq-local ai-code-backends-infra--session-terminal-backend
+                          'ghostel)
+              (insert "Saved very-tall.png\n")
+              (cl-letf (((symbol-function 'display-images-p)
+                         (lambda (&optional _display) t))
+                        ((symbol-function 'window-body-width)
+                         (lambda (_window pixelwise)
+                           (should pixelwise)
+                           1200))
+                        ((symbol-function 'window-body-height)
+                         (lambda (_window pixelwise)
+                           (should pixelwise)
+                           801))
+                        ((symbol-function 'create-image)
+                         (lambda (_data _type _data-p &rest properties)
+                           (setq created-properties properties)
+                           'fake-image)))
+                (ai-code-session-link--linkify-session-region
+                 (point-min) (point-max)))
+              (should (= (plist-get created-properties :max-height) 400)))))
+      (when (file-directory-p root)
+        (delete-directory root t)))))
+
+(ert-deftest test-ai-code-session-link--image-height-fits-smallest-window ()
+  "A shared preview should fit half the smallest window showing its buffer."
+  (let ((buffer (generate-new-buffer " *ai-code-image-two-windows*"))
+        smaller-window)
+    (unwind-protect
+        (save-window-excursion
+          (let ((window-min-height 1))
+            (delete-other-windows)
+            (setq smaller-window (split-window-below))
+            (set-window-buffer (selected-window) buffer)
+            (set-window-buffer smaller-window buffer)
+            (with-current-buffer buffer
+              (cl-letf (((symbol-function 'window-body-height)
+                         (lambda (window pixelwise)
+                           (should pixelwise)
+                           (if (eq window smaller-window) 400 800))))
+                (should
+                 (= (cdr (ai-code-session-link--image-preview-max-dimensions
+                          ""))
+                    200))))))
+      (when (window-live-p smaller-window)
+        (delete-window smaller-window))
+      (when (buffer-live-p buffer)
+        (kill-buffer buffer)))))
 
 (ert-deftest ai-code-session-link-test-ghostel-image-preview-common-reference-forms ()
   "Ghostel image previews should handle common local image reference forms."
