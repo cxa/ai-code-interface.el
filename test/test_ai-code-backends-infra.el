@@ -722,7 +722,7 @@ The prefix argument should also force instance-name prompting."
                 ((symbol-function 'ai-code-backends-infra--sync-terminal-dimensions)
                  (lambda (&rest _args) nil))
                 ((symbol-function
-                  'ai-code-backends-infra-ghostel-schedule-visible-image-linkify)
+                  'ai-code-ghostel-image-preview-schedule-visible-linkify)
                  (lambda (window)
                    (setq display-linkified-window window))))
         (ai-code-backends-infra--display-buffer-in-side-window

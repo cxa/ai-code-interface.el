@@ -644,8 +644,7 @@ buffer is in scroll/copy mode, working around bug #1422."
       (ai-code-backends-infra--sync-terminal-dimensions buffer window)
       (with-current-buffer buffer
         (when (eq ai-code-backends-infra--session-terminal-backend 'ghostel)
-          (ai-code-backends-infra-ghostel-schedule-visible-image-linkify
-           window))))
+          (ai-code-ghostel-image-preview-schedule-visible-linkify window))))
     window))
 
 (defun ai-code-backends-infra--fit-side-window-body-width (window)

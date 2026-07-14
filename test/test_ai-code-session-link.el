@@ -14,6 +14,8 @@
 
 (defvar ai-code-backends-infra--session-directory)
 (defvar ai-code-backends-infra--session-terminal-backend)
+(defvar ai-code-session-link-image-preview-position-function)
+(defvar ai-code-session-link-image-preview-transaction-function)
 
 (ert-deftest ai-code-session-link-test-toggle-defaults-enabled ()
   "Session linkification should be enabled by default."
@@ -1278,6 +1280,7 @@
               (search-forward "screenshot.png")
               (let* ((link-start (match-beginning 0))
                      (link-end (match-end 0))
+                     (line-end (line-end-position))
                      (preview-overlays
                       (cl-remove-if-not
                        (lambda (overlay)
@@ -1290,10 +1293,21 @@
                 (should (equal (overlay-get (car preview-overlays)
                                             'ai-code-session-image-file)
                                image-file))
-                (should (= (overlay-start (car preview-overlays))
+                (should (= (overlay-get (car preview-overlays)
+                                        'ai-code-session-image-link-start)
                            link-start))
-                (should (= (overlay-end (car preview-overlays))
+                (should (= (overlay-get (car preview-overlays)
+                                        'ai-code-session-image-link-end)
                            link-end))
+                (should (= (overlay-start (car preview-overlays)) line-end))
+                (should (= (overlay-end (car preview-overlays))
+                           (1+ line-end)))
+                (should (equal (overlay-get (car preview-overlays) 'display)
+                               (list :image "fake image bytes" :args
+                                     (cdr created-image))))
+                (should (equal (overlay-get (car preview-overlays)
+                                            'after-string)
+                               "\n"))
                 (should (equal (car created-image) "fake image bytes"))
                 (should-not (equal (car created-image) image-file))
                 (should (nth 2 created-image))
@@ -1320,14 +1334,6 @@
       (when (file-directory-p root)
         (delete-directory root t)))))
 
-(ert-deftest ai-code-session-link-test-unicode-trailing-punctuation-categories ()
-  "Image preview suffix detection should use Unicode punctuation categories."
-  (should (ai-code-session-link--unicode-trailing-punctuation-p ?\u3002))
-  (should (ai-code-session-link--unicode-trailing-punctuation-p ?\u061f))
-  (should (ai-code-session-link--unicode-trailing-punctuation-p ?\uff09))
-  (should-not (ai-code-session-link--unicode-trailing-punctuation-p ?/))
-  (should-not (ai-code-session-link--unicode-trailing-punctuation-p ?a)))
-
 (ert-deftest ai-code-session-link-test-ghostel-image-preview-follows-trailing-punctuation ()
   "Image previews should appear after sentence punctuation following a path."
   (let* ((root (make-temp-file "ai-code-session-image-preview-punctuation-" t))
@@ -1353,6 +1359,7 @@
                 (search-forward image-file)
                 (let* ((link-start (match-beginning 0))
                        (link-end (match-end 0))
+                       (line-end (line-end-position))
                        (preview-overlays
                         (cl-remove-if-not
                          (lambda (overlay)
@@ -1360,8 +1367,14 @@
                          (overlays-in (point-min) (point-max))))
                        (overlay (car preview-overlays)))
                   (should (= (length preview-overlays) 1))
-                  (should (= (overlay-start overlay) link-start))
-                  (should (= (overlay-end overlay) (1+ link-end)))
+                  (should (= (overlay-get overlay
+                                          'ai-code-session-image-link-start)
+                             link-start))
+                  (should (= (overlay-get overlay
+                                          'ai-code-session-image-link-end)
+                             link-end))
+                  (should (= (overlay-start overlay) line-end))
+                  (should (= (overlay-end overlay) (1+ line-end)))
                   (should (equal (overlay-get
                                   overlay
                                   'ai-code-session-image-display-text)
@@ -1460,12 +1473,23 @@ detection regexp must stitch those rows back together."
                 (should (equal (overlay-get (car preview-overlays)
                                             'ai-code-session-image-file)
                                image-file))
-                (should (equal (car created-image) "fake image bytes"))))))
+                (should (equal (car created-image) "fake image bytes")))
+              (dolist (fragment (list head tail))
+                (goto-char (point-min))
+                (search-forward fragment)
+                (let ((fragment-start (match-beginning 0))
+                      (fragment-end (match-end 0)))
+                  (while (< fragment-start fragment-end)
+                    (should-not
+                     (get-char-property fragment-start 'display))
+                    (should-not
+                     (get-char-property fragment-start 'invisible))
+                    (setq fragment-start (1+ fragment-start))))))))
       (when (file-directory-p root)
         (delete-directory root t)))))
 
-(ert-deftest ai-code-session-link-test-ghostel-image-preview-keeps-line-gutter ()
-  "Image previews should align with the image path line's leading gutter."
+(ert-deftest test-ai-code-session-link--ghostel-image-preview-uses-newline-display-overlay ()
+  "Image previews should occupy a dedicated row after their visible path."
   (let* ((root (make-temp-file "ai-code-session-image-preview-indent-" t))
          (image-file (expand-file-name "screenshot.png" root)))
     (unwind-protect
@@ -1483,20 +1507,370 @@ detection regexp must stitch those rows back together."
               (insert "    | /tmp/nope.txt\n")
               (insert "    | screenshot.png\n")
               (ai-code-session-link--linkify-session-region (point-min) (point-max))
-              (let* ((preview-overlays
-                      (cl-remove-if-not
-                       (lambda (overlay)
-                         (overlay-get overlay 'ai-code-session-image-preview))
-                       (overlays-in (point-min) (point-max))))
-                     (after-string (overlay-get (car preview-overlays)
-                                                'after-string)))
+              (goto-char (point-min))
+              (search-forward "screenshot.png")
+              (let ((path-start (match-beginning 0))
+                    (preview-overlays
+                     (cl-remove-if-not
+                      (lambda (overlay)
+                        (overlay-get overlay 'ai-code-session-image-preview))
+                      (overlays-in (point-min) (point-max)))))
                 (should (= (length preview-overlays) 1))
-                (should (string-prefix-p "\n    " after-string))))))
+                (should (overlay-get (car preview-overlays) 'display))
+                (should-not (get-char-property path-start 'display))
+                (should (eq (get-char-property path-start 'face) 'link))
+                (should (eq (get-char-property path-start 'mouse-face)
+                            'highlight))
+                (should (eq (char-after
+                             (overlay-start (car preview-overlays)))
+                            ?\n))
+                (should (equal (overlay-get (car preview-overlays)
+                                            'before-string)
+                               "\n    "))
+                (should (equal (overlay-get (car preview-overlays)
+                                            'after-string)
+                               "\n"))))))
       (when (file-directory-p root)
         (delete-directory root t)))))
 
-(ert-deftest ai-code-session-link-test-ghostel-image-preview-absorbs-clicks ()
-  "Clicking the inline image preview should not open the file link."
+(ert-deftest test-ai-code-session-link--ghostel-image-preview-keeps-path-visible ()
+  "An image preview must not replace or hide its source path."
+  (let* ((root (make-temp-file "ai-code-session-image-preview-visible-path-" t))
+         (image-file (expand-file-name "screenshot.png" root)))
+    (unwind-protect
+        (progn
+          (with-temp-file image-file
+            (insert "fake image bytes"))
+          (cl-letf (((symbol-function 'display-images-p)
+                     (lambda (&optional _display) t))
+                    ((symbol-function 'create-image)
+                     (lambda (file &rest args)
+                       (list :image file :args args))))
+            (with-temp-buffer
+              (setq-local ai-code-backends-infra--session-directory root)
+              (setq-local ai-code-backends-infra--session-terminal-backend
+                          'ghostel)
+              (insert "  ╰  screenshot.png\n")
+              (ai-code-session-link--linkify-session-region
+               (point-min) (point-max))
+              (goto-char (point-min))
+              (search-forward "screenshot.png")
+              (let ((path-start (match-beginning 0))
+                    (path-end (match-end 0)))
+                (while (< path-start path-end)
+                  (should-not (get-char-property path-start 'display))
+                  (should-not (get-char-property path-start 'invisible))
+                  (setq path-start (1+ path-start)))))))
+      (when (file-directory-p root)
+        (delete-directory root t)))))
+
+(ert-deftest test-ai-code-session-link--ghostel-image-preview-aligns-after-tree-path ()
+  "A tree-prefixed preview should align below its still-visible path."
+  (let* ((root (make-temp-file "ai-code-session-image-preview-align-" t))
+         (image-file (expand-file-name "screenshot.png" root)))
+    (unwind-protect
+        (progn
+          (with-temp-file image-file
+            (insert "fake image bytes"))
+          (cl-letf (((symbol-function 'display-images-p)
+                     (lambda (&optional _display) t))
+                    ((symbol-function 'create-image)
+                     (lambda (file &rest args)
+                       (list :image file :args args))))
+            (dolist (text '("  ╰  screenshot.png\n"
+                            "  ╰\n     screenshot.png\n"
+                            "  └  screenshot.png\n"
+                            "  └\n     screenshot.png\n"))
+              (with-temp-buffer
+                (setq-local ai-code-backends-infra--session-directory root)
+                (setq-local ai-code-backends-infra--session-terminal-backend
+                            'ghostel)
+                (insert text)
+                (ai-code-session-link--linkify-session-region
+                 (point-min) (point-max))
+                (goto-char (point-min))
+                (search-forward "screenshot.png")
+                (let ((path-start (match-beginning 0)))
+                  (goto-char path-start)
+                  (let ((expected-indent (make-string (current-column) ?\s))
+                        (preview
+                         (cl-find-if
+                          (lambda (overlay)
+                            (overlay-get overlay
+                                         'ai-code-session-image-preview))
+                          (overlays-in (point-min) (point-max)))))
+                    (should preview)
+                      (should-not (get-char-property path-start 'display))
+                    (should (equal (overlay-get preview 'before-string)
+                                   (concat "\n" expected-indent)))))))))
+      (when (file-directory-p root)
+        (delete-directory root t)))))
+
+(ert-deftest test-ai-code-session-link--ghostel-image-preview-rejects-nonleading-tree-marker ()
+  "A non-leading tree marker should use only the row's whitespace indent."
+  (let* ((root (make-temp-file "ai-code-session-image-preview-tree-negative-" t))
+         (image-file (expand-file-name "screenshot.png" root)))
+    (unwind-protect
+        (progn
+          (with-temp-file image-file
+            (insert "fake image bytes"))
+          (cl-letf (((symbol-function 'display-images-p)
+                     (lambda (&optional _display) t))
+                    ((symbol-function 'create-image)
+                     (lambda (file &rest args)
+                       (list :image file :args args))))
+            (dolist (text '("> ╰  screenshot.png\n"
+                            "| ╰\n     screenshot.png\n"))
+              (with-temp-buffer
+                (setq-local ai-code-backends-infra--session-directory root)
+                (setq-local ai-code-backends-infra--session-terminal-backend
+                            'ghostel)
+                (insert text)
+                (ai-code-session-link--linkify-session-region
+                 (point-min) (point-max))
+                (goto-char (point-min))
+                (search-forward "screenshot.png")
+                (let ((path-start (match-beginning 0)))
+                  (goto-char path-start)
+                  (let* ((line-start (line-beginning-position))
+                         (indent-end
+                          (save-excursion
+                            (goto-char line-start)
+                            (skip-chars-forward " \t" (line-end-position))
+                            (point)))
+                         (expected-indent
+                          (buffer-substring-no-properties
+                           line-start indent-end))
+                         (preview
+                          (cl-find-if
+                           (lambda (overlay)
+                             (overlay-get overlay
+                                          'ai-code-session-image-preview))
+                           (overlays-in (point-min) (point-max)))))
+                    (should preview)
+                    (should (equal (overlay-get preview 'before-string)
+                                   (concat "\n" expected-indent)))))))))
+      (when (file-directory-p root)
+        (delete-directory root t)))))
+
+(ert-deftest test-ai-code-session-link--ghostel-image-preview-refreshes-after-tree-prefix-removal ()
+  "Removing a tree prefix should rebuild its preview with row indentation."
+  (let* ((root (make-temp-file "ai-code-session-image-preview-tree-refresh-" t))
+         (image-file (expand-file-name "screenshot.png" root)))
+    (unwind-protect
+        (progn
+          (with-temp-file image-file
+            (insert "fake image bytes"))
+          (cl-letf (((symbol-function 'display-images-p)
+                     (lambda (&optional _display) t))
+                    ((symbol-function 'create-image)
+                     (lambda (file &rest args)
+                       (list :image file :args args))))
+            (with-temp-buffer
+              (setq-local ai-code-backends-infra--session-directory root)
+              (setq-local ai-code-backends-infra--session-terminal-backend
+                          'ghostel)
+              (insert "  ╰  screenshot.png\n")
+              (ai-code-session-link--linkify-session-region
+               (point-min) (point-max))
+              (let ((old-preview
+                     (cl-find-if
+                      (lambda (overlay)
+                        (overlay-get overlay
+                                     'ai-code-session-image-preview))
+                      (overlays-in (point-min) (point-max)))))
+                (should old-preview)
+                (should (equal (overlay-get old-preview 'before-string)
+                               "\n     "))
+                (goto-char (point-min))
+                (search-forward "╰")
+                (replace-match ">" t t)
+                (ai-code-session-link--linkify-session-region
+                 (point-min) (point-max))
+                (let ((previews
+                       (cl-remove-if-not
+                        (lambda (overlay)
+                          (overlay-get overlay
+                                       'ai-code-session-image-preview))
+                        (overlays-in (point-min) (point-max)))))
+                  (should (= (length previews) 1))
+                  (should (equal (overlay-get (car previews) 'before-string)
+                                 "\n  "))
+                  (should-not (overlay-buffer old-preview)))))))
+      (when (file-directory-p root)
+        (delete-directory root t)))))
+
+(ert-deftest test-ai-code-session-link--ghostel-image-preview-keeps-line-suffix-visible ()
+  "A terminal row's source path and suffix should remain visible together."
+  (let* ((root (make-temp-file "ai-code-session-image-preview-suffix-" t))
+         (image-file (expand-file-name "screenshot.png" root)))
+    (unwind-protect
+        (progn
+          (with-temp-file image-file
+            (insert "fake image bytes"))
+          (cl-letf (((symbol-function 'display-images-p)
+                     (lambda (&optional _display) t))
+                    ((symbol-function 'create-image)
+                     (lambda (file &rest args)
+                       (list :image file :args args))))
+            (with-temp-buffer
+              (setq-local ai-code-backends-infra--session-directory root)
+              (setq-local ai-code-backends-infra--session-terminal-backend 'ghostel)
+              (insert "> screenshot.png  describe this image\n")
+              (ai-code-session-link--linkify-session-region (point-min) (point-max))
+              (let* ((overlay
+                      (cl-find-if
+                       (lambda (candidate)
+                         (overlay-get candidate 'ai-code-session-image-preview))
+                       (overlays-in (point-min) (point-max))))
+                     (line-end (save-excursion
+                                 (goto-char (point-min))
+                                 (line-end-position))))
+                (should overlay)
+                (should (= (overlay-start overlay) line-end))
+                (should (= (overlay-end overlay) (1+ line-end)))
+                (should (= (overlay-get overlay
+                                        'ai-code-session-image-display-end)
+                           line-end))
+                (should (equal (overlay-get overlay 'before-string) "\n"))
+                (should (equal (overlay-get overlay 'after-string) "\n"))
+                (goto-char (point-min))
+                (search-forward "screenshot.png  describe this image")
+                (let ((row-start (match-beginning 0))
+                      (row-end (match-end 0)))
+                  (while (< row-start row-end)
+                    (should-not (get-char-property row-start 'display))
+                    (should-not (get-char-property row-start 'invisible))
+                    (setq row-start (1+ row-start))))
+                (should-not
+                 (overlay-get overlay
+                              'ai-code-session-image-preview-suffix-overlay))
+                (ai-code-session-link--delete-image-preview-overlays
+                 (point-min) line-end)
+                (should-not (overlay-buffer overlay))))))
+      (when (file-directory-p root)
+        (delete-directory root t)))))
+
+(ert-deftest test-ai-code-session-link--ghostel-image-preview-does-not-overlap-suffix-image ()
+  "A second image reference must not overlap the preview owning its row."
+  (let* ((root (make-temp-file "ai-code-session-image-preview-overlap-" t))
+         (primary-file (expand-file-name "primary.png" root))
+         (suffix-file (expand-file-name "rendered.png" root)))
+    (unwind-protect
+        (progn
+          (dolist (file (list primary-file suffix-file))
+            (with-temp-file file
+              (insert "fake image bytes")))
+          (cl-letf (((symbol-function 'display-images-p)
+                     (lambda (&optional _display) t))
+                    ((symbol-function 'create-image)
+                     (lambda (file &rest args)
+                       (list :image file :args args))))
+            (with-temp-buffer
+              (setq-local ai-code-backends-infra--session-directory root)
+              (setq-local ai-code-backends-infra--session-terminal-backend
+                          'ghostel)
+              (insert primary-file "  rendered.png\n")
+              (ai-code-session-link--linkify-strict-image-preview-region
+               (point-min) (point-max))
+              (let ((previews
+                     (cl-remove-if-not
+                      (lambda (overlay)
+                        (overlay-get overlay 'ai-code-session-image-preview))
+                      (overlays-in (point-min) (point-max)))))
+                (should (= (length previews) 1))
+                (should (equal (overlay-get (car previews)
+                                            'ai-code-session-image-file)
+                               primary-file))
+                (should (equal (overlay-get (car previews) 'after-string)
+                               "\n"))
+                (goto-char (point-min))
+                (search-forward "rendered.png")
+                (should-not (get-char-property (match-beginning 0) 'display))
+                (should-not
+                 (get-char-property (match-beginning 0) 'invisible))))))
+      (when (file-directory-p root)
+        (delete-directory root t)))))
+
+(ert-deftest test-ai-code-session-link--image-preview-uses-lifecycle-seam ()
+  "Preview scans should transact once and honor the position owner."
+  (let* ((root (make-temp-file "ai-code-session-image-preview-seam-" t))
+         (image-file (expand-file-name "screenshot.png" root))
+         (transaction-count 0)
+         (position-count 0))
+    (unwind-protect
+        (progn
+          (with-temp-file image-file
+            (insert "fake image bytes"))
+          (cl-letf (((symbol-function 'display-images-p)
+                     (lambda (&optional _display) t))
+                    ((symbol-function 'create-image)
+                     (lambda (file &rest args)
+                       (list :image file :args args))))
+            (with-temp-buffer
+              (setq-local ai-code-backends-infra--session-directory root)
+              (setq-local ai-code-backends-infra--session-terminal-backend
+                          'ghostel)
+              (setq-local
+               ai-code-session-link-image-preview-transaction-function
+               (lambda (_start _end function)
+                 (setq transaction-count (1+ transaction-count))
+                 (funcall function)))
+              (setq-local
+               ai-code-session-link-image-preview-position-function
+               (lambda (_start _end)
+                 (setq position-count (1+ position-count))
+                 nil))
+              (insert "screenshot.png\n")
+              (ai-code-session-link--linkify-strict-image-preview-region
+               (point-min) (point-max))
+              (should (= transaction-count 1))
+              (should (= position-count 1))
+              (should-not
+               (cl-find-if
+                (lambda (overlay)
+                  (overlay-get overlay 'ai-code-session-image-preview))
+                (overlays-in (point-min) (point-max)))))))
+      (when (file-directory-p root)
+        (delete-directory root t)))))
+
+(ert-deftest test-ai-code-session-link--normal-linkify-transacts-image-layout ()
+  "Normal file linkification should use one image lifecycle transaction."
+  (let* ((root (make-temp-file "ai-code-session-image-linkify-seam-" t))
+         (image-file (expand-file-name "screenshot.png" root))
+         (transaction-count 0))
+    (unwind-protect
+        (progn
+          (with-temp-file image-file
+            (insert "fake image bytes"))
+          (cl-letf (((symbol-function 'display-images-p)
+                     (lambda (&optional _display) t))
+                    ((symbol-function 'create-image)
+                     (lambda (file &rest args)
+                       (list :image file :args args))))
+            (with-temp-buffer
+              (setq-local ai-code-backends-infra--session-directory root)
+              (setq-local ai-code-backends-infra--session-terminal-backend
+                          'ghostel)
+              (setq-local
+               ai-code-session-link-image-preview-transaction-function
+               (lambda (_start _end function)
+                 (setq transaction-count (1+ transaction-count))
+                 (funcall function)))
+              (insert "screenshot.png\n")
+              (ai-code-session-link--linkify-session-region
+               (point-min) (point-max))
+              (should (= transaction-count 1))
+              (should
+               (cl-find-if
+                (lambda (overlay)
+                  (overlay-get overlay 'ai-code-session-image-preview))
+                (overlays-in (point-min) (point-max)))))))
+      (when (file-directory-p root)
+        (delete-directory root t)))))
+
+(ert-deftest test-ai-code-session-link--ghostel-image-preview-keeps-link-navigation ()
+  "A display preview should preserve navigation on the underlying image link."
   (let* ((root (make-temp-file "ai-code-session-image-preview-click-" t))
          (image-file (expand-file-name "screenshot.png" root)))
     (unwind-protect
@@ -1518,15 +1892,7 @@ detection regexp must stitch those rows back together."
                        (lambda (overlay)
                          (overlay-get overlay 'ai-code-session-image-preview))
                        (overlays-in (point-min) (point-max))))
-                     (overlay (car preview-overlays))
-                     (after-string (overlay-get overlay 'after-string))
-                     (image-index (cl-position-if
-                                   (lambda (index)
-                                     (get-text-property index 'display after-string))
-                                   (number-sequence 0 (1- (length after-string)))))
-                     (preview-keymap
-                      (and image-index
-                           (get-text-property image-index 'keymap after-string))))
+                     (overlay (car preview-overlays)))
                 (should (= (length preview-overlays) 1))
                 (goto-char (point-min))
                 (search-forward "screenshot.png")
@@ -1534,11 +1900,8 @@ detection regexp must stitch those rows back together."
                                                            'keymap)
                                         [mouse-1])
                             'ai-code-session-navigate-link-at-mouse))
-                (should preview-keymap)
-                (should (eq (lookup-key preview-keymap [mouse-1])
-                            'ai-code-session-link--ignore-image-preview-event))
-                (should-not (eq (lookup-key preview-keymap [mouse-1])
-                                'ai-code-session-navigate-link-at-mouse))
+                (should (overlay-get overlay 'display))
+                (should (equal (overlay-get overlay 'after-string) "\n"))
                 (should-not (overlay-get overlay 'keymap))))))
       (when (file-directory-p root)
         (delete-directory root t)))))
@@ -1642,10 +2005,12 @@ detection regexp must stitch those rows back together."
               (insert "Saved history.png\n")
               (ai-code-session-link--linkify-session-region
                (point-min) (point-max))
-              (should (= create-count 1))
+              ;; One descriptor probes the source dimensions; the other is
+              ;; the final backing-pixel-aware preview descriptor.
+              (should (= create-count 2))
               (ai-code-session-link--linkify-session-region
                (point-min) (point-max))
-              (should (= create-count 1))
+              (should (= create-count 2))
               (should
                (= (length
                    (cl-remove-if-not
@@ -1693,6 +2058,25 @@ detection regexp must stitch those rows back together."
       (when (file-directory-p root)
         (delete-directory root t)))))
 
+(ert-deftest test-ai-code-session-link--position-owner-removes-existing-preview ()
+  "A rejected preview position should not retain an existing overlay."
+  (with-temp-buffer
+    (setq-local ai-code-backends-infra--session-terminal-backend 'ghostel)
+    (insert "/tmp/input.png")
+    (let ((preview (make-overlay (point-min) (point-max)))
+          (suffix (make-overlay (point-max) (point-max))))
+      (overlay-put preview 'ai-code-session-image-preview t)
+      (overlay-put preview 'ai-code-session-image-preview-suffix-overlay
+                   suffix)
+      (setq-local ai-code-session-link-image-preview-position-function
+                  (lambda (_start _end) nil))
+      (cl-letf (((symbol-function 'display-images-p)
+                 (lambda (&optional _display) t)))
+        (ai-code-session-link--apply-image-preview-for-file
+         (point-min) (point-max) "/tmp/input.png" "/tmp/input.png"))
+      (should-not (overlay-buffer preview))
+      (should-not (overlay-buffer suffix)))))
+
 (ert-deftest test-ai-code-session-link--linkify-strict-image-preview-region-refresh ()
   "Repeated scans preserve unchanged previews and refresh changed files."
   (let* ((root (make-temp-file "ai-code-session-image-rescan-" t))
@@ -1723,13 +2107,13 @@ detection regexp must stitch those rows back together."
                 (should preview)
                 (ai-code-session-link--linkify-strict-image-preview-region
                  (point-min) (point-max))
-                (should (= create-count 1))
+                (should (= create-count 2))
                 (should (eq (overlay-buffer preview) (current-buffer)))
                 (with-temp-file image-file
                   (insert "updated image bytes with a different size"))
                 (ai-code-session-link--linkify-strict-image-preview-region
                  (point-min) (point-max))
-                (should (= create-count 2))
+                (should (= create-count 4))
                 (should-not (overlay-buffer preview))
                 (should
                  (cl-find-if
@@ -1785,6 +2169,104 @@ detection regexp must stitch those rows back together."
       (when (file-directory-p root)
         (delete-directory root t)))))
 
+(ert-deftest test-ai-code-session-link--linkify-strict-image-preview-region-file-url-wrap-before-slash ()
+  "Strict scanning should join a file URL wrapped before a path slash."
+  (let* ((root (make-temp-file
+                "ai-code-session-image-preview-wrap-before-slash-" t))
+         (dir (expand-file-name "com.openai.sky.CUAService" root))
+         (image-file (expand-file-name
+                      "Emacs Screenshot 2026-07-14 at 00.38.35.jpeg"
+                      dir))
+         (encoded-file
+          (replace-regexp-in-string " " "%20" image-file t t))
+         (split-index
+          (1- (- (length encoded-file)
+                 (length (file-name-nondirectory encoded-file)))))
+         continuation-start)
+    (unwind-protect
+        (progn
+          (make-directory dir t)
+          (with-temp-file image-file
+            (insert "fake image bytes"))
+          (cl-letf (((symbol-function 'display-images-p)
+                     (lambda (&optional _display) t))
+                    ((symbol-function 'create-image)
+                     (lambda (data &rest args)
+                       (list :image data :args args))))
+            (with-temp-buffer
+              (setq-local ai-code-backends-infra--session-directory root)
+              (setq-local ai-code-backends-infra--session-terminal-backend
+                          'ghostel)
+              (insert "{\"screenshot\": {\"url\": \"file://")
+              (insert (substring encoded-file 0 split-index))
+              (insert "\n")
+              (setq continuation-start (point))
+              (insert (substring encoded-file split-index))
+              (insert "\"}}\n")
+              (setq buffer-read-only t)
+              (ai-code-session-link--linkify-strict-image-preview-region
+               continuation-start (point-max))
+              (let ((preview-overlays
+                     (cl-remove-if-not
+                      (lambda (overlay)
+                        (overlay-get overlay 'ai-code-session-image-preview))
+                      (overlays-in (point-min) (point-max)))))
+                (should (= (length preview-overlays) 1))
+                (should (equal (get-text-property
+                                continuation-start
+                                'ai-code-session-link)
+                               (concat "file://" encoded-file)))
+                (should (equal (overlay-get (car preview-overlays)
+                                            'ai-code-session-image-file)
+                               image-file))))))
+      (when (file-directory-p root)
+        (delete-directory root t)))))
+
+(ert-deftest test-ai-code-session-link--strict-image-candidates-absolute-candidate-precedence ()
+  "A standalone absolute image path should precede a joined candidate."
+  (with-temp-buffer
+    (insert "file:///tmp/wrapped-prefix\n")
+    (let ((start (point))
+          (link-text "/tmp/standalone.png"))
+      (insert link-text)
+      (should
+       (equal
+        (mapcar
+         (lambda (candidate)
+           (plist-get candidate :link-text))
+         (ai-code-session-link--strict-image-candidates
+          start (point) link-text))
+        '("/tmp/standalone.png"
+          "file:///tmp/wrapped-prefix/tmp/standalone.png"))))))
+
+(ert-deftest test-ai-code-session-link--strict-image-candidates-path-after-unicode-punctuation ()
+  "A strong image path after Unicode prose punctuation should stand alone."
+  (with-temp-buffer
+    (let ((path "/tmp/screenshot.png"))
+      (insert "结果见 report.org:42，")
+      (let ((path-start (point)))
+        (insert path "。")
+        (goto-char (point-min))
+        (re-search-forward "\\.png")
+        (let* ((bounds
+                (ai-code-session-link--strict-image-candidate-bounds
+                 (match-beginning 0) (match-end 0)))
+               (link-text
+                (buffer-substring-no-properties (car bounds) (cdr bounds)))
+               (candidates
+                (ai-code-session-link--strict-image-candidates
+                 (car bounds) (cdr bounds) link-text)))
+          (should (= (plist-get (car candidates) :start) path-start))
+          (should (equal (plist-get (car candidates) :link-text) path)))))))
+
+(ert-deftest test-ai-code-session-link--strict-image-candidates-keeps-punctuation-in-path ()
+  "A path that starts strongly should retain punctuation in its directories."
+  (with-temp-buffer
+    (let ((path "/tmp/a，/screenshot.png"))
+      (insert path)
+      (should-not
+       (ai-code-session-link--strict-image-path-suffix-info path)))))
+
 (ert-deftest ai-code-session-link-test-ghostel-image-preview-file-url-wrap ()
   "Ghostel image previews should handle terminal-wrapped file:// URLs."
   (let* ((root (make-temp-file "ai-code-session-image-preview-url-" t))
@@ -1828,6 +2310,13 @@ detection regexp must stitch those rows back together."
                                image-file))))))
       (when (file-directory-p root)
         (delete-directory root t)))))
+
+(ert-deftest test-ai-code-session-link--file-url-image-regexp-rejects-incomplete-path-promptly ()
+  "An incomplete file URL must not trigger exponential regexp backtracking."
+  (should-not
+   (string-match-p
+    ai-code-session-link--file-url-image-regexp
+    (concat "file:" (make-string 64 ?a)))))
 
 (ert-deftest ai-code-session-link-test-ghostel-image-preview-strict-visible-wrap-bare-path ()
   "Strict visible scanning should rejoin a wrapped BARE absolute path.
@@ -1942,7 +2431,7 @@ Bare wrapped paths -- as printed by tools such as Claude, which omit the
         (delete-directory root t)))))
 
 (ert-deftest ai-code-session-link-test-image-preview-max-dimensions ()
-  "Preview caps: integer customs are hard caps; nil height is uncapped."
+  "Preview caps apply when no window is available for fitting."
   ;; An explicit integer custom is used verbatim, regardless of any window.
   (let ((ai-code-session-link-ghostel-image-preview-max-width 400)
         (ai-code-session-link-ghostel-image-preview-max-height 300))
@@ -1950,13 +2439,133 @@ Bare wrapped paths -- as printed by tools such as Claude, which omit the
       (should (equal (ai-code-session-link--image-preview-max-dimensions "")
                      '(400 . 300)))))
   ;; With nil customs and no window showing the buffer, only the fixed width
-  ;; fallback applies.  Height remains uncapped so screenshots can fill width.
+  ;; fallback applies.  Height remains uncapped because there is no visible
+  ;; window to fit.
   (let ((ai-code-session-link-ghostel-image-preview-max-width nil)
         (ai-code-session-link-ghostel-image-preview-max-height nil))
     (with-temp-buffer
       (should (equal (ai-code-session-link--image-preview-max-dimensions "  ")
                      (cons ai-code-session-link--image-preview-fallback-max-width
                            nil))))))
+
+(ert-deftest test-ai-code-session-link--image-preview-uses-frame-backing-scale ()
+  "Preview rasterization requests backing pixels before logical scaling."
+  (let (captured-properties create-count)
+    (cl-letf (((symbol-function 'ai-code-session-link--image-preview-data)
+               (lambda (_file) "png data"))
+              ((symbol-function 'ai-code-session-link--image-preview-format-hint)
+               (lambda (_file) 'image/png))
+              ((symbol-function 'image-type)
+               (lambda (&rest _args) 'png))
+              ((symbol-function 'frame-scale-factor)
+               (lambda (&optional _frame) 2.0))
+              ((symbol-function 'create-image)
+               (lambda (_data _type _data-p &rest properties)
+                 (setq create-count (1+ (or create-count 0)))
+                 (push properties captured-properties)
+                 (if (= create-count 1) 'source-image 'preview-image)))
+              ((symbol-function 'image-size)
+               (lambda (image &optional _pixels _frame)
+                 (should (eq image 'source-image))
+                 '(1984 . 436)))
+              ((symbol-function 'image-flush) #'ignore))
+      (should
+       (eq (ai-code-session-link--create-image-preview
+            "retina.png" 869 nil 0)
+           'preview-image))
+      (setq captured-properties (nreverse captured-properties))
+      (should (= (length captured-properties) 2))
+      (should (= (plist-get (car captured-properties) :scale) 1.0))
+      (let ((display-properties (cadr captured-properties)))
+        (should (= (plist-get display-properties :width) 1738))
+        (should (= (plist-get display-properties :height) 382))
+        (should (= (plist-get display-properties :scale) 0.5))
+        (should-not (plist-member display-properties :max-width))))))
+
+(ert-deftest test-ai-code-session-link--image-preview-refreshes-for-frame-scale ()
+  "A preview created at 1x should be rebuilt after moving to a 2x frame."
+  (let* ((root (make-temp-file "ai-code-session-image-frame-scale-" t))
+         (image-file (expand-file-name "retina.png" root))
+         (frame-scale 1.0)
+         (create-count 0))
+    (unwind-protect
+        (progn
+          (with-temp-file image-file
+            (insert "png data"))
+          (cl-letf (((symbol-function 'display-images-p)
+                     (lambda (&optional _display) t))
+                    ((symbol-function 'frame-scale-factor)
+                     (lambda (&optional _frame) frame-scale))
+                    ((symbol-function 'create-image)
+                     (lambda (_data _type _data-p &rest properties)
+                       (setq create-count (1+ create-count))
+                       (if (cl-oddp create-count)
+                           'source-image
+                         (cons 'image properties))))
+                    ((symbol-function 'image-size)
+                     (lambda (image &optional _pixels _frame)
+                       (should (eq image 'source-image))
+                       '(1984 . 436)))
+                    ((symbol-function 'image-flush) #'ignore))
+            (with-temp-buffer
+              (setq-local ai-code-backends-infra--session-directory root)
+              (setq-local ai-code-backends-infra--session-terminal-backend
+                          'ghostel)
+              (insert "Viewed retina.png\n")
+              (ai-code-session-link--linkify-session-region
+               (point-min) (point-max))
+              (let ((preview
+                     (cl-find-if
+                      (lambda (overlay)
+                        (overlay-get overlay 'ai-code-session-image-preview))
+                      (overlays-in (point-min) (point-max)))))
+                (should preview)
+                (should (= create-count 2))
+                (should (= (plist-get (cdr (overlay-get preview 'display))
+                                      :scale)
+                           1.0))
+                (setq frame-scale 2.0)
+                (ai-code-session-link--linkify-session-region
+                 (point-min) (point-max))
+                (let ((retina-preview
+                       (cl-find-if
+                        (lambda (overlay)
+                          (overlay-get overlay
+                                       'ai-code-session-image-preview))
+                        (overlays-in (point-min) (point-max)))))
+                  (should retina-preview)
+                  (should-not (eq retina-preview preview))
+                  (should (= create-count 4))
+                  (should (= (plist-get
+                              (cdr (overlay-get retina-preview 'display))
+                              :scale)
+                             0.5)))))))
+      (when (file-directory-p root)
+        (delete-directory root t)))))
+
+(ert-deftest test-ai-code-session-link--image-preview-allows-tall-visible-window ()
+  "A Ghostel preview remains tall unless the user supplies a height cap."
+  (save-window-excursion
+    (with-temp-buffer
+      (let ((window (selected-window))
+            (ai-code-session-link-ghostel-image-preview-max-height nil))
+        (set-window-buffer window (current-buffer))
+        (cl-letf (((symbol-function 'window-body-width)
+                   (lambda (&rest _args) 800))
+                  ((symbol-function 'frame-char-width)
+                   (lambda (&rest _args) 10)))
+          ;; Tall real display lines are necessary for fractional scrolling.
+          (should-not (cdr (ai-code-session-link--image-preview-max-dimensions
+                            "")))
+          ;; A user cap remains an explicit hard bound.
+          (let ((ai-code-session-link-ghostel-image-preview-max-height 1000))
+            (should (= (cdr (ai-code-session-link--image-preview-max-dimensions
+                             ""))
+                       1000)))
+          (let ((ai-code-session-link-ghostel-image-preview-max-height 200))
+            (should (= (cdr (ai-code-session-link--image-preview-max-dimensions
+                             ""))
+                       200))))))))
 
 (ert-deftest ai-code-session-link-test-ghostel-image-preview-common-reference-forms ()
   "Ghostel image previews should handle common local image reference forms."

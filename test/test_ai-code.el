@@ -425,7 +425,7 @@
   (with-temp-buffer
     (insert-file-contents (expand-file-name "ai-code.el" default-directory))
     (should (re-search-forward
-             "Package-Requires: ((emacs \"29\\.1\") (transient \"0\\.9\\.0\") (magit \"2\\.1\\.0\"))"
+             "Package-Requires: ((emacs \"29\\.1\") (transient \"0\\.9\\.0\") (magit \"2\\.1\\.0\") (ultra-scroll \"0\\.6\\.2\"))"
              nil t))))
 
 (ert-deftest ai-code-test-package-summary-fits-package-lint-limit ()

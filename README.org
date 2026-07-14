@@ -124,7 +124,11 @@ Enable installation of packages from MELPA by adding an entry to package-archive
   - Ghostel is an Emacs terminal emulator powered by libghostty-vt, the VT engine from Ghostty.
   - AI Code enables Ghostel image support for AI sessions:
     - terminal programs can use Ghostel's Kitty graphics protocol;
-    - local image paths printed by an AI CLI (for example =screenshot.png=) are previewed inline in the session buffer.
+    - local image paths printed by an AI CLI (for example =screenshot.png=) are previewed inline in the session buffer while the source path remains visible and clickable.
+    - the required =ultra-scroll= package dependency preserves partial-pixel
+      scrolling for a tall local preview; it is dispatched only while that
+      preview is visible, not as a global scrolling mode.  Set
+      =ai-code-ghostel-image-preview-prefer-ultra-scroll= to =nil= to opt out.
   - [[https://github.com/dakra/ghostel][ghostel]] is under active development, please install the latest version.
   - To try it:
 
@@ -555,9 +559,9 @@ To transfer development work between different AI coding backends (e.g., from Co
   ;; Inline preview for image paths printed by the AI CLI.
   (setq ai-code-session-link-ghostel-image-preview-enabled t)
   (setq ai-code-session-link-ghostel-image-preview-max-bytes (* 10 1024 1024))
-  ;; Display caps in pixels. nil (default) fits the session window and only
-  ;; scales large images down -- small images keep their native size. Set an
-  ;; integer for a fixed hard cap instead.
+  ;; Display caps in logical pixels. nil (default) fits the session window.
+  ;; AI Code requests the matching backing-pixel raster on HiDPI/Retina frames
+  ;; and never enlarges the source. Set an integer for a fixed hard cap.
   (setq ai-code-session-link-ghostel-image-preview-max-width nil)
   (setq ai-code-session-link-ghostel-image-preview-max-height nil)
 #+end_src

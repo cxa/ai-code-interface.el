@@ -20,6 +20,8 @@
 (defvar ghostel-kitty-graphics-mediums)
 (defvar ghostel-inhibit-redraw-functions)
 (defvar ai-code-session-link-inhibit-functions)
+(defvar ai-code-session-link-image-preview-source-function)
+(defvar ai-code-session-link-image-preview-transaction-function)
 (defvar ai-code-backends-infra--session-directory)
 (defvar ghostel--fake-cursor-overlay)
 (defvar ghostel--cursor-char-pos)
@@ -27,6 +29,9 @@
 (defvar ghostel--plain-link-detection-end)
 (defvar ghostel-link-map)
 (defvar x-preedit-overlay)
+
+(declare-function ai-code-ghostel-image-preview--cached-source
+                  "ai-code-ghostel-image-preview" (link-text))
 
 (ert-deftest test-ai-code-backends-infra-ghostel-create-session-restores-ai-state ()
   "Ghostel session creation should restore AI Code local state after mode reset."
@@ -86,7 +91,11 @@
     (should (eq ghostel-progress-function
                 #'ai-code-backends-infra-ghostel--progress))
     (should (eq ai-code-backends-infra-ghostel--progress-function
-                #'ignore))))
+                #'ignore))
+    (should (bound-and-true-p ai-code-ghostel-image-preview-mode))
+    (should
+     (eq ai-code-session-link-image-preview-transaction-function
+         #'ai-code-ghostel-image-preview--call-transaction))))
 
 (ert-deftest test-ai-code-backends-infra-ghostel-configures-ime-redraw-inhibition ()
   "Ghostel AI session configuration should enable IME redraw inhibition."
@@ -293,73 +302,6 @@
         (should (equal restored-before-scan
                        "fileref:/tmp/src/foo.el:1"))))))
 
-(ert-deftest test-ai-code-backends-infra-ghostel-working-redraw-keeps-cached-links ()
-  "Working animation redraws should not refresh already detected links."
-  (let ((link-keymap (make-sparse-keymap))
-        linkify-called)
-    (with-temp-buffer
-      (setq-local ai-code-backends-infra--session-terminal-backend 'ghostel)
-      (insert "Working (42s)\nOpen src/foo.el:1\n")
-      (let (link-start link-end)
-        (goto-char (point-min))
-        (search-forward "src/foo.el:1")
-        (setq link-start (match-beginning 0)
-              link-end (match-end 0))
-        (add-text-properties
-         link-start link-end
-         (list 'ai-code-session-link "src/foo.el:1"
-               'ai-code-session-hover-link t
-               'help-echo "mouse-1: Visit file"
-               'mouse-face 'highlight
-               'keymap link-keymap
-               'follow-link t
-               'font-lock-face 'link
-               'face 'link))
-        (ai-code-backends-infra-ghostel--cache-preserved-link-spans
-         (point-min) (point-max))
-        (remove-text-properties
-         link-start link-end
-         '(ai-code-session-link nil
-           ai-code-session-hover-link nil
-           help-echo nil
-           mouse-face nil
-           keymap nil
-           follow-link nil
-           font-lock-face nil
-           face nil))
-        (goto-char (point-min))
-        (search-forward "42s")
-        (replace-match "43s")
-        (cl-letf (((symbol-function
-                    'ai-code-session-link--linkify-session-region)
-                   (lambda (&rest _args)
-                     (setq linkify-called t))))
-          (ai-code-backends-infra-ghostel--linkify-image-preview-region
-           (current-buffer)
-           (point-min)
-           (point-max)))
-        (should-not linkify-called)
-        (should (equal (get-text-property link-start 'ai-code-session-link)
-                       "src/foo.el:1"))
-        (should (equal (get-text-property link-start 'help-echo)
-                       "mouse-1: Visit file"))))))
-
-(ert-deftest test-ai-code-backends-infra-ghostel-unlinked-candidate-still-linkifies ()
-  "Ghostel redraw linkification should still run for new unlinked paths."
-  (let (linkify-called)
-    (with-temp-buffer
-      (setq-local ai-code-backends-infra--session-terminal-backend 'ghostel)
-      (insert "Working (42s)\nOpen src/new.el:1\n")
-      (cl-letf (((symbol-function
-                  'ai-code-session-link--linkify-session-region)
-                 (lambda (&rest _args)
-                   (setq linkify-called t))))
-        (ai-code-backends-infra-ghostel--linkify-image-preview-region
-         (current-buffer)
-         (point-min)
-         (point-max)))
-      (should linkify-called))))
-
 (ert-deftest test-ai-code-backends-infra-ghostel-records-recent-input-in-ai-session ()
   "Recent input tracking should only mark AI Code Ghostel sessions."
   (cl-letf (((symbol-function 'float-time)
@@ -423,110 +365,6 @@
          (ai-code-backends-infra-ghostel--redraw-inhibited-p
           (current-buffer)))))))
 
-(ert-deftest test-ai-code-backends-infra-ghostel-configures-visible-image-hook ()
-  "Ghostel AI session configuration should install visible image recovery."
-  (with-temp-buffer
-    (setq-local ai-code-backends-infra--session-terminal-backend 'ghostel)
-    (cl-letf
-        (((symbol-function 'ghostel--window-anchored-p)
-          (lambda (&rest _args) t))
-         ((symbol-function 'ai-code-backends-infra--configure-session-input-shortcuts)
-          (lambda () nil))
-         ((symbol-function 'ai-code-backends-infra--install-navigation-cursor-sync)
-          (lambda () nil)))
-      (ai-code-backends-infra--configure-ghostel-buffer)
-      (should
-       (advice-member-p
-        #'ai-code-backends-infra-ghostel--window-anchored-p-around
-        'ghostel--window-anchored-p))
-      (should
-       (advice-member-p
-        #'ai-code-backends-infra-ghostel--linkify-session-region-around
-        'ai-code-session-link--linkify-session-region)))
-    (should (memq #'ai-code-backends-infra-ghostel--window-scroll
-                  window-scroll-functions))))
-
-(ert-deftest test-ai-code-backends-infra-ghostel--window-anchored-p-around-image-overflow ()
-  "An overflowing image should prevent Ghostel redraw re-anchoring."
-  (save-window-excursion
-    (with-temp-buffer
-      (let ((window (selected-window))
-            (buffer (current-buffer)))
-        (set-window-buffer window buffer)
-        (setq-local ai-code-backends-infra--session-terminal-backend 'ghostel)
-        (insert "Saved screenshot.png\ninput\n")
-        (let ((preview (make-overlay 7 21 buffer))
-              (measured-height 500)
-              (pixel-vscroll 0)
-              (original-result t)
-              (pixel-calls 0)
-              (original-calls 0))
-          (overlay-put preview 'ai-code-session-image-preview t)
-          (overlay-put preview 'after-string "\n[large image]\n")
-          (set-window-start window (point-min) t)
-          (cl-letf (((symbol-function 'window-body-height)
-                     (lambda (target-window &optional pixelwise)
-                       (should (eq target-window window))
-                       (should pixelwise)
-                       300))
-                    ((symbol-function 'default-line-height)
-                     (lambda () 20))
-                    ((symbol-function 'window-vscroll)
-                     (lambda (target-window &optional pixelwise)
-                       (should (eq target-window window))
-                       (should pixelwise)
-                       pixel-vscroll))
-                    ((symbol-function 'window-text-pixel-size)
-                     (lambda (target-window from to &rest _args)
-                       (setq pixel-calls (1+ pixel-calls))
-                       (should (eq target-window window))
-                       (should (= from (window-start window)))
-                       (should (= to (point-max)))
-                       (cons 100 measured-height)))
-                    ((symbol-function 'original-window-anchored-p)
-                     (lambda (&rest _args)
-                       (setq original-calls (1+ original-calls))
-                       original-result)))
-            ;; Text rows fit, but image pixels overflow the body plus
-            ;; Ghostel's one-line partial-row tolerance.
-            (should-not
-             (ai-code-backends-infra-ghostel--window-anchored-p-around
-              #'original-window-anchored-p window))
-            ;; The same display is anchored once its measured height fits.
-            (setq measured-height 320)
-            (should
-             (ai-code-backends-infra-ghostel--window-anchored-p-around
-              #'original-window-anchored-p window))
-            ;; Pixel vscroll represents preview content already clipped above
-            ;; the window start after Ghostel bottom-aligns a tall preview.
-            (setq measured-height 330
-                  pixel-vscroll 10)
-            (should
-             (ai-code-backends-infra-ghostel--window-anchored-p-around
-              #'original-window-anchored-p window))
-            ;; A malformed measurement safely preserves Ghostel's result.
-            (setq measured-height 'invalid)
-            (should
-             (ai-code-backends-infra-ghostel--window-anchored-p-around
-              #'original-window-anchored-p window))
-            (should (= pixel-calls 4))
-            ;; Without an AI image preview, preserve Ghostel's result.
-            (delete-overlay preview)
-            (setq measured-height 500)
-            (should
-             (ai-code-backends-infra-ghostel--window-anchored-p-around
-              #'original-window-anchored-p window))
-            (should (= pixel-calls 4))
-            ;; A window Ghostel already considers unanchored needs no
-            ;; display geometry measurement.
-            (move-overlay preview 7 21 buffer)
-            (setq original-result nil)
-            (should-not
-             (ai-code-backends-infra-ghostel--window-anchored-p-around
-              #'original-window-anchored-p window))
-            (should (= pixel-calls 4))
-            (should (= original-calls 6))))))))
-
 (ert-deftest test-ai-code-backends-infra-ghostel-configures-image-mediums ()
   "Ghostel AI session configuration should enable local image mediums."
   (with-temp-buffer
@@ -573,479 +411,6 @@
         (if original-bound
             (setq ghostel-kitty-graphics-mediums original-value)
           (makunbound 'ghostel-kitty-graphics-mediums))))))
-
-(ert-deftest test-ai-code-backends-infra-ghostel-visible-linkify-restores-image-preview ()
-  "Visible Ghostel image linkification should restore inline image previews."
-  (let* ((root (make-temp-file "ai-code-ghostel-history-image-" t))
-         (image-file (expand-file-name "history.png" root)))
-    (unwind-protect
-        (progn
-          (with-temp-file image-file
-            (insert "fake image bytes"))
-          (cl-letf (((symbol-function 'display-images-p)
-                     (lambda (&optional _display) t))
-                    ((symbol-function 'create-image)
-                     (lambda (file &rest args)
-                       (list :image file :args args))))
-            (with-temp-buffer
-              (setq-local ai-code-backends-infra--session-directory root)
-              (setq-local ai-code-backends-infra--session-terminal-backend
-                          'ghostel)
-              (insert "Restored history\n")
-              (insert "history.png\n")
-              (ai-code-session-link--linkify-strict-image-preview-region
-               (point-min) (point-max))
-              (should
-               (= (length
-                   (cl-remove-if-not
-                    (lambda (overlay)
-                      (overlay-get overlay 'ai-code-session-image-preview))
-                    (overlays-in (point-min) (point-max))))
-                  1)))))
-      (when (file-directory-p root)
-        (delete-directory root t)))))
-
-(ert-deftest test-ai-code-backends-infra-ghostel--visible-linkify-keeps-input-at-bottom ()
-  "Adding a preview to a following window should keep its input visible."
-  (save-window-excursion
-    (with-temp-buffer
-      (let ((window (selected-window))
-            (anchor-count 0)
-            (following t)
-            input-visible)
-        (set-window-buffer window (current-buffer))
-        (setq-local ai-code-backends-infra--session-terminal-backend 'ghostel)
-        (insert "Saved screenshot.png\ninput\n")
-        (cl-letf
-            (((symbol-function
-               'ai-code-backends-infra-ghostel--redraw-inhibited-p)
-              (lambda (_buffer) nil))
-             ((symbol-function
-               'ai-code-backends-infra-ghostel--visible-image-region)
-              (lambda (_window) (cons (point-min) (point-max))))
-             ((symbol-function
-               'ai-code-backends-infra-ghostel--linkify-session-region)
-              (lambda (&rest _args) nil))
-             ((symbol-function
-               'ai-code-backends-infra-ghostel--cache-preserved-link-spans)
-              (lambda (&rest _args) nil))
-             ((symbol-function
-               'ai-code-backends-infra-ghostel--trusted-local-session-p)
-              (lambda () t))
-             ((symbol-function 'ghostel--window-anchored-p)
-              (lambda (target-window &optional _body-height)
-                (should (eq target-window window))
-                following))
-             ((symbol-function 'ghostel--anchor-window)
-              (lambda (&optional target-window _force)
-                (should (eq target-window window))
-                (setq anchor-count (1+ anchor-count)
-                      input-visible t)))
-             ((symbol-function
-               'ai-code-session-link--linkify-strict-image-preview-region)
-              (lambda (start end)
-                (unless
-                    (cl-some
-                     (lambda (overlay)
-                       (overlay-get overlay 'ai-code-session-image-preview))
-                     (overlays-in start end))
-                  (let ((preview (make-overlay start end)))
-                    (overlay-put preview 'ai-code-session-image-preview t))))))
-          (ai-code-backends-infra-ghostel--linkify-visible-image-previews
-           (current-buffer) window)
-          (should input-visible)
-          (should (= anchor-count 1))
-          ;; An unchanged rescan must not introduce another anchor jump.
-          (setq input-visible nil)
-          (ai-code-backends-infra-ghostel--linkify-visible-image-previews
-           (current-buffer) window)
-          (should-not input-visible)
-          (should (= anchor-count 1))
-          ;; Adding a preview while reading scrollback must not steal focus.
-          (dolist (overlay (overlays-in (point-min) (point-max)))
-            (when (overlay-get overlay 'ai-code-session-image-preview)
-              (delete-overlay overlay)))
-          (setq following nil)
-          (ai-code-backends-infra-ghostel--linkify-visible-image-previews
-           (current-buffer) window)
-          (should-not input-visible)
-          (should (= anchor-count 1))
-          ;; The generic delayed linkifier used by the process filter must
-          ;; preserve the same follow transition.
-          (dolist (overlay (overlays-in (point-min) (point-max)))
-            (when (overlay-get overlay 'ai-code-session-image-preview)
-              (delete-overlay overlay)))
-          (setq following t)
-          (ai-code-backends-infra-ghostel--linkify-session-region-around
-           (lambda (start end)
-             (ai-code-session-link--linkify-strict-image-preview-region
-              start end))
-           (point-min)
-           (point-max))
-          (should input-visible)
-          (should (= anchor-count 2)))))))
-
-(ert-deftest test-ai-code-backends-infra-ghostel--apply-image-preview-for-file-around-live-input-row ()
-  "Ghostel should keep image paths in its live input row text-only."
-  (with-temp-buffer
-    (setq-local ai-code-backends-infra--session-terminal-backend 'ghostel)
-    (let ((history-start (point)))
-      (insert "/tmp/history.png\n")
-      (let ((input-start (point)))
-        (insert "/tmp/input.png")
-        (setq-local ghostel--cursor-char-pos (point-max))
-        (let ((below-start (progn
-                             (insert "\n")
-                             (point))))
-          (insert "/tmp/below.png")
-          (let (calls input-preview)
-            (ai-code-backends-infra-ghostel--apply-image-preview-for-file-around
-             (lambda (start &rest _args)
-               (push start calls))
-             history-start (1- input-start) "/tmp/history.png"
-             "/tmp/history.png")
-            (setq input-preview
-                  (make-overlay input-start (1- below-start)))
-            (overlay-put input-preview 'ai-code-session-image-preview t)
-            (overlay-put input-preview 'after-string "[preview]")
-            (ai-code-backends-infra-ghostel--apply-image-preview-for-file-around
-             (lambda (start &rest _args)
-               (push start calls))
-             input-start (1- below-start) "/tmp/input.png" "/tmp/input.png")
-            (ai-code-backends-infra-ghostel--apply-image-preview-for-file-around
-             (lambda (start &rest _args)
-               (push start calls))
-             below-start (point-max) "/tmp/below.png" "/tmp/below.png")
-            (should (equal calls (list below-start history-start)))
-            (should-not (overlay-buffer input-preview))))))))
-
-(ert-deftest test-ai-code-backends-infra-ghostel-schedules-visible-linkify ()
-  "Visible image linkification should schedule bounded window scans."
-  (let (scheduled)
-    (with-temp-buffer
-      (set-window-buffer (selected-window) (current-buffer))
-      (setq-local ai-code-backends-infra--session-terminal-backend 'ghostel)
-      (let ((ai-code-backends-infra-ghostel-visible-image-linkify-delays
-             '(0.1 0.5)))
-        (cl-letf (((symbol-function 'run-at-time)
-                   (lambda (delay _repeat function &rest args)
-                     (push (list delay function args) scheduled)
-                     'mock-timer)))
-          (ai-code-backends-infra-ghostel-schedule-visible-image-linkify
-           (selected-window))
-          (should (equal (mapcar #'car (reverse scheduled))
-                          '(0.1 0.5))))))))
-
-(ert-deftest test-ai-code-backends-infra-ghostel-schedules-visible-linkify-remotely ()
-  "Visible linkification should still refresh URL links for remote sessions."
-  (let (scheduled)
-    (with-temp-buffer
-      (set-window-buffer (selected-window) (current-buffer))
-      (setq-local default-directory "/ssh:example:/repo/")
-      (setq-local ai-code-backends-infra--session-directory default-directory)
-      (setq-local ai-code-backends-infra--session-terminal-backend 'ghostel)
-      (let ((ai-code-backends-infra-ghostel-visible-image-linkify-delays
-             '(0.1)))
-        (cl-letf (((symbol-function 'run-at-time)
-                   (lambda (delay _repeat function &rest args)
-                     (push (list delay function args) scheduled)
-                     'mock-timer)))
-          (ai-code-backends-infra-ghostel-schedule-visible-image-linkify
-           (selected-window))
-          (should (= (length scheduled) 1))
-          (should (equal (caar scheduled) 0.1)))))))
-
-(ert-deftest test-ai-code-backends-infra-ghostel-visible-linkify-retries-during-preedit ()
-  "Visible linkification should retry instead of touching text during preedit."
-  (let (rescheduled linkified)
-    (with-temp-buffer
-      (set-window-buffer (selected-window) (current-buffer))
-      (setq-local ai-code-backends-infra--session-terminal-backend 'ghostel)
-      (insert "src/File.el:1\n")
-      (goto-char (point-max))
-      (let ((overlay (make-overlay (point) (point) (current-buffer))))
-        (unwind-protect
-            (progn
-              (overlay-put overlay 'after-string "zhong")
-              (cl-letf (((symbol-function
-                          'ai-code-backends-infra-ghostel-schedule-visible-image-linkify)
-                         (lambda (window delays)
-                           (setq rescheduled (list window delays))))
-                        ((symbol-function
-                          'ai-code-session-link--linkify-session-region)
-                         (lambda (&rest _args)
-                           (setq linkified t))))
-                (ai-code-backends-infra-ghostel--linkify-visible-image-previews
-                 (current-buffer)
-                 (selected-window)))
-              (should
-               (equal rescheduled
-                      (list
-                       (selected-window)
-                       (list
-                        ai-code-session-link--linkify-inhibited-retry-delay))))
-              (should-not linkified))
-          (delete-overlay overlay))))))
-
-(ert-deftest test-ai-code-backends-infra-ghostel-visible-linkify-retries-during-recent-input ()
-  "Visible linkification should retry while recent input protects redraws."
-  (let (rescheduled linkified)
-    (with-temp-buffer
-      (set-window-buffer (selected-window) (current-buffer))
-      (setq-local ai-code-backends-infra--session-terminal-backend 'ghostel)
-      (setq-local ai-code-backends-infra-ghostel--last-input-activity-time
-                  9.5)
-      (insert "src/File.el:1\n")
-      (goto-char (point-max))
-      (let ((ai-code-backends-infra-ghostel-inhibit-redraw-after-input t)
-            (ai-code-backends-infra-ghostel-input-redraw-inhibit-delay 0.8))
-        (cl-letf (((symbol-function 'float-time)
-                   (lambda (&optional _time) 10.0))
-                  ((symbol-function
-                    'ai-code-backends-infra-ghostel-schedule-visible-image-linkify)
-                   (lambda (window delays)
-                     (setq rescheduled (list window delays))))
-                  ((symbol-function
-                    'ai-code-session-link--linkify-session-region)
-                   (lambda (&rest _args)
-                     (setq linkified t))))
-          (ai-code-backends-infra-ghostel--linkify-visible-image-previews
-           (current-buffer)
-           (selected-window))
-          (should
-           (equal rescheduled
-                  (list
-                   (selected-window)
-                   (list
-                    ai-code-session-link--linkify-inhibited-retry-delay))))
-          (should-not linkified))))))
-
-(ert-deftest test-ai-code-backends-infra-ghostel-visible-linkify-wraps-url ()
-  "Visible Ghostel linkification should relinkify wrapped URLs."
-  (with-temp-buffer
-    (set-window-buffer (selected-window) (current-buffer))
-    (setq-local ai-code-backends-infra--session-terminal-backend 'ghostel)
-    (insert "origin\n")
-    (insert "https://example.com/repo/project-int   \n")
-    (insert "erface.el\n")
-    (insert "HEAD\n")
-    (goto-char (point-min))
-    (set-window-start (selected-window) (point-min) t)
-    (ai-code-backends-infra-ghostel--linkify-visible-image-previews
-     (current-buffer)
-     (selected-window))
-    (goto-char (point-min))
-    (search-forward "https://example.com/repo/project-int")
-    (let ((url "https://example.com/repo/project-interface.el"))
-      (should (equal (get-text-property (match-beginning 0)
-                                        'ai-code-session-link)
-                     url))
-      (search-forward "erface.el")
-      (should (equal (get-text-property (match-beginning 0)
-                                        'ai-code-session-link)
-                     url)))))
-
-(ert-deftest test-ai-code-backends-infra-ghostel-visible-linkify-remote-url ()
-  "Visible Ghostel linkification should linkify URLs for remote sessions."
-  (with-temp-buffer
-    (set-window-buffer (selected-window) (current-buffer))
-    (setq-local default-directory "/ssh:example:/repo/")
-    (setq-local ai-code-backends-infra--session-directory default-directory)
-    (setq-local ai-code-backends-infra--session-terminal-backend 'ghostel)
-    (insert "https://example.com/repo/project-int   \n")
-    (insert "erface.el\n")
-    (goto-char (point-min))
-    (set-window-start (selected-window) (point-min) t)
-    (cl-letf (((symbol-function
-                'ai-code-session-link--linkify-strict-image-preview-region)
-               (lambda (&rest _args)
-                 (error "Strict image previews should be skipped remotely"))))
-      (ai-code-backends-infra-ghostel--linkify-visible-image-previews
-       (current-buffer)
-       (selected-window)))
-    (goto-char (point-min))
-    (search-forward "erface.el")
-    (should (equal (get-text-property (match-beginning 0)
-                                      'ai-code-session-link)
-                   "https://example.com/repo/project-interface.el"))))
-
-(ert-deftest test-ai-code-backends-infra-ghostel-region-linkify-remote-url ()
-  "Queued Ghostel region linkification should linkify remote URLs only."
-  (with-temp-buffer
-    (setq-local default-directory "/ssh:example:/repo/")
-    (setq-local ai-code-backends-infra--session-directory default-directory)
-    (setq-local ai-code-backends-infra--session-terminal-backend 'ghostel)
-    (insert "https://example.com/repo/project-int   \n")
-    (insert "erface.el\n")
-    (cl-letf (((symbol-function
-                'ai-code-session-link--linkify-strict-image-preview-region)
-               (lambda (&rest _args)
-                 (error "Strict image previews should be skipped remotely"))))
-      (ai-code-backends-infra-ghostel--linkify-image-preview-region
-       (current-buffer)
-       (point-min)
-       (point-max)))
-    (goto-char (point-min))
-    (search-forward "erface.el")
-    (should (equal (get-text-property (match-beginning 0)
-                                      'ai-code-session-link)
-                   "https://example.com/repo/project-interface.el"))))
-
-(ert-deftest test-ai-code-backends-infra-ghostel-schedules-visible-linkify-per-window ()
-  "Visible image linkification timers should be isolated per window."
-  (let ((buffer (generate-new-buffer " *ai-code-ghostel-window-timers*"))
-        (owners (make-hash-table :test 'eq))
-        cancelled
-        right-window)
-    (unwind-protect
-        (let ((window-min-width 1))
-          (delete-other-windows)
-          (setq right-window (split-window-right))
-          (set-window-buffer (selected-window) buffer)
-          (set-window-buffer right-window buffer)
-          (with-current-buffer buffer
-            (setq-local ai-code-backends-infra--session-terminal-backend
-                        'ghostel)
-            (cl-letf (((symbol-function 'run-at-time)
-                       (lambda (_delay _repeat _function &rest args)
-                         (let ((timer (timer-create)))
-                           (puthash timer (cadr args) owners)
-                           timer)))
-                      ((symbol-function 'cancel-timer)
-                       (lambda (timer)
-                         (push (gethash timer owners) cancelled))))
-              (ai-code-backends-infra-ghostel-schedule-visible-image-linkify
-               (selected-window)
-               '(0.1))
-              (ai-code-backends-infra-ghostel-schedule-visible-image-linkify
-               right-window
-               '(0.2))
-              (ai-code-backends-infra-ghostel-schedule-visible-image-linkify
-               (selected-window)
-               '(0.3))
-              (should (equal cancelled (list (selected-window))))
-              (should (assq (selected-window)
-                            ai-code-backends-infra-ghostel--visible-image-linkify-timers))
-              (should (assq right-window
-                            ai-code-backends-infra-ghostel--visible-image-linkify-timers)))))
-      (when (window-live-p right-window)
-        (delete-window right-window))
-      (when (buffer-live-p buffer)
-        (kill-buffer buffer)))))
-
-(ert-deftest test-ai-code-backends-infra-ghostel-visible-linkify-is-bounded ()
-  "Visible image linkification should not scan the full scrollback."
-  (let (linkified)
-    (with-temp-buffer
-      (set-window-buffer (selected-window) (current-buffer))
-      (setq-local ai-code-backends-infra--session-terminal-backend 'ghostel)
-      (insert (make-string 1000 ?x))
-      (goto-char (point-min))
-      (set-window-start (selected-window) (point-min) t)
-      (let ((ai-code-backends-infra-ghostel-visible-image-linkify-max-chars
-             100))
-        (cl-letf (((symbol-function
-                    'ai-code-session-link--linkify-strict-image-preview-region)
-                   (lambda (start end)
-                     (setq linkified (cons start end)))))
-          (ai-code-backends-infra-ghostel--linkify-visible-image-previews
-           (current-buffer)
-           (selected-window))
-          (should linkified)
-          (should (<= (- (cdr linkified) (car linkified)) 100)))))))
-
-(ert-deftest test-ai-code-backends-infra-ghostel-visible-linkify-retries-same-region ()
-  "Visible image linkification should retry delayed scans for the same text."
-  (let ((scan-count 0))
-    (with-temp-buffer
-      (set-window-buffer (selected-window) (current-buffer))
-      (setq-local ai-code-backends-infra--session-terminal-backend 'ghostel)
-      (insert "history.png\n")
-      (goto-char (point-min))
-      (set-window-start (selected-window) (point-min) t)
-      (cl-letf (((symbol-function
-                  'ai-code-session-link--linkify-strict-image-preview-region)
-                 (lambda (_start _end)
-                   (setq scan-count (1+ scan-count)))))
-        (ai-code-backends-infra-ghostel--linkify-visible-image-previews
-         (current-buffer)
-         (selected-window))
-        (ai-code-backends-infra-ghostel--linkify-visible-image-previews
-         (current-buffer)
-         (selected-window))
-        (should (= scan-count 2))))))
-
-(ert-deftest test-ai-code-backends-infra-ghostel-remote-linkify-skips-file-stats ()
-  "Remote Ghostel image recovery should not inspect remote file paths."
-  (let (path-resolution-called strict-linkify-called)
-    (with-temp-buffer
-      (set-window-buffer (selected-window) (current-buffer))
-      (setq-local ai-code-backends-infra--session-directory
-                  "/ssh:example:/repo/")
-      (setq-local ai-code-backends-infra--session-terminal-backend 'ghostel)
-      (insert "./remote.png\n")
-      (goto-char (point-min))
-      (set-window-start (selected-window) (point-min) t)
-      (cl-letf (((symbol-function
-                  'ai-code-session-link--resolve-existing-local-path)
-                 (lambda (&rest _args)
-                   (setq path-resolution-called t)
-                   nil))
-                ((symbol-function
-                  'ai-code-session-link--linkify-strict-image-preview-region)
-                 (lambda (&rest _args)
-                   (setq strict-linkify-called t)
-                   (ai-code-session-link--resolve-existing-local-path
-                    "remote.png"
-                    "/ssh:example:/repo/"))))
-        (ai-code-backends-infra-ghostel--linkify-visible-image-previews
-         (current-buffer)
-         (selected-window))
-        (ai-code-backends-infra-ghostel--linkify-image-preview-region
-         (current-buffer)
-         (point-min)
-         (point-max))
-        (goto-char (point-min))
-        (search-forward "./remote.png")
-        (should (equal (get-text-property (match-beginning 0)
-                                          'ai-code-session-link)
-                       "./remote.png"))
-        (should-not strict-linkify-called)
-        (should-not path-resolution-called)))))
-
-(ert-deftest test-ai-code-backends-infra-ghostel-redraw-linkify-is-bounded ()
-  "Ghostel redraw linkification should use the queued link-detection region."
-  (let (linkified original-called)
-    (with-temp-buffer
-      (setq-local ai-code-backends-infra--session-terminal-backend 'ghostel)
-      (setq-local ghostel--plain-link-detection-begin 4)
-      (setq-local ghostel--plain-link-detection-end 900)
-      (insert (make-string 1000 ?x))
-      (let ((ai-code-backends-infra-ghostel-visible-image-linkify-max-chars
-             100))
-        (cl-letf (((symbol-function
-                    'ai-code-session-link--linkify-strict-image-preview-region)
-                   (lambda (start end)
-                     (setq linkified (cons start end)))))
-          (ai-code-backends-infra-ghostel--run-queued-link-detection-around
-           (lambda (_buffer)
-             (setq original-called t))
-           (current-buffer))
-          (should original-called)
-          (should linkified)
-          (should (<= (- (cdr linkified) (car linkified)) 100)))))))
-
-(ert-deftest test-ai-code-backends-infra-ghostel-readonly-entry-schedules-visible-linkify ()
-  "Ghostel copy/emacs mode entry should schedule visible image recovery."
-  (let (scheduled)
-    (with-temp-buffer
-      (setq-local ai-code-backends-infra--session-terminal-backend 'ghostel)
-      (cl-letf (((symbol-function
-                  'ai-code-backends-infra-ghostel-schedule-visible-image-linkify-for-buffer)
-                 (lambda (&optional buffer delays)
-                   (setq scheduled (list buffer delays)))))
-        (ai-code-backends-infra-ghostel--after-readonly-command)
-        (should (equal scheduled (list (current-buffer) nil)))))))
 
 (ert-deftest test-ai-code-backends-infra-ghostel-start-process-binds-image-mediums-before-exec ()
   "Ghostel startup should pass image mediums to `ghostel-exec' before init."
@@ -1153,13 +518,203 @@
                 "\e[2K\r\e[2;90mWorking (43s) - esc to interrupt\e[22;39m"))
         (should-not linkified)))))
 
+(ert-deftest test-ai-code-backends-infra-ghostel--render-output-captures-ephemeral-wrapped-image ()
+  "Wrapped images should survive deletion before Ghostel materializes output."
+  (let* ((root (make-temp-file "ai-code-ghostel-ephemeral-image-" t))
+         (dir (expand-file-name "ephemeral-screenshot-service" root))
+         (image-file (expand-file-name
+                      "Emacs Screenshot 2026-07-14 at 00.38.35.jpeg"
+                      dir))
+         (encoded-file
+          (replace-regexp-in-string " " "%20" image-file t t))
+         (split-index
+          (1- (- (length encoded-file)
+                 (length (file-name-nondirectory encoded-file)))))
+         (first-output
+          (concat "{\"screenshot\": {\"url\": \"file://"
+                  (substring encoded-file 0 split-index)
+                  "\n"))
+         (second-output
+          (concat (substring encoded-file split-index) "\"}}\n"))
+         (buffer (generate-new-buffer " *ai-code-ghostel-ephemeral-image*"))
+         scheduled)
+    (unwind-protect
+        (progn
+          (make-directory dir t)
+          (with-temp-file image-file
+            (insert "fake image bytes"))
+          (cl-letf (((symbol-function 'display-images-p)
+                     (lambda (&optional _display) t))
+                    ((symbol-function 'create-image)
+                     (lambda (data &rest args)
+                       (list :image data :args args)))
+                    ((symbol-function
+                      'ai-code-backends-infra--output-meaningful-p)
+                     (lambda (_output) nil))
+                    ((symbol-function 'run-at-time)
+                     (lambda (delay _repeat function &rest args)
+                       (push (list delay function args) scheduled)
+                       'mock-timer)))
+            (save-window-excursion
+              (set-window-buffer (selected-window) buffer)
+              (with-current-buffer buffer
+                (setq-local ai-code-backends-infra--session-directory root)
+                (setq-local ai-code-backends-infra--session-terminal-backend
+                            'ghostel)
+                (setq-local ai-code-ghostel-image-preview-mode t)
+                (setq-local
+                 ai-code-session-link-image-preview-position-function
+                 #'ai-code-ghostel-image-preview--position-allowed-p)
+                (setq-local
+                 ai-code-session-link-image-preview-source-function
+                 #'ai-code-ghostel-image-preview--cached-source)
+                ;; A real Ghostel process filter updates its terminal model;
+                ;; the Emacs buffer remains unchanged until a later redraw.
+                (ai-code-backends-infra-ghostel--render-output
+                 buffer #'ignore 'mock-process first-output)
+                (ai-code-backends-infra-ghostel--render-output
+                 buffer
+                 (lambda (_process _output)
+                   ;; Model a producer cleanup racing with Ghostel's filter.
+                   (delete-file image-file))
+                 'mock-process
+                 second-output)
+                (should (= (point-min) (point-max)))
+                (should-not (file-exists-p image-file))
+                ;; Materialize the terminal model only after the file vanished.
+                (insert first-output second-output)
+                (setq-local ghostel--cursor-char-pos (point-max))
+                (set-window-point (selected-window) (point-max))
+                (let ((retry
+                       (cl-find-if
+                        (lambda (entry)
+                          (eq (nth 1 entry)
+                              #'ai-code-ghostel-image-preview--linkify-visible))
+                        scheduled)))
+                  (should retry)
+                  (apply (nth 1 retry) (nth 2 retry)))
+                (let ((previews
+                       (cl-remove-if-not
+                        (lambda (overlay)
+                          (overlay-get overlay
+                                       'ai-code-session-image-preview))
+                        (overlays-in (point-min) (point-max)))))
+                  (should (= (length previews) 1))
+                  (goto-char (point-min))
+                  (search-forward "/Emacs%20Screenshot")
+                  (should-not
+                   (get-char-property (match-beginning 0) 'display))
+                  (should-not
+                   (get-char-property (match-beginning 0) 'invisible))
+                  (should
+                   (equal
+                    (get-text-property (match-beginning 0)
+                                       'ai-code-session-link)
+                    (concat "file://" encoded-file))))))))
+      (when (file-directory-p root)
+        (delete-directory root t))
+      (when (buffer-live-p buffer)
+        (kill-buffer buffer)))))
+
+(ert-deftest test-ai-code-backends-infra-ghostel--render-output-retries-image-after-cursor-leaves ()
+  "A completed image output line should preview after Ghostel's cursor leaves."
+  (let* ((root (make-temp-file "ai-code-ghostel-cursor-row-image-" t))
+         (image-file (expand-file-name "screenshot.png" root))
+         (output (format "结果见 report.org:42，%s。\n" image-file))
+         (buffer (generate-new-buffer " *ai-code-ghostel-cursor-row-image*"))
+         scheduled)
+    (unwind-protect
+        (progn
+          (with-temp-file image-file
+            (insert "fake image bytes"))
+          (cl-letf (((symbol-function 'display-images-p)
+                     (lambda (&optional _display) t))
+                    ((symbol-function 'create-image)
+                     (lambda (data &rest args)
+                       (list :image data :args args)))
+                    ((symbol-function
+                      'ai-code-backends-infra--output-meaningful-p)
+                     (lambda (_output) nil))
+                    ((symbol-function 'run-at-time)
+                     (lambda (delay _repeat function &rest args)
+                       (push (list delay function args) scheduled)
+                       'mock-timer)))
+            (save-window-excursion
+              (set-window-buffer (selected-window) buffer)
+              (with-current-buffer buffer
+                (setq-local ai-code-backends-infra--session-directory root)
+                (setq-local ai-code-backends-infra--session-terminal-backend
+                            'ghostel)
+                (setq-local ai-code-ghostel-image-preview-mode t)
+                (setq-local
+                 ai-code-session-link-image-preview-position-function
+                 #'ai-code-ghostel-image-preview--position-allowed-p)
+                (ai-code-backends-infra-ghostel--render-output
+                 buffer
+                 (lambda (_process text)
+                   (insert text)
+                   ;; Ghostel can leave its terminal cursor on a completed
+                   ;; output row until the input box is rendered separately.
+                   (setq-local ghostel--cursor-char-pos (1- (point-max))))
+                 'mock-process
+                 output)
+                (let ((generic
+                       (cl-find-if
+                        (lambda (entry)
+                          (not
+                           (eq (nth 1 entry)
+                               #'ai-code-ghostel-image-preview--linkify-visible)))
+                        scheduled)))
+                  (should generic)
+                  (apply (nth 1 generic) (nth 2 generic)))
+                (goto-char (point-min))
+                (search-forward image-file)
+                (should (eq (get-text-property (match-beginning 0) 'face)
+                            'link))
+                (should-not
+                 (cl-find-if
+                  (lambda (overlay)
+                    (overlay-get overlay 'ai-code-session-image-preview))
+                  (overlays-in (point-min) (point-max))))
+                ;; Codex renders its input box later without repeating the
+                ;; image path in that process-output chunk.
+                (goto-char (point-max))
+                (insert "› \n")
+                (setq-local ghostel--cursor-char-pos (1- (point-max)))
+                (goto-char (point-min))
+                (search-forward image-file)
+                (should
+                 (ai-code-ghostel-image-preview--position-allowed-p
+                  (match-beginning 0) (match-end 0)))
+                (set-window-point (selected-window) (point-max))
+                (let ((retry
+                       (cl-find-if
+                        (lambda (entry)
+                          (eq (nth 1 entry)
+                              #'ai-code-ghostel-image-preview--linkify-visible))
+                        scheduled)))
+                  (should retry)
+                  (apply (nth 1 retry) (nth 2 retry)))
+                (should
+                 (= 1
+                    (length
+                     (cl-remove-if-not
+                      (lambda (overlay)
+                        (overlay-get overlay 'ai-code-session-image-preview))
+                      (overlays-in (point-min) (point-max))))))))))
+      (when (file-directory-p root)
+        (delete-directory root t))
+      (when (buffer-live-p buffer)
+        (kill-buffer buffer)))))
+
 (ert-deftest test-ai-code-backends-infra-ghostel-queues-redraw-output ()
   "Ghostel redraw-like output should be batched before rendering."
-  (let (rendered scheduled cancelled noted linkified)
+  (let (rendered scheduled scheduled-delay cancelled noted linkified)
     (with-temp-buffer
       (setq-local ai-code-backends-infra--session-terminal-backend 'ghostel)
       (cl-letf (((symbol-function 'run-at-time)
-                 (lambda (_delay _repeat function &rest args)
+                 (lambda (delay _repeat function &rest args)
+                   (setq scheduled-delay delay)
                    (setq scheduled (cons function args))
                    'mock-timer))
                 ((symbol-function 'cancel-timer)
@@ -1183,6 +738,10 @@
         (should (equal ai-code-backends-infra-ghostel--render-queue
                        "\e[2K\rWorking (42s"))
         (should (eq ai-code-backends-infra-ghostel--render-timer 'mock-timer))
+        ;; A complete TUI status frame commonly arrives in a few chunks over
+        ;; multiple display ticks.  One 10ms tick is too short to hide those
+        ;; intermediate clears on a graphical terminal with an image preview.
+        (should (= scheduled-delay 0.05))
         (ai-code-backends-infra-ghostel--handle-process-output
          (current-buffer)
          (lambda (_process output)

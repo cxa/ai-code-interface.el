@@ -9,6 +9,7 @@
 ;;; Code:
 
 (require 'cl-lib)
+(require 'ai-code-ghostel-image-preview)
 (require 'ai-code-session-link)
 
 ;; Prefer `ghostel-exec' for Ghostel backend startup when available, as
@@ -45,19 +46,11 @@ enabled by default because it widens the terminal's local resource access."
 (declare-function ghostel-send-key "ghostel" (key-name &optional mods))
 (declare-function ghostel-send-string "ghostel" (string))
 (declare-function ghostel-paste-string "ghostel" (string))
-(declare-function ghostel--anchor-window "ghostel" (&optional window force))
-(declare-function ghostel--window-anchored-p
-                  "ghostel" (window &optional body-pixel-height))
 (declare-function ghostel--schedule-link-detection
                   "ghostel" (&optional begin end))
 (declare-function ghostel--run-queued-plain-link-detection
                   "ghostel" (buffer))
-(declare-function ghostel--redispatch-scroll-event "ghostel" (event))
-(declare-function ghostel-copy-mode "ghostel" ())
-(declare-function ghostel-emacs-mode "ghostel" ())
 (declare-function ghostel-ime-mode "ghostel-ime" (&optional arg))
-(declare-function ai-code-session-link--linkify-strict-image-preview-region
-                  "ai-code-session-link" (start end))
 (declare-function ai-code-session-link--recent-output-plain-text
                   "ai-code-session-link" (output))
 
@@ -85,31 +78,8 @@ enabled by default because it widens the terminal's local resource access."
 (defvar-local ai-code-backends-infra-ghostel--progress-function nil
   "Original Ghostel progress function captured before AI Code wrapping.")
 
-(defvar ai-code-backends-infra-ghostel--preserving-image-preview-follow nil
-  "Non-nil while a linkification batch preserves Ghostel follow state.")
-
 (defconst ai-code-backends-infra-ghostel--linkify-redraw-delay 0.05
   "Seconds to wait before relinkifying recent Ghostel output.")
-
-(defcustom ai-code-backends-infra-ghostel-visible-image-linkify-delays
-  '(0.15 0.5)
-  "Delays used to scan visible Ghostel text for image previews.
-
-Only the visible window region is scanned.  This keeps restored session
-history responsive even when Ghostel has a large scrollback."
-  :type '(repeat number)
-  :group 'ai-code-backends-infra)
-
-(defcustom ai-code-backends-infra-ghostel-visible-image-linkify-max-chars
-  20000
-  "Maximum visible Ghostel characters scanned for image previews at once."
-  :type 'integer
-  :group 'ai-code-backends-infra)
-
-(defcustom ai-code-backends-infra-ghostel-scroll-image-linkify-delay 0.08
-  "Debounce delay before scanning visible Ghostel text after scrolling."
-  :type 'number
-  :group 'ai-code-backends-infra)
 
 (defcustom ai-code-backends-infra-ghostel-anti-flicker t
   "Enable short output batching for Ghostel TUI redraws.
@@ -120,8 +90,12 @@ chunks prevents users from seeing those incomplete intermediate frames."
   :type 'boolean
   :group 'ai-code-backends-infra)
 
-(defcustom ai-code-backends-infra-ghostel-render-delay 0.01
-  "Seconds to wait before flushing queued Ghostel redraw output."
+(defcustom ai-code-backends-infra-ghostel-render-delay 0.05
+  "Seconds to wait before flushing queued Ghostel redraw output.
+
+This quiet period lets a multi-chunk terminal redraw complete before the
+graphical frame is redisplayed, avoiding flashes of intermediate clear frames
+behind inline image previews."
   :type 'number
   :group 'ai-code-backends-infra)
 
@@ -171,9 +145,6 @@ This is disabled by default because it can make interactive echo feel laggy."
 (defconst ai-code-backends-infra-ghostel--redraw-regexp
   "\033\\[[0-9;?]*[A-GJKMH]"
   "Regexp matching ANSI terminal redraw, clear, or cursor movement sequences.")
-
-(defvar-local ai-code-backends-infra-ghostel--visible-image-linkify-timers nil
-  "Alist of (WINDOW . TIMERS) for visible image preview scans.")
 
 (defvar-local ai-code-backends-infra-ghostel--render-queue nil
   "Queued Ghostel output waiting for anti-flicker rendering.")
@@ -307,110 +278,6 @@ STATE and PROGRESS use the signature of `ghostel-progress-function'."
                   ghostel-progress-function))
     (setq-local ghostel-progress-function
                 #'ai-code-backends-infra-ghostel--progress)))
-
-(defun ai-code-backends-infra-ghostel--visible-image-region (window)
-  "Return the bounded visible buffer region for WINDOW."
-  (when (and (window-live-p window)
-             (buffer-live-p (window-buffer window)))
-    (with-current-buffer (window-buffer window)
-      (when (ai-code-backends-infra-ghostel--ai-session-buffer-p)
-        (save-excursion
-          (save-restriction
-            (widen)
-            (let* ((start (max (point-min) (window-start window)))
-                   (end (or (ignore-errors (window-end window t))
-                            (min (point-max)
-                                 (+ start
-                                    ai-code-backends-infra-ghostel-visible-image-linkify-max-chars))))
-                   (end (min (point-max) end)))
-              (when (> (- end start)
-                       ai-code-backends-infra-ghostel-visible-image-linkify-max-chars)
-                (setq start (max (point-min)
-                                 (- end
-                                    ai-code-backends-infra-ghostel-visible-image-linkify-max-chars))))
-              (goto-char start)
-              (setq start (line-beginning-position))
-              (goto-char end)
-              (setq end (min (point-max) (line-end-position)))
-              (when (> (- end start)
-                       ai-code-backends-infra-ghostel-visible-image-linkify-max-chars)
-                (setq end (min (point-max)
-                                (+ start
-                                   ai-code-backends-infra-ghostel-visible-image-linkify-max-chars))))
-              (and (< start end) (cons start end)))))))))
-
-(defun ai-code-backends-infra-ghostel--window-has-image-preview-p (window)
-  "Return non-nil when WINDOW's remaining buffer contains an image preview."
-  (when (and (window-live-p window)
-             (buffer-live-p (window-buffer window)))
-    (with-current-buffer (window-buffer window)
-      (let ((start (window-start window))
-            (end (point-max)))
-        (cl-some
-         (lambda (overlay)
-           (overlay-get overlay 'ai-code-session-image-preview))
-         (delete-dups
-          (append (and (< start end) (overlays-in start end))
-                  (overlays-at start)
-                  (overlays-at end))))))))
-
-(defun ai-code-backends-infra-ghostel--window-pixel-anchor-state
-    (window &optional body-pixel-height)
-  "Return WINDOW's pixel anchor state, or `unknown' when unmeasurable.
-The symbols `anchored' and `unanchored' account for display-only content such
-as image preview overlay strings.  BODY-PIXEL-HEIGHT has the same meaning as
-in `ghostel--window-anchored-p'."
-  (if (not (and (window-live-p window)
-                (buffer-live-p (window-buffer window))))
-      'unknown
-    (with-current-buffer (window-buffer window)
-      (let* ((body-pixel-height
-              (or body-pixel-height (window-body-height window t)))
-             (default-line-height
-              (and (numberp body-pixel-height)
-                   (> body-pixel-height 0)
-                   (with-selected-window window (default-line-height))))
-             (fit-height
-              (and (numberp default-line-height)
-                   (> default-line-height 0)
-                   (+ body-pixel-height default-line-height)))
-             (pixel-vscroll
-              (max 0 (or (ignore-errors (window-vscroll window t)) 0)))
-             (visible-limit
-              (and fit-height (+ fit-height pixel-vscroll)))
-             (size
-              (and visible-limit
-                   (ignore-errors
-                     (window-text-pixel-size
-                      window (window-start window) (point-max)
-                      nil (1+ visible-limit)))))
-             (content-height
-              ;; With the integer FROM above, `window-text-pixel-size'
-              ;; returns (WIDTH . HEIGHT).
-              (and (consp size) (numberp (cdr size)) (cdr size))))
-        (if (numberp content-height)
-            (if (<= content-height visible-limit)
-                'anchored
-              'unanchored)
-          'unknown)))))
-
-(defun ai-code-backends-infra-ghostel--window-anchored-p-around
-    (original window &optional body-pixel-height)
-  "Correct ORIGINAL's anchor result for image preview pixels in WINDOW.
-BODY-PIXEL-HEIGHT is forwarded to ORIGINAL and used for the pixel check."
-  (let ((anchored (funcall original window body-pixel-height)))
-    (if (and anchored
-             (ai-code-backends-infra-ghostel--ai-session-buffer-p
-              (window-buffer window))
-             (ai-code-backends-infra-ghostel--window-has-image-preview-p
-              window))
-        (pcase
-            (ai-code-backends-infra-ghostel--window-pixel-anchor-state
-             window body-pixel-height)
-          ('anchored t)
-          ('unanchored nil)
-          (_ anchored))
-      anchored)))
 
 (defun ai-code-backends-infra-ghostel--trusted-local-session-p ()
   "Return non-nil when this Ghostel session can safely read local files."
@@ -760,319 +627,6 @@ BEGIN and END are the Ghostel link-detection bounds."
      :around
      #'ai-code-backends-infra-ghostel--around-run-queued-link-detection)))
 
-(defun ai-code-backends-infra-ghostel--image-preview-overlays-in-region
-    (start end)
-  "Return image preview overlays touching START through END."
-  (cl-remove-if-not
-   (lambda (overlay)
-     (overlay-get overlay 'ai-code-session-image-preview))
-   (delete-dups
-    (append (overlays-in start end)
-            (overlays-at start)
-            (overlays-at end)))))
-
-(defun ai-code-backends-infra-ghostel--input-row-bounds ()
-  "Return the bounds of Ghostel's live cursor row, or nil."
-  (let ((cursor (and (boundp 'ghostel--cursor-char-pos)
-                     ghostel--cursor-char-pos)))
-    (when (and (ai-code-backends-infra-ghostel--ai-session-buffer-p)
-               (integer-or-marker-p cursor))
-      (save-excursion
-        (goto-char (max (point-min)
-                        (min (point-max) cursor)))
-        (cons (line-beginning-position) (line-end-position))))))
-
-(defun ai-code-backends-infra-ghostel--remove-input-image-previews
-    (start end)
-  "Remove image preview overlays touching the input region START through END."
-  (dolist (overlay
-           (ai-code-backends-infra-ghostel--image-preview-overlays-in-region
-            start end))
-    (delete-overlay overlay)))
-
-(defun ai-code-backends-infra-ghostel--apply-image-preview-for-file-around
-    (original match-start match-end link-text file &optional display-text)
-  "Call ORIGINAL unless MATCH-START through MATCH-END is live Ghostel input.
-LINK-TEXT, FILE, and optional DISPLAY-TEXT are forwarded unchanged."
-  (if-let* ((input-bounds
-             (ai-code-backends-infra-ghostel--input-row-bounds))
-            ((<= (car input-bounds) match-start))
-            ((<= match-start (cdr input-bounds))))
-      (progn
-        (ai-code-backends-infra-ghostel--remove-input-image-previews
-         match-start match-end)
-        nil)
-    (funcall original match-start match-end link-text file display-text)))
-
-(defun ai-code-backends-infra-ghostel--call-preserving-image-preview-follow
-    (buffer start end windows function)
-  "Call FUNCTION while preserving image preview follow state in BUFFER.
-START and END bound the overlays inspected.  WINDOWS limits the windows
-considered; when nil, use every window displaying BUFFER."
-  (if ai-code-backends-infra-ghostel--preserving-image-preview-follow
-      (funcall function)
-    (let ((ai-code-backends-infra-ghostel--preserving-image-preview-follow t))
-      (with-current-buffer buffer
-        (let* ((windows (or windows (get-buffer-window-list buffer nil t)))
-           (anchored-windows
-            (when (and (fboundp 'ghostel--window-anchored-p)
-                       (fboundp 'ghostel--anchor-window))
-              (cl-remove-if-not
-               (lambda (window)
-                 (and (window-live-p window)
-                      (eq (window-buffer window) buffer)
-                      (ignore-errors
-                        (ghostel--window-anchored-p window))))
-               windows)))
-           (previews-before
-            (ai-code-backends-infra-ghostel--image-preview-overlays-in-region
-             start end))
-           (result (funcall function)))
-          (when (and anchored-windows
-                     (cl-some
-                      (lambda (overlay)
-                        (not (memq overlay previews-before)))
-                      (ai-code-backends-infra-ghostel--image-preview-overlays-in-region
-                       start end)))
-            (dolist (window anchored-windows)
-              (when (and (window-live-p window)
-                         (eq (window-buffer window) buffer))
-                (ghostel--anchor-window window))))
-          result)))))
-
-(defun ai-code-backends-infra-ghostel--linkify-session-region-around
-    (original start end)
-  "Call ORIGINAL for START through END while preserving Ghostel follow state."
-  (if (ai-code-backends-infra-ghostel--ai-session-buffer-p)
-      (ai-code-backends-infra-ghostel--call-preserving-image-preview-follow
-       (current-buffer) start end nil
-       (lambda () (funcall original start end)))
-    (funcall original start end)))
-
-(defun ai-code-backends-infra-ghostel--linkify-bounded-region
-    (buffer start end &optional windows)
-  "Linkify BUFFER from START to END while preserving follow state.
-WINDOWS limits the windows considered; when nil, use every window displaying
-BUFFER."
-  (ai-code-backends-infra-ghostel--call-preserving-image-preview-follow
-   buffer start end windows
-   (lambda ()
-     (ai-code-backends-infra-ghostel--linkify-session-region start end)
-     (when (ai-code-backends-infra-ghostel--trusted-local-session-p)
-       (ai-code-session-link--linkify-strict-image-preview-region start end))
-     (ai-code-backends-infra-ghostel--cache-preserved-link-spans start end))))
-
-(defun ai-code-backends-infra-ghostel--linkify-visible-image-previews
-    (buffer window)
-  "Linkify session links and image previews in BUFFER shown by WINDOW."
-  (when (and (buffer-live-p buffer)
-             (window-live-p window)
-             (eq (window-buffer window) buffer))
-    (if (ai-code-backends-infra-ghostel--redraw-inhibited-p buffer)
-        (ai-code-backends-infra-ghostel-schedule-visible-image-linkify
-         window
-         (list ai-code-session-link--linkify-inhibited-retry-delay))
-      (with-current-buffer buffer
-        (ai-code-backends-infra-ghostel--prune-visible-image-linkify-timers)
-        (when-let* ((region
-                     (ai-code-backends-infra-ghostel--visible-image-region
-                      window)))
-          (ai-code-backends-infra-ghostel--linkify-bounded-region
-           buffer (car region) (cdr region) (list window)))))))
-
-(defun ai-code-backends-infra-ghostel--cancel-visible-image-linkify-timers
-    (window)
-  "Cancel visible image preview scan timers registered for WINDOW."
-  (when-let* ((entry
-               (assq window
-                     ai-code-backends-infra-ghostel--visible-image-linkify-timers)))
-    (dolist (timer (cdr entry))
-      (when (timerp timer)
-        (cancel-timer timer)))
-    (setq ai-code-backends-infra-ghostel--visible-image-linkify-timers
-          (assq-delete-all
-           window
-           ai-code-backends-infra-ghostel--visible-image-linkify-timers))))
-
-(defun ai-code-backends-infra-ghostel--prune-visible-image-linkify-timers ()
-  "Remove visible image preview scan timer entries for dead windows."
-  (setq ai-code-backends-infra-ghostel--visible-image-linkify-timers
-        (cl-remove-if-not
-         (lambda (entry)
-           (and (consp entry)
-                (window-live-p (car entry))))
-         ai-code-backends-infra-ghostel--visible-image-linkify-timers)))
-
-(defun ai-code-backends-infra-ghostel--register-visible-image-linkify-timers
-    (window timers)
-  "Register visible image preview scan TIMERS for WINDOW."
-  (push (cons window timers)
-        ai-code-backends-infra-ghostel--visible-image-linkify-timers))
-
-(defun ai-code-backends-infra-ghostel--linkify-image-preview-region
-    (buffer start end)
-  "Linkify session links and image previews in BUFFER between START and END.
-The region is bounded so Ghostel redraw/link-detection advice cannot
-accidentally scan an entire scrollback buffer."
-  (when (and (buffer-live-p buffer)
-             (integer-or-marker-p start)
-             (integer-or-marker-p end))
-    (with-current-buffer buffer
-      (when (and (ai-code-backends-infra-ghostel--ai-session-buffer-p)
-                 (not
-                  (ai-code-backends-infra-ghostel--redraw-inhibited-p
-                   buffer)))
-        (save-restriction
-          (widen)
-          (let ((start (if (markerp start) (marker-position start) start))
-                (end (if (markerp end) (marker-position end) end)))
-            (setq start (max (point-min) (min (point-max) start))
-                  end (max (point-min) (min (point-max) end)))
-            (when (< start end)
-              (when (> (- end start)
-                       ai-code-backends-infra-ghostel-visible-image-linkify-max-chars)
-                (setq start
-                      (max (point-min)
-                           (- end
-                              ai-code-backends-infra-ghostel-visible-image-linkify-max-chars))))
-              (save-excursion
-                (goto-char start)
-                (setq start (line-beginning-position))
-                (goto-char end)
-                (setq end (min (point-max) (line-end-position)))
-                (when (> (- end start)
-                         ai-code-backends-infra-ghostel-visible-image-linkify-max-chars)
-                  (setq start
-                        (max (point-min)
-                             (- end
-                                ai-code-backends-infra-ghostel-visible-image-linkify-max-chars))))
-                (when (< start end)
-                  (ai-code-backends-infra-ghostel--linkify-bounded-region
-                   buffer start end))))))))))
-
-(defun ai-code-backends-infra-ghostel-schedule-visible-image-linkify
-    (window &optional delays)
-  "Schedule visible session link and image preview linkification for WINDOW.
-Optional DELAYS overrides
-`ai-code-backends-infra-ghostel-visible-image-linkify-delays'."
-  (when (and (window-live-p window)
-             (buffer-live-p (window-buffer window)))
-    (let ((buffer (window-buffer window)))
-      (when (ai-code-backends-infra-ghostel--ai-session-buffer-p buffer)
-        (with-current-buffer buffer
-          (ai-code-backends-infra-ghostel--prune-visible-image-linkify-timers)
-          (ai-code-backends-infra-ghostel--cancel-visible-image-linkify-timers
-           window)
-          (let ((timers
-                 (mapcar
-                  (lambda (delay)
-                    (run-at-time
-                     delay nil
-                     #'ai-code-backends-infra-ghostel--linkify-visible-image-previews
-                     buffer window))
-                  (or delays
-                      ai-code-backends-infra-ghostel-visible-image-linkify-delays))))
-            (ai-code-backends-infra-ghostel--register-visible-image-linkify-timers
-             window timers)))))))
-
-(defun ai-code-backends-infra-ghostel-schedule-visible-image-linkify-for-buffer
-    (&optional buffer delays)
-  "Schedule visible session link and image preview linkification for BUFFER.
-Optional DELAYS overrides the default visible image linkification delays."
-  (let ((buffer (or buffer (current-buffer))))
-    (when (buffer-live-p buffer)
-      (dolist (window (get-buffer-window-list buffer nil t))
-        (ai-code-backends-infra-ghostel-schedule-visible-image-linkify
-         window delays)))))
-
-(defun ai-code-backends-infra-ghostel--window-scroll (window _display-start)
-  "Schedule visible session link and image preview linkification for WINDOW."
-  (ai-code-backends-infra-ghostel-schedule-visible-image-linkify
-   window
-   (list ai-code-backends-infra-ghostel-scroll-image-linkify-delay)))
-
-(defun ai-code-backends-infra-ghostel--after-readonly-command (&rest _args)
-  "Schedule visible session link and image preview linkification."
-  (when (ai-code-backends-infra-ghostel--ai-session-buffer-p)
-    (ai-code-backends-infra-ghostel-schedule-visible-image-linkify-for-buffer
-     (current-buffer))))
-
-(defun ai-code-backends-infra-ghostel--after-redispatch-scroll-event (event)
-  "Schedule visible session link and image preview linkification after EVENT."
-  (when-let* ((window (ignore-errors (posn-window (event-start event))))
-              ((window-live-p window)))
-    (ai-code-backends-infra-ghostel-schedule-visible-image-linkify
-     window
-     (list ai-code-backends-infra-ghostel-scroll-image-linkify-delay))))
-
-(defun ai-code-backends-infra-ghostel--run-queued-link-detection-around
-    (original buffer)
-  "Run ORIGINAL Ghostel link detection in BUFFER and add image previews."
-  (let (start end)
-    (when (buffer-live-p buffer)
-      (with-current-buffer buffer
-        (when (ai-code-backends-infra-ghostel--ai-session-buffer-p)
-          (setq start (and (boundp 'ghostel--plain-link-detection-begin)
-                           ghostel--plain-link-detection-begin)
-                end (and (boundp 'ghostel--plain-link-detection-end)
-                         ghostel--plain-link-detection-end)))))
-    (prog1 (funcall original buffer)
-      (when (and start end)
-        (ai-code-backends-infra-ghostel--linkify-image-preview-region
-         buffer start end)))))
-
-(defun ai-code-backends-infra-ghostel--install-image-preview-advice ()
-  "Install Ghostel advice used to display stable image previews."
-  (when (not
-         (advice-member-p
-          #'ai-code-backends-infra-ghostel--apply-image-preview-for-file-around
-          'ai-code-session-link--apply-image-preview-for-file))
-    (advice-add
-     'ai-code-session-link--apply-image-preview-for-file
-     :around
-     #'ai-code-backends-infra-ghostel--apply-image-preview-for-file-around))
-  (when (not (advice-member-p
-              #'ai-code-backends-infra-ghostel--linkify-session-region-around
-              'ai-code-session-link--linkify-session-region))
-    (advice-add 'ai-code-session-link--linkify-session-region
-                :around
-                #'ai-code-backends-infra-ghostel--linkify-session-region-around))
-  (when (and (fboundp 'ghostel--window-anchored-p)
-             (not (advice-member-p
-                   #'ai-code-backends-infra-ghostel--window-anchored-p-around
-                   'ghostel--window-anchored-p)))
-    (advice-add 'ghostel--window-anchored-p
-                :around
-                #'ai-code-backends-infra-ghostel--window-anchored-p-around))
-  (when (and (fboundp 'ghostel--run-queued-plain-link-detection)
-             (not (advice-member-p
-                   #'ai-code-backends-infra-ghostel--run-queued-link-detection-around
-                   'ghostel--run-queued-plain-link-detection)))
-    (advice-add 'ghostel--run-queued-plain-link-detection
-                :around
-                #'ai-code-backends-infra-ghostel--run-queued-link-detection-around))
-  (when (and (fboundp 'ghostel--redispatch-scroll-event)
-             (not (advice-member-p
-                   #'ai-code-backends-infra-ghostel--after-redispatch-scroll-event
-                   'ghostel--redispatch-scroll-event)))
-    (advice-add 'ghostel--redispatch-scroll-event
-                :after
-                #'ai-code-backends-infra-ghostel--after-redispatch-scroll-event))
-  (when (and (fboundp 'ghostel-copy-mode)
-             (not (advice-member-p
-                   #'ai-code-backends-infra-ghostel--after-readonly-command
-                   'ghostel-copy-mode)))
-    (advice-add 'ghostel-copy-mode
-                :after
-                #'ai-code-backends-infra-ghostel--after-readonly-command))
-  (when (and (fboundp 'ghostel-emacs-mode)
-             (not (advice-member-p
-                   #'ai-code-backends-infra-ghostel--after-readonly-command
-                   'ghostel-emacs-mode)))
-    (advice-add 'ghostel-emacs-mode
-                :after
-                #'ai-code-backends-infra-ghostel--after-readonly-command)))
-
 (defun ai-code-backends-infra-ghostel--effective-kitty-graphics-mediums ()
   "Return Kitty graphics mediums for the current AI Code Ghostel session."
   (delete-dups
@@ -1220,6 +774,9 @@ ORIG-FILTER is Ghostel's original process filter."
              (animated-status-output
               (ai-code-backends-infra-ghostel--animated-status-output-p
                output)))
+        ;; Preserve short-lived screenshot bytes before Ghostel redraws or the
+        ;; producer has a chance to unlink its temporary file.
+        (ai-code-ghostel-image-preview-capture-output output)
         (when orig-filter
           (funcall orig-filter process output))
         (when (buffer-live-p buffer)
@@ -1331,9 +888,7 @@ Ghostel owns terminal-model resizing through its mode-local window hooks."
   (ai-code-backends-infra-ghostel--install-preedit-redraw-inhibition)
   (ai-code-backends-infra-ghostel--install-link-preservation-advice)
   (ai-code-backends-infra-ghostel--install-lifecycle-hooks)
-  (ai-code-backends-infra-ghostel--install-image-preview-advice)
-  (add-hook 'window-scroll-functions
-            #'ai-code-backends-infra-ghostel--window-scroll nil t)
+  (ai-code-ghostel-image-preview-enable)
   (ai-code-backends-infra--configure-session-input-shortcuts)
   (ai-code-backends-infra--install-navigation-cursor-sync))
 

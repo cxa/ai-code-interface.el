@@ -8,7 +8,7 @@
 ;; - GeminiCLI:gemini-flash-3.5
 ;;
 ;; Version: 1.89
-;; Package-Requires: ((emacs "29.1") (transient "0.9.0") (magit "2.1.0"))
+;; Package-Requires: ((emacs "29.1") (transient "0.9.0") (magit "2.1.0") (ultra-scroll "0.6.2"))
 ;; URL: https://github.com/tninja/ai-code-interface.el
 
 ;; SPDX-License-Identifier: Apache-2.0
