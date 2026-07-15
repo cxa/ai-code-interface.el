@@ -138,6 +138,23 @@
          (ai-code-ghostel-image-preview--capture-output-sources "Working")))
       (should-not scanned))))
 
+(ert-deftest test-ai-code-ghostel-image-preview--keeps-former-public-names ()
+  "Existing Ghostel preview customizations and callers should keep working."
+  (dolist (pair
+           '((ai-code-backends-infra-ghostel-visible-image-linkify-delays
+              . ai-code-ghostel-image-preview-linkify-delays)
+             (ai-code-backends-infra-ghostel-visible-image-linkify-max-chars
+              . ai-code-ghostel-image-preview-linkify-max-chars)
+             (ai-code-backends-infra-ghostel-scroll-image-linkify-delay
+              . ai-code-ghostel-image-preview-scroll-linkify-delay)))
+    (should (eq (indirect-variable (car pair)) (cdr pair))))
+  (dolist (pair
+           '((ai-code-backends-infra-ghostel-schedule-visible-image-linkify
+              . ai-code-ghostel-image-preview-schedule-visible-linkify)
+             (ai-code-backends-infra-ghostel-schedule-visible-image-linkify-for-buffer
+              . ai-code-ghostel-image-preview-schedule-buffer)))
+    (should (eq (symbol-function (car pair)) (cdr pair)))))
+
 (ert-deftest test-ai-code-ghostel-image-preview--enable-owns-session-hooks ()
   "Enabling the module should install its complete buffer-local interface."
   (should (fboundp 'ai-code-ghostel-image-preview-enable))
@@ -427,6 +444,38 @@
       (should (eq ultra-event 'clamped-event))
       (should-not pixel-called)
       (should scheduled))))
+
+(ert-deftest test-ai-code-ghostel-image-preview--local-wheel-uses-emacs-mac-scroll ()
+  "A local preview should preserve emacs-mac wheel event handling."
+  (let ((original-featurep (symbol-function 'featurep))
+        mac-event
+        ultra-called)
+    (cl-letf (((symbol-function 'featurep)
+               (lambda (feature &optional subfeature)
+                 (if (eq feature 'mac-win)
+                     t
+                   (funcall original-featurep feature subfeature))))
+              ((symbol-function 'ai-code-ghostel-image-preview--event-window)
+               (lambda (_event) (selected-window)))
+              ((symbol-function
+                'ai-code-ghostel-image-preview--window-has-preview-p)
+               (lambda (_window) t))
+              ((symbol-function
+                'ai-code-ghostel-image-preview--clamp-up-event)
+               (lambda (_event _window) 'clamped-event))
+              ((symbol-function 'ultra-scroll-mac)
+               (lambda (event &optional _arg)
+                 (setq mac-event event)))
+              ((symbol-function 'ultra-scroll)
+               (lambda (&rest _args)
+                 (setq ultra-called t)))
+              ((symbol-function
+                'ai-code-ghostel-image-preview-schedule-visible-linkify)
+               #'ignore))
+      (let ((ai-code-ghostel-image-preview-prefer-ultra-scroll t))
+        (ai-code-ghostel-image-preview-scroll 'wheel-event))
+      (should (eq mac-event 'clamped-event))
+      (should-not ultra-called))))
 
 (ert-deftest test-ai-code-ghostel-image-preview--kitty-wheel-keeps-pixel-scroll ()
   "Native Kitty graphics should retain the ordinary pixel-scroll path."

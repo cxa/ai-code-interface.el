@@ -79,7 +79,9 @@
     (setq-local ghostel-command-start-functions nil)
     (setq-local ghostel-command-finish-functions nil)
     (setq-local ghostel-progress-function #'ignore)
-    (cl-letf (((symbol-function 'ai-code-backends-infra--configure-session-input-shortcuts)
+    (cl-letf (((symbol-function 'display-images-p)
+               (lambda (&optional _display) t))
+              ((symbol-function 'ai-code-backends-infra--configure-session-input-shortcuts)
                (lambda () nil))
               ((symbol-function 'ai-code-backends-infra--install-navigation-cursor-sync)
                (lambda () nil)))
@@ -96,6 +98,24 @@
     (should
      (eq ai-code-session-link-image-preview-transaction-function
          #'ai-code-ghostel-image-preview--call-transaction))))
+
+(ert-deftest test-ai-code-backends-infra-ghostel-skips-disabled-image-preview-lifecycle ()
+  "Disabling local previews should leave their Ghostel lifecycle inactive."
+  (let ((ai-code-session-link-ghostel-image-preview-enabled nil))
+    (with-temp-buffer
+      (setq-local ai-code-backends-infra--session-terminal-backend 'ghostel)
+      (setq-local window-scroll-functions nil)
+      (cl-letf (((symbol-function
+                  'ai-code-backends-infra--configure-session-input-shortcuts)
+                 #'ignore)
+                ((symbol-function
+                  'ai-code-backends-infra--install-navigation-cursor-sync)
+                 #'ignore))
+        (ai-code-backends-infra--configure-ghostel-buffer))
+      (should-not (bound-and-true-p ai-code-ghostel-image-preview-mode))
+      (should-not
+       (memq #'ai-code-ghostel-image-preview--window-scroll
+             window-scroll-functions)))))
 
 (ert-deftest test-ai-code-backends-infra-ghostel-configures-ime-redraw-inhibition ()
   "Ghostel AI session configuration should enable IME redraw inhibition."
@@ -709,13 +729,15 @@
 
 (ert-deftest test-ai-code-backends-infra-ghostel-queues-redraw-output ()
   "Ghostel redraw-like output should be batched before rendering."
-  (let (rendered scheduled scheduled-delay cancelled noted linkified)
+  (let (rendered scheduled scheduled-delay cancelled noted linkified
+        (schedule-count 0))
     (with-temp-buffer
       (setq-local ai-code-backends-infra--session-terminal-backend 'ghostel)
       (cl-letf (((symbol-function 'run-at-time)
                  (lambda (delay _repeat function &rest args)
                    (setq scheduled-delay delay)
                    (setq scheduled (cons function args))
+                   (setq schedule-count (1+ schedule-count))
                    'mock-timer))
                 ((symbol-function 'cancel-timer)
                  (lambda (timer)
@@ -748,7 +770,8 @@
            (push output rendered))
          'mock-process
          " - esc to interrupt)")
-        (should (equal cancelled '(mock-timer)))
+        (should-not cancelled)
+        (should (= schedule-count 1))
         (should (equal ai-code-backends-infra-ghostel--render-queue
                        "\e[2K\rWorking (42s - esc to interrupt)"))
         (apply (car scheduled) (cdr scheduled))
@@ -812,7 +835,7 @@
            (push output rendered))
          'mock-process
          "\e[2K\r\e[2;4mWorking\e[22;24m (42s)")
-        (should (equal cancelled '(mock-timer)))
+        (should-not cancelled)
         (should (equal ai-code-backends-infra-ghostel--render-queue
                        (concat
                         "\e[2K\r\e[2mWorking (42s)\e[22m"

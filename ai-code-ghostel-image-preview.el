@@ -42,6 +42,7 @@
 (declare-function ghostel--redraw-now "ghostel" (buffer &optional force))
 (declare-function ghostel--viewport-start "ghostel" ())
 (declare-function ultra-scroll "ultra-scroll" (event &optional arg))
+(declare-function ultra-scroll-mac "ultra-scroll" (event &optional arg))
 
 (defvar ai-code-session-link-image-preview-position-function)
 (defvar ai-code-session-link-image-preview-source-function)
@@ -61,15 +62,30 @@
 (defconst ai-code-ghostel-image-preview--output-probe-limit 4096
   "Maximum recent output characters checked for a new image clue.")
 
+(define-obsolete-variable-alias
+  'ai-code-backends-infra-ghostel-visible-image-linkify-delays
+  'ai-code-ghostel-image-preview-linkify-delays
+  "1.90")
+
 (defcustom ai-code-ghostel-image-preview-linkify-delays '(0.15 0.5)
   "Delays used to scan a newly displayed Ghostel viewport for previews."
   :type '(repeat number)
   :group 'ai-code-backends-infra)
 
+(define-obsolete-variable-alias
+  'ai-code-backends-infra-ghostel-visible-image-linkify-max-chars
+  'ai-code-ghostel-image-preview-linkify-max-chars
+  "1.90")
+
 (defcustom ai-code-ghostel-image-preview-linkify-max-chars 20000
   "Fallback scan size when Ghostel or Emacs cannot report a viewport."
   :type 'integer
   :group 'ai-code-backends-infra)
+
+(define-obsolete-variable-alias
+  'ai-code-backends-infra-ghostel-scroll-image-linkify-delay
+  'ai-code-ghostel-image-preview-scroll-linkify-delay
+  "1.90")
 
 (defcustom ai-code-ghostel-image-preview-scroll-linkify-delay 0.08
   "Debounce delay before scanning a Ghostel viewport after scrolling."
@@ -866,8 +882,12 @@ Optional DELAYS overrides the default scan delays."
              (ai-code-ghostel-image-preview--window-has-preview-p window)
              (or (fboundp 'ultra-scroll)
                  (require 'ultra-scroll nil t)))
-        (ultra-scroll
-         (ai-code-ghostel-image-preview--clamp-up-event event window))
+        (let ((event
+               (ai-code-ghostel-image-preview--clamp-up-event event window)))
+          (if (and (featurep 'mac-win)
+                   (fboundp 'ultra-scroll-mac))
+              (ultra-scroll-mac event)
+            (ultra-scroll event)))
       (if (fboundp 'pixel-scroll-precision)
           (pixel-scroll-precision event)
         (mwheel-scroll event)))
@@ -926,6 +946,16 @@ Optional DELAYS overrides the default scan delays."
     (advice-remove 'ghostel--redraw-now
                    #'ai-code-ghostel-image-preview--redraw-now-around))
   t)
+
+(define-obsolete-function-alias
+  'ai-code-backends-infra-ghostel-schedule-visible-image-linkify
+  #'ai-code-ghostel-image-preview-schedule-visible-linkify
+  "1.90")
+
+(define-obsolete-function-alias
+  'ai-code-backends-infra-ghostel-schedule-visible-image-linkify-for-buffer
+  #'ai-code-ghostel-image-preview-schedule-buffer
+  "1.90")
 
 (provide 'ai-code-ghostel-image-preview)
 ;;; ai-code-ghostel-image-preview.el ends here

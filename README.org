@@ -125,10 +125,8 @@ Enable installation of packages from MELPA by adding an entry to package-archive
   - AI Code enables Ghostel image support for AI sessions:
     - terminal programs can use Ghostel's Kitty graphics protocol;
     - local image paths printed by an AI CLI (for example =screenshot.png=) are previewed inline in the session buffer while the source path remains visible and clickable.
-    - the required =ultra-scroll= package dependency preserves partial-pixel
-      scrolling for a tall local preview; it is dispatched only while that
-      preview is visible, not as a global scrolling mode.  Set
-      =ai-code-ghostel-image-preview-prefer-ultra-scroll= to =nil= to opt out.
+    - tall local previews can use the optional =ultra-scroll= integration
+      described below.
   - [[https://github.com/dakra/ghostel][ghostel]] is under active development, please install the latest version.
   - To try it:
 
@@ -137,6 +135,7 @@ Enable installation of packages from MELPA by adding an entry to package-archive
 #+end_src
 
 *** Optional Dependencies
+- [[https://github.com/jdtsmith/ultra-scroll][ultra-scroll]]: Recommended for partial-pixel scrolling past tall local image previews in Ghostel. AI Code loads and dispatches it only while such a preview is visible, without enabling its global mode. Set =ai-code-ghostel-image-preview-prefer-ultra-scroll= to =nil= to opt out.
 - `helm`: For an enhanced auto-completion experience (`ai-code-input.el`).
 - `whisper`: For speech-to-text input via `ai-code-speech-to-text-input`. Record audio, press `RET` to stop, then choose whether to insert the transcription into the current buffer, send it to the active AI coding session with editable initial input, or copy it to the clipboard.
 - `gptel`: For intelligent, AI-generated content headlines in the prompt file.

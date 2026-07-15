@@ -53,6 +53,8 @@ enabled by default because it widens the terminal's local resource access."
 (declare-function ghostel-ime-mode "ghostel-ime" (&optional arg))
 (declare-function ai-code-session-link--recent-output-plain-text
                   "ai-code-session-link" (output))
+(declare-function ai-code-session-link--image-preview-enabled-p
+                  "ai-code-session-link" ())
 
 (defvar ai-code-backends-infra--session-terminal-backend)
 (defvar ai-code-backends-infra--session-directory)
@@ -91,11 +93,12 @@ chunks prevents users from seeing those incomplete intermediate frames."
   :group 'ai-code-backends-infra)
 
 (defcustom ai-code-backends-infra-ghostel-render-delay 0.05
-  "Seconds to wait before flushing queued Ghostel redraw output.
+  "Maximum seconds to batch queued Ghostel redraw output.
 
-This quiet period lets a multi-chunk terminal redraw complete before the
-graphical frame is redisplayed, avoiding flashes of intermediate clear frames
-behind inline image previews."
+The timer starts with the first redraw chunk, so continuous output cannot
+postpone rendering indefinitely.  Chunks arriving within this interval are
+rendered together, avoiding flashes of intermediate clear frames behind inline
+image previews."
   :type 'number
   :group 'ai-code-backends-infra)
 
@@ -812,15 +815,14 @@ ORIG-FILTER is Ghostel's original process filter."
           (progn
             (setq ai-code-backends-infra-ghostel--render-queue
                   (concat ai-code-backends-infra-ghostel--render-queue output))
-            (when ai-code-backends-infra-ghostel--render-timer
-              (cancel-timer ai-code-backends-infra-ghostel--render-timer))
-            (setq ai-code-backends-infra-ghostel--render-timer
-                  (run-at-time
-                   ai-code-backends-infra-ghostel-render-delay nil
-                   #'ai-code-backends-infra-ghostel--flush-render-queue
-                   buffer
-                   orig-filter
-                   process)))
+            (unless ai-code-backends-infra-ghostel--render-timer
+              (setq ai-code-backends-infra-ghostel--render-timer
+                    (run-at-time
+                     ai-code-backends-infra-ghostel-render-delay nil
+                     #'ai-code-backends-infra-ghostel--flush-render-queue
+                     buffer
+                     orig-filter
+                     process))))
         (ai-code-backends-infra-ghostel--render-output
          buffer orig-filter process output)))))
 
@@ -888,7 +890,8 @@ Ghostel owns terminal-model resizing through its mode-local window hooks."
   (ai-code-backends-infra-ghostel--install-preedit-redraw-inhibition)
   (ai-code-backends-infra-ghostel--install-link-preservation-advice)
   (ai-code-backends-infra-ghostel--install-lifecycle-hooks)
-  (ai-code-ghostel-image-preview-enable)
+  (when (ai-code-session-link--image-preview-enabled-p)
+    (ai-code-ghostel-image-preview-enable))
   (ai-code-backends-infra--configure-session-input-shortcuts)
   (ai-code-backends-infra--install-navigation-cursor-sync))
 
