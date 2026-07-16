@@ -16,6 +16,7 @@
 ;;; Code:
 
 (require 'cl-lib)
+(require 'seq)
 (require 'subr-x)
 (require 'ai-code-editor-viewport)
 (require 'ai-code-session)
@@ -747,6 +748,100 @@ use the branch name."
         (puthash key session-buffer ai-code-backends-infra--file-session-map)
       (remhash key ai-code-backends-infra--file-session-map))))
 
+(defun ai-code-backends-infra--live-terminal-session-p (buffer)
+  "Return non-nil when BUFFER is a managed terminal with a live process."
+  (and (buffer-live-p buffer)
+       (buffer-local-value
+        'ai-code-backends-infra--session-terminal-backend buffer)
+       (when-let* ((process (get-buffer-process buffer)))
+         (process-live-p process))))
+
+(defun ai-code-backends-infra--preferred-session (sessions)
+  "Return an unambiguous session from SESSIONS, or nil."
+  (cond
+   ((memq ai-code-backends-infra--last-accessed-buffer sessions)
+    ai-code-backends-infra--last-accessed-buffer)
+   ((length= sessions 1) (car sessions))))
+
+(defun ai-code-backends-infra--attached-sessions (source)
+  "Return live sessions explicitly attached to SOURCE's file."
+  (when-let* ((file (buffer-local-value 'buffer-file-name source))
+              (normalized-file
+               (ai-code-backends-infra--normalize-file-path file)))
+    (let (sessions)
+      (maphash
+       (lambda (key session)
+         (when (and (equal (cdr-safe key) normalized-file)
+                    (ai-code-backends-infra--live-terminal-session-p session))
+           (push session sessions)))
+       ai-code-backends-infra--file-session-map)
+      (delete-dups sessions))))
+
+(defun ai-code-backends-infra--project-sessions (source)
+  "Return live sessions belonging to SOURCE's current project."
+  (when-let* ((root
+               (with-current-buffer source
+                 (ai-code--session-project-root)))
+              (normalized-root
+               (ignore-errors
+                 (ai-code-backends-infra--normalize-session-directory root))))
+    (seq-filter
+     (lambda (session)
+       (when-let* ((directory
+                    (ai-code-backends-infra-session-directory session)))
+         (string= directory normalized-root)))
+     (ai-code-backends-infra-session-buffers))))
+
+(defun ai-code-backends-infra-current-buffer-session (&optional buffer)
+  "Return the unambiguous live TUI session associated with BUFFER.
+BUFFER defaults to the current buffer.  Return BUFFER itself when it is a
+managed terminal session.  Prefer a session explicitly attached to BUFFER's
+file.  Otherwise use the sole session in BUFFER's project, or the most recently
+accessed project session.  Return nil instead of choosing arbitrarily."
+  (let ((source (or buffer (current-buffer))))
+    (when (buffer-live-p source)
+      (if (ai-code-backends-infra--live-terminal-session-p source)
+          source
+        (let ((attached (ai-code-backends-infra--attached-sessions source)))
+          (or (ai-code-backends-infra--preferred-session attached)
+              (unless attached
+                (ai-code-backends-infra--preferred-session
+                 (ai-code-backends-infra--project-sessions source)))))))))
+
+(defun ai-code-backends-infra-session-buffers ()
+  "Return all live managed terminal session buffers."
+  (cl-remove-if-not #'ai-code-backends-infra--live-terminal-session-p
+                    (buffer-list)))
+
+(defun ai-code-backends-infra--send-string-with-paste
+    (string paste send-function paste-function paste-active-p backend-name)
+  "Send STRING safely through a terminal backend.
+Use SEND-FUNCTION for ordinary input.  When PASTE is non-nil, use
+PASTE-FUNCTION only while PASTE-ACTIVE-P returns non-nil, or report that
+BACKEND-NAME cannot paste safely."
+  (cond
+   ((not paste) (funcall send-function string))
+   ((and paste-function paste-active-p (funcall paste-active-p))
+    (funcall paste-function string))
+   (t
+    (user-error
+     "This %s session cannot paste multiline input without submitting"
+     backend-name))))
+
+(defun ai-code-backends-infra-insert-string (string buffer)
+  "Insert STRING into TUI session BUFFER without submitting it.
+Multiline input uses the terminal backend's paste operation so embedded
+newlines are not interpreted as Return keys."
+  (unless (ai-code-backends-infra--live-terminal-session-p buffer)
+    (user-error "AI session is no longer available"))
+  (with-current-buffer buffer
+    (ai-code-backends-infra--terminal-send-string
+     string (and (string-match-p "\n" string) t)))
+  (setq ai-code-backends-infra--last-accessed-buffer buffer)
+  (if-let* ((window (get-buffer-window buffer)))
+      (select-window window)
+    (ai-code-backends-infra--display-buffer-in-side-window buffer)))
+
 (defun ai-code-backends-infra--attached-file-session (prefix source-buffer working-dir)
   "Return attached session state for PREFIX and SOURCE-BUFFER.
 WORKING-DIR is the directory used to validate compatible sessions.
@@ -822,7 +917,7 @@ SOURCE-BUFFER unless FORCE-PROMPT is non-nil."
       (setq-local ai-code-backends-infra--session-directory
                   (ai-code-backends-infra--normalize-session-directory directory)))))
 
-(defun ai-code-backends-infra--buffer-session-directory (buffer)
+(defun ai-code-backends-infra-session-directory (buffer)
   "Return BUFFER session directory, using legacy `default-directory' as fallback."
   (when (buffer-live-p buffer)
     (with-current-buffer buffer
@@ -917,7 +1012,7 @@ Return a cons of (base-name . instance-name) or nil."
        (when-let* ((parsed (ai-code-backends-infra--parse-session-buffer-name
                             (buffer-name buf)
                             prefix)))
-         (if-let* ((buffer-directory (ai-code-backends-infra--buffer-session-directory buf)))
+         (if-let* ((buffer-directory (ai-code-backends-infra-session-directory buf)))
              (string= (ai-code-backends-infra--normalize-session-directory buffer-directory)
                       target-directory)
            (string= (car parsed) base))))
@@ -942,7 +1037,7 @@ Return a cons of (base-name . instance-name) or nil."
   "Return non-nil when BUFFER is live and still belongs to DIRECTORY."
   (and (buffer-live-p buffer)
        (when-let* ((buffer-directory
-                    (ai-code-backends-infra--buffer-session-directory buffer)))
+                    (ai-code-backends-infra-session-directory buffer)))
          (string=
           (ai-code-backends-infra--normalize-session-directory buffer-directory)
           (ai-code-backends-infra--normalize-session-directory directory)))))

@@ -118,6 +118,7 @@
 (require 'ai-code-input)
 (require 'ai-code-task)
 (require 'ai-code-prompt-mode)
+(require 'ai-code-send)
 (require 'ai-code-agile)
 (require 'ai-code-git)
 (require 'ai-code-github)
@@ -516,10 +517,37 @@ Shows the current backend label to the right."
   ("q" "Ask question (C-u: clipboard)" ai-code-ask-question)
   ("x" "Explain code in scope" ai-code-explain)
   ("<SPC>" "Send command (C-u: context)" ai-code-send-command)
+  ("I" "Insert to session..." ai-code-insert-menu)
   ("@" "Context (add/show/clear)" ai-code-context-action)
   ("C" "Create file or dir with AI" ai-code-create-file-or-dir)
   (":" "Speech to text input" ai-code-speech-to-text-input)
   ("w" "New worktree branch (C-u: status)" ai-code-git-worktree-action))
+
+;;;###autoload
+(transient-define-prefix ai-code-insert-menu ()
+  "Insert files and editor selections into an AI Code session or viewport."
+  ["Insert"
+   ["Files" :class transient-column
+    :setup-children ai-code-send-setup-menu-children
+    ("f" "File" ai-code-send-file)
+    ("F" "File to..." ai-code-send-file-to)
+    ("c" "Current file" ai-code-send-current-file)
+    ("o" "Other file" ai-code-send-other-file)]
+   ["Code" :class transient-column
+    :setup-children ai-code-send-setup-menu-children
+    ("r" "Region" ai-code-send-region)
+    ("R" "Region to..." ai-code-send-region-to)
+    ("d" "DWIM" ai-code-send-dwim)
+    ("D" "DWIM to..." ai-code-send-dwim-to)]
+   ["Attachments" :class transient-column
+    :setup-children ai-code-send-setup-menu-children
+    ("s" "Screenshot" ai-code-send-screenshot)
+    ("S" "Screenshot to..." ai-code-send-screenshot-to)
+    ("i" "Clipboard image" ai-code-send-clipboard-image)
+    ("I" "Clipboard image to..." ai-code-send-clipboard-image-to)]]
+  (interactive)
+  (ai-code-send-prepare-menu)
+  (transient-setup 'ai-code-insert-menu))
 
 (transient-define-group ai-code--menu-agile-development
   (ai-code--infix-select-code-change-auto-test)

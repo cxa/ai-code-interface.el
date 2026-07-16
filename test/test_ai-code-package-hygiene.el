@@ -15,6 +15,16 @@
     (insert-file-contents path nil 0 length)
     (buffer-string)))
 
+(defun ai-code-test--variable-initializer (file definition variable)
+  "Return VARIABLE's initializer from DEFINITION in FILE."
+  (with-temp-buffer
+    (insert-file-contents file)
+    (goto-char (point-min))
+    (re-search-forward
+     (format "^(%s %s\\_>" definition variable))
+    (goto-char (match-beginning 0))
+    (nth 2 (read (current-buffer)))))
+
 (ert-deftest ai-code-test-autoloads-file-has-spdx-header ()
   "Autoloads file should advertise the package license with SPDX."
   (let ((header (ai-code-test--file-prefix "ai-code-autoloads.el" 400)))
@@ -68,6 +78,29 @@
      (re-search-forward
       "(autoload 'ai-code-lint-current-file "
       nil t))))
+
+(ert-deftest test-ai-code-package-hygiene--autoloads-includes-native-send-commands ()
+  "Autoloads file should expose the native Insert commands."
+  (with-temp-buffer
+    (insert-file-contents "ai-code-autoloads.el")
+    (dolist (command '("ai-code-send-file"
+                       "ai-code-send-screenshot"
+                       "ai-code-send-clipboard-image"
+                       "ai-code-send-region"
+                       "ai-code-send-dwim"
+                       "ai-code-send-dwim-to"))
+      (should (re-search-forward
+               (format "(autoload '%s " command)
+               nil t)))))
+
+(ert-deftest test-ai-code-package-hygiene--autoload-screenshot-default-matches-source ()
+  "Autoloads should preserve the platform-specific screenshot default."
+  (should
+   (equal
+    (ai-code-test--variable-initializer
+     "ai-code-autoloads.el" "defvar" 'ai-code-send-screenshot-command)
+    (ai-code-test--variable-initializer
+     "ai-code-send.el" "defcustom" 'ai-code-send-screenshot-command))))
 
 (ert-deftest ai-code-test-secondary-files-use-standard-keywords ()
   "Secondary package files should use standard finder keywords."

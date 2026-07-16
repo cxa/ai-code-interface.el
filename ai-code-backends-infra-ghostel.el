@@ -39,6 +39,10 @@ enabled by default because it widens the terminal's local resource access."
                   "ai-code-backends-infra" (output))
 (declare-function ai-code-backends-infra--set-session-directory
                   "ai-code-backends-infra" (buffer directory))
+(declare-function ai-code-backends-infra--send-string-with-paste
+                  "ai-code-backends-infra"
+                  (string paste send-function paste-function paste-active-p
+                          backend-name))
 (declare-function ai-code-backends-infra--sync-terminal-cursor
                   "ai-code-backends-infra" ())
 (declare-function ai-code-editor-viewport-filter-output
@@ -49,6 +53,7 @@ enabled by default because it widens the terminal's local resource access."
 (declare-function ghostel-send-key "ghostel" (key-name &optional mods))
 (declare-function ghostel-send-string "ghostel" (string))
 (declare-function ghostel-paste-string "ghostel" (string))
+(declare-function ghostel--mode-enabled "ghostel-module" (term mode))
 (declare-function ghostel-cursor-point "ghostel" ())
 (declare-function ghostel--schedule-link-detection
                   "ghostel" (&optional begin end))
@@ -69,6 +74,7 @@ enabled by default because it widens the terminal's local resource access."
 (defvar ghostel-inhibit-redraw-functions)
 (defvar ghostel-kitty-graphics-mediums)
 (defvar ghostel-link-map)
+(defvar ghostel--term)
 (defvar ghostel-use-native-pty)
 (eval-when-compile
   (defvar ghostel-command-finish-functions)
@@ -906,9 +912,14 @@ ORIG-FILTER is Ghostel's original process filter."
 (defun ai-code-backends-infra-ghostel-send-string (string &optional paste)
   "Send STRING to the current Ghostel process.
 If PASTE is non-nil, send it as a pasted string."
-  (if (and paste (fboundp 'ghostel-paste-string))
-      (ghostel-paste-string string)
-    (ghostel-send-string string)))
+  (ai-code-backends-infra--send-string-with-paste
+   string paste #'ghostel-send-string
+   (and (fboundp 'ghostel-paste-string) #'ghostel-paste-string)
+   (lambda ()
+     (and (fboundp 'ghostel--mode-enabled)
+          (bound-and-true-p ghostel--term)
+          (ghostel--mode-enabled ghostel--term 2004)))
+   "Ghostel"))
 
 (defun ai-code-backends-infra-ghostel-send-escape ()
   "Send escape to the current Ghostel process."

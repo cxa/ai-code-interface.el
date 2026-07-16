@@ -17,8 +17,10 @@
 (require 'seq)
 (require 'subr-x)
 
+(declare-function ai-code-editor-viewport-source-directory
+                  "ai-code-editor-viewport" (&optional viewport))
+
 (defvar ai-code-editor-viewport-mode)
-(defvar ai-code-editor-viewport--source-directory)
 
 (defcustom ai-code-editor-viewport-image-preview-max-width 480
   "Maximum width in pixels for an image inserted into a viewport."
@@ -33,7 +35,7 @@
 (defcustom ai-code-editor-viewport-attachment-directory
   ".ai.code.files/attachments"
   "Directory where clipboard images pasted into a viewport are saved.
-Relative values are resolved from the CLI session's project root."
+Relative values are resolved from the CLI session's working directory."
   :type 'directory
   :group 'ai-code)
 
@@ -243,22 +245,21 @@ to the path substituted for %s in ARGS, or `stdout' when it emits PNG data."
           available))
        ai-code-editor-viewport--clipboard-image-targets))))
 
-(defun ai-code-editor-viewport--project-root ()
-  "Return the project root used to shorten viewport file references."
-  (let ((directory (file-name-as-directory
-                    (expand-file-name
-                     (or ai-code-editor-viewport--source-directory
-                         default-directory)))))
-    (or (locate-dominating-file directory ".git") directory)))
+(defun ai-code-editor-viewport--session-directory ()
+  "Return the CLI session directory used for viewport file references."
+  (file-name-as-directory
+   (expand-file-name
+    (or (ai-code-editor-viewport-source-directory)
+        default-directory))))
 
-(defun ai-code-editor-viewport--attachment-directory ()
-  "Return the directory used to persist pasted viewport attachments."
+(defun ai-code-editor-viewport-ensure-attachment-directory ()
+  "Return the attachment directory, creating it when needed."
   (let ((directory
          (if (file-name-absolute-p
               ai-code-editor-viewport-attachment-directory)
-             ai-code-editor-viewport-attachment-directory
+           ai-code-editor-viewport-attachment-directory
            (expand-file-name ai-code-editor-viewport-attachment-directory
-                             (ai-code-editor-viewport--project-root)))))
+                             (ai-code-editor-viewport--session-directory)))))
     (make-directory directory t)
     (file-name-as-directory directory)))
 
@@ -276,7 +277,8 @@ Return the attachment file, or nil when no supported image target is readable."
     (let ((file
            (make-temp-file
             (expand-file-name
-             "clipboard-" (ai-code-editor-viewport--attachment-directory))
+             "clipboard-"
+             (ai-code-editor-viewport-ensure-attachment-directory))
             nil extension))
           completed)
       (unwind-protect
@@ -346,7 +348,7 @@ Return the attachment file, or nil when no supported image target is readable."
                   (make-temp-file
                    (expand-file-name
                     "clipboard-"
-                    (ai-code-editor-viewport--attachment-directory))
+                    (ai-code-editor-viewport-ensure-attachment-directory))
                    nil ".png"))
             (rename-file staging-file attachment-file t)
             (setq completed t))
@@ -362,7 +364,7 @@ Return the attachment file, or nil when no supported image target is readable."
         (when (and attachment-file (file-exists-p attachment-file))
           (delete-file attachment-file))))))
 
-(defun ai-code-editor-viewport--save-clipboard-image ()
+(defun ai-code-editor-viewport-save-clipboard-image ()
   "Save a clipboard image and return its attachment file.
 Prefer Emacs's cross-platform selection API, then try configured external
 handlers for display servers that do not expose raw image selections."
@@ -372,17 +374,18 @@ handlers for display servers that do not expose raw image selections."
 (defun ai-code-editor-viewport--try-save-clipboard-image ()
   "Save and return a clipboard image, or nil when none can be extracted."
   (condition-case nil
-      (ai-code-editor-viewport--save-clipboard-image)
+      (ai-code-editor-viewport-save-clipboard-image)
     (user-error nil)))
 
 (defun ai-code-editor-viewport--file-reference (file)
   "Return the prompt reference to FILE for the current viewport."
   (let* ((absolute-file (expand-file-name file))
-         (project-root (ai-code-editor-viewport--project-root)))
+         (session-directory
+          (ai-code-editor-viewport--session-directory)))
     (concat "@"
-            (if (and project-root
-                     (file-in-directory-p absolute-file project-root))
-                (file-relative-name absolute-file project-root)
+            (if (and session-directory
+                     (file-in-directory-p absolute-file session-directory))
+                (file-relative-name absolute-file session-directory)
               absolute-file))))
 
 (defun ai-code-editor-viewport--preview-image (file)
@@ -491,7 +494,7 @@ modification hook."
               (insert " "))))
         (buffer-substring-no-properties (point-min) (point-max))))))
 
-(defun ai-code-editor-viewport--insert-files (files)
+(defun ai-code-editor-viewport-insert-files (files)
   "Insert FILES as readable references in the current editor viewport."
   (unless ai-code-editor-viewport-mode
     (user-error "Not in an AI CLI editor viewport"))
@@ -507,7 +510,7 @@ modification hook."
 (defun ai-code-editor-viewport-handle-drop (uri action)
   "Insert the local file represented by dropped URI and return ACTION."
   (when-let* ((file (dnd-get-local-file-name uri t)))
-    (ai-code-editor-viewport--insert-files (list file))
+    (ai-code-editor-viewport-insert-files (list file))
     (or action 'copy)))
 
 (defun ai-code-editor-viewport-handle-drops (uris action)
@@ -519,7 +522,7 @@ modification hook."
                   (dnd-get-local-file-name uri t))
                 uris))))
     (when files
-      (ai-code-editor-viewport--insert-files files)
+      (ai-code-editor-viewport-insert-files files)
       (or action 'copy))))
 
 (put 'ai-code-editor-viewport-handle-drops 'dnd-multiple-handler t)
@@ -532,16 +535,16 @@ modification hook."
   (unless ai-code-editor-viewport-mode
     (user-error "Not in an AI CLI editor viewport"))
   (if-let* ((files (ai-code-editor-viewport--clipboard-files)))
-      (ai-code-editor-viewport--insert-files files)
+      (ai-code-editor-viewport-insert-files files)
     (pcase (ai-code-editor-viewport--clipboard-content-kind)
       ('image
-       (ai-code-editor-viewport--insert-files
-        (list (ai-code-editor-viewport--save-clipboard-image))))
+       (ai-code-editor-viewport-insert-files
+        (list (ai-code-editor-viewport-save-clipboard-image))))
       ('text (yank arg))
       (_
        (if-let* ((image-file
                   (ai-code-editor-viewport--try-save-clipboard-image)))
-           (ai-code-editor-viewport--insert-files (list image-file))
+           (ai-code-editor-viewport-insert-files (list image-file))
          (yank arg))))))
 
 

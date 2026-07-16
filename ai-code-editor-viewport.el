@@ -66,11 +66,41 @@ the input view before AI Code sends the return key."
 (defvar-local ai-code-editor-viewport--source-directory nil
   "Working directory of the CLI session associated with this viewport.")
 
+(defvar-local ai-code-editor-viewport--source-buffer nil
+  "CLI session buffer associated with this viewport.")
+
 (defvar-local ai-code-editor-viewport--submit-function nil
   "Function that submits restored TUI input for this source buffer.")
 
 (defvar-local ai-code-editor-viewport-source-cursor-function nil
   "Function returning the live terminal cursor position for this source.")
+
+(defun ai-code-editor-viewport-source-buffer (&optional viewport)
+  "Return VIEWPORT's associated live CLI session buffer.
+VIEWPORT defaults to the current buffer."
+  (let ((buffer (or viewport (current-buffer))))
+    (when (buffer-live-p buffer)
+      (let ((source
+             (buffer-local-value
+              'ai-code-editor-viewport--source-buffer buffer)))
+        (and (buffer-live-p source) source)))))
+
+(defun ai-code-editor-viewport-source-directory (&optional viewport)
+  "Return VIEWPORT's associated CLI session directory.
+VIEWPORT defaults to the current buffer."
+  (let ((buffer (or viewport (current-buffer))))
+    (when (buffer-live-p buffer)
+      (buffer-local-value
+       'ai-code-editor-viewport--source-directory buffer))))
+
+(defun ai-code-editor-viewport-for-session (session)
+  "Return the editor viewport associated with live buffer SESSION."
+  (when (buffer-live-p session)
+    (seq-find
+     (lambda (buffer)
+       (and (buffer-local-value 'ai-code-editor-viewport-mode buffer)
+            (eq (ai-code-editor-viewport-source-buffer buffer) session)))
+     (buffer-list))))
 
 ;;;; Viewport mode
 
@@ -525,7 +555,8 @@ Return a plist that records the window and its previous buffer."
                   (buffer-auto-save-file-name nil))
               (clone-buffer name nil)))))
     (with-current-buffer viewport-buffer
-      (setq ai-code-editor-viewport--source-directory
+      (setq ai-code-editor-viewport--source-buffer source-buffer
+            ai-code-editor-viewport--source-directory
             (if (buffer-live-p source-buffer)
                 (buffer-local-value 'default-directory source-buffer)
               default-directory))

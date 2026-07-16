@@ -64,9 +64,60 @@ ARG is the prefix argument.
 (autoload 'ai-code-cli-switch-to-buffer-or-hide "ai-code" "\
 Hide the current buffer when its name both begins and ends with '*'.
 Otherwise switch to AI CLI buffer." t)
+(autoload 'ai-code-insert-menu "ai-code" "\
+Insert files and editor selections into an AI Code session or viewport." t)
 (autoload 'ai-code-menu "ai-code" "\
 Show the AI Code transient menu selected by `ai-code-menu-layout`." t)
 (register-definition-prefixes "ai-code" '("ai-code-"))
+
+
+;;; Generated autoloads from ai-code-send.el
+
+(defvar ai-code-send-screenshot-command
+  (cond
+   ((eq system-type 'darwin) '("/usr/sbin/screencapture" "-i"))
+   ((and (eq system-type 'gnu/linux) (getenv "WAYLAND_DISPLAY")) '("grim"))
+   ((eq system-type 'windows-nt) nil)
+   (t '("import")))
+  "Command used by `ai-code-send-screenshot' to capture an image.
+macOS uses the preinstalled screencapture program.  GNU/Linux uses grim under
+Wayland and ImageMagick's import program under X11.  Other Unix-like systems
+use import by default.  Windows does not bundle a compatible capture program,
+so customize this option there.
+
+The destination file name is appended to this list.")
+(custom-autoload 'ai-code-send-screenshot-command "ai-code-send" t)
+(autoload 'ai-code-send-file "ai-code-send" "Insert a file or selected Dired files into an ai-code session.
+When PROMPT-FOR-FILE is non-nil, always prompt for a file.
+When PICK-SESSION is non-nil, choose the destination session.
+
+(fn &optional PROMPT-FOR-FILE PICK-SESSION)" t)
+(autoload 'ai-code-send-file-to "ai-code-send" "Insert a file into a selected ai-code session.
+With PROMPT-FOR-FILE, always prompt for a file.
+
+(fn &optional PROMPT-FOR-FILE)" t)
+(autoload 'ai-code-send-current-file "ai-code-send" "Insert the current file into an ai-code session." t)
+(autoload 'ai-code-send-other-file "ai-code-send" "Prompt for and insert another file into an ai-code session." t)
+(autoload 'ai-code-send-screenshot "ai-code-send" "Capture and insert a screenshot into an ai-code session.
+When PICK-SESSION is non-nil, choose the destination session.
+
+(fn &optional PICK-SESSION)" t)
+(autoload 'ai-code-send-screenshot-to "ai-code-send" "Capture and insert a screenshot into a selected ai-code session." t)
+(autoload 'ai-code-send-clipboard-image "ai-code-send" "Save and insert the clipboard image into an ai-code session.
+When PICK-SESSION is non-nil, choose the destination session.
+
+(fn &optional PICK-SESSION)" t)
+(autoload 'ai-code-send-clipboard-image-to "ai-code-send" "Save and insert the clipboard image into a selected ai-code session." t)
+(autoload 'ai-code-send-region "ai-code-send" "Insert the active region into an ai-code session.
+When PICK-SESSION is non-nil, choose the destination session.
+
+(fn &optional PICK-SESSION)" t)
+(autoload 'ai-code-send-region-to "ai-code-send" "Insert the active region into a selected ai-code session." t)
+(autoload 'ai-code-send-dwim "ai-code-send" "Insert the most relevant editor input into an ai-code session.
+Prefer Dired files, the active region, diagnostics at point, then the current
+line." t)
+(autoload 'ai-code-send-dwim-to "ai-code-send" "Insert relevant editor input into a selected ai-code session." t)
+(register-definition-prefixes "ai-code-send" '("ai-code-send-"))
 
 
 ;;; Generated autoloads from ai-code-agent-shell.el

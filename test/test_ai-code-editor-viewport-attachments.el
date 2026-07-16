@@ -153,6 +153,25 @@
             (should (equal (buffer-string) "@notes/design.txt"))))
       (delete-directory directory t))))
 
+(ert-deftest test-ai-code-editor-viewport-attachments--uses-session-directory-for-reference ()
+  "File references should be relative to the viewport's CLI session directory."
+  (let* ((repository (make-temp-file "ai-code-editor-nested-project-" t))
+         (session-directory (expand-file-name "packages/app/" repository))
+         (file (expand-file-name "src/main.el" session-directory)))
+    (unwind-protect
+        (progn
+          (make-directory (expand-file-name ".git" repository))
+          (make-directory (file-name-directory file) t)
+          (with-temp-file file
+            (insert ";; main"))
+          (with-temp-buffer
+            (setq-local ai-code-editor-viewport--source-directory
+                        session-directory)
+            (ai-code-editor-viewport-mode 1)
+            (ai-code-editor-viewport-insert-files (list file))
+            (should (equal (buffer-string) "@src/main.el"))))
+      (delete-directory repository t))))
+
 (ert-deftest test-ai-code-editor-viewport-attachments--yank-saves-image-preview ()
   "`C-y' should detect clipboard images without target metadata."
   (let* ((directory (make-temp-file "ai-code-editor-clipboard-image-" t))

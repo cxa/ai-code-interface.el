@@ -148,6 +148,27 @@ Enable installation of packages from MELPA by adding an entry to package-archive
 - `projectile`: For project root initialization.
 - `helm-gtags`: For tags creation and symbol navigation fallback from clickable session symbols.
 
+*** Optional Screenshot Capture
+
+The Insert submenu's =Screenshot= commands rely on an external program to
+capture an image.  Install or configure the option for your platform:
+
+| Platform        | Screenshot capture                | Setup                                      |
+|-----------------+-----------------------------------+--------------------------------------------|
+| macOS           | =screencapture=                   | Preinstalled; used by default with =-i=.   |
+| Linux (Wayland) | =grim=                            | Install =grim=; selected when =WAYLAND_DISPLAY= is set. |
+| Linux (X11)     | =import= from ImageMagick         | Install the ImageMagick package.           |
+| Windows         | No compatible tool is bundled     | Configure a capture program as shown below. |
+
+Customize =ai-code-send-screenshot-command= when the default is unavailable.
+The command is a list containing the program followed by its arguments; AI Code
+appends the destination PNG path when invoking it:
+
+#+begin_src emacs-lisp
+(setopt ai-code-send-screenshot-command
+        '("my-screenshot-program" "--interactive"))
+#+end_src
+
 ** Key Features
 
 - *Transient-Driven Hub (`C-c a`)*: One keystroke opens a contextual transient menu that groups every capability (CLI control, code actions, agile workflows, utilities) so you never need to memorize scattered keybindings.
@@ -163,12 +184,16 @@ Enable installation of packages from MELPA by adding an entry to package-archive
 [[./clickable_link_ai_session.png]]
 - *Context-Aware Code Actions*: The menu exposes dedicated entries for changing code (`c`), implementing TODOs (`i`), asking questions (`q`), explaining code (`x`), sending free-form commands (`<SPC>`), and refreshing AI context (`@`). Each command automatically captures the surrounding function, region, or clipboard contents (via `C-u`) to keep prompts precise.
   - When a visible AI session buffer already exists, prompts can be routed to that session directly instead of opening a new one.
+- *Insert into AI Sessions*: Open the configurable `ai-code-menu` prefix (`C-c a` in the configuration examples), then press `I` to open the Insert submenu for files, Dired selections, regions, diagnostics-aware DWIM, screenshots, and clipboard images. The `I` entry always remains available. If no session is running, pressing it reports that state; if only sessions for other projects are running, it opens the submenu with just the `to...` entries for choosing one explicitly. An editor viewport associated with the destination session receives the insertion when present; otherwise AI Code inserts into that session's TUI input without submitting it. Screenshot capture may require the [[*Optional Screenshot Capture][platform-specific utility described above]].
+  - Inserted TUI content is always preceded and followed by two newline characters.[fn:insert-tui-spacing] In a viewport, AI Code omits the leading two newlines when the viewport is empty, keeps them when it already contains content, and always appends two newlines. Viewport attachments follow the same spacing rule.
 - *Agile Development Workflows*: Use the refactoring navigator (`r`), the guided TDD cycle (`t`), and the pull/review diff helper (`v`) to keep AI-assisted work aligned with agile best practices. Prompt authoring is first-class through quick access to the prompt file (`p`), build/test helper (`b`), and AI-assisted shell/file execution (`!`). In prompt files, send the current block with `C-c C-c`.
 - *Productivity & Debugging Utilities*: Initialize project navigation assets (`.`), investigate exceptions (`e`), debug Emacs runtime issues (`d`), auto-fix Flycheck issues in scope (`f`), copy or open file paths formatted for prompts (`k`, `o`), generate MCP inspector commands (`m`), capture session notes straight into Org (`n`), search notes with AI (`/`), dictate prompts with speech-to-text (`:`), and toggle desktop notifications (`N`) to get alerted when AI responses are ready in background sessions.
 - *Architecture Document Generation*: Derive practical architecture documents for the current repository with `C-c a A` (`ai-code-derive-architecture-document`). The command can generate architecture guardrails, a C4 PlantUML overview, a lightweight DDD context, or a test context document under `.ai.code.files/architecture/` so future AI coding sessions can reuse module boundaries, dependency rules, runtime flows, and validation expectations. See [[./docs/architecture/c4-overview.org][the C4 architecture overview for this repository]] for an example C4 diagram guide.
 - *Seamless Prompt Management*: Open the prompt file via `ai-code-open-prompt-file` (stored under `.ai.code.files/.ai.code.prompt.org` by default), send regions with `ai-code-prompt-send-block`, and reuse prompt snippets via `yasnippet` to keep conversations organized.
 - *Interactive Chat & Context Tools*: Dedicated buffers hold long-running chats, automatically enriched with file paths, diffs, and history from Magit or Git commands for richer AI responses.
 - *AI-Assisted Bash Commands*: From Dired, shell, eshell, or vterm, run `C-c a !` and type natural-language commands prefixed with `:` (e.g., `:count lines of python code recursively`); the tool generates the shell command for review and executes it in a compile buffer.
+
+[fn:insert-tui-spacing] Managed TUI sessions expose rendered terminal contents, not a backend-independent logical input value. AI Code therefore cannot reliably determine whether a TUI input is empty and conservatively keeps the leading separator.
 
 *** Typical Workflows Example
 

@@ -288,6 +288,97 @@
   (should-error (transient-get-suffix 'ai-code--menu-actions-with-context "o")
                 :type 'error))
 
+(ert-deftest test-ai-code--menu-actions-with-context-opens-insert-menu ()
+  "Test that the actions menu opens the independent Insert menu."
+  (let ((suffix (transient-get-suffix 'ai-code--menu-actions-with-context "I")))
+    (should suffix)
+    (should (eq (plist-get (cdr suffix) :command)
+                'ai-code-insert-menu))))
+
+(defun ai-code-test--call-with-menu-state (prefix function)
+  "Call FUNCTION with PREFIX's initialized suffixes and keymap."
+  (let* ((transient--prefix (transient--init-prefix prefix nil))
+         (layout (transient--init-suffixes prefix))
+         (transient--suffixes (transient--flatten-suffixes layout)))
+    (funcall function transient--suffixes
+             (transient--make-transient-map))))
+
+(ert-deftest test-ai-code--insert-menu-entry-remains-active-without-destination ()
+  "The top-level Insert entry should remain visible and active."
+  (dolist (prefix '(ai-code-menu-default ai-code-menu-2-columns))
+    (pcase-let
+        ((`(,inapt ,binding ,pre-command)
+          (ai-code-test--call-with-menu-state
+           prefix
+           (lambda (suffixes map)
+             (let ((suffix
+                    (seq-find
+                     (lambda (item)
+                       (eq (oref item command) 'ai-code-insert-menu))
+                     suffixes)))
+               (list
+                (and suffix (oref suffix inapt))
+                (lookup-key map (kbd "I"))
+                (lookup-key (transient--make-predicate-map)
+                            [ai-code-insert-menu])))))))
+      (should (eq binding 'ai-code-insert-menu))
+      (should-not inapt)
+      (should-not (eq pre-command 'transient--do-warn-inapt)))))
+
+(ert-deftest test-ai-code--insert-menu-checks-session-before-setup ()
+  "Pressing Insert should check session availability before menu setup."
+  (let (calls)
+    (cl-letf (((symbol-function 'ai-code-send-prepare-menu)
+               (lambda () (push 'prepare calls)))
+              ((symbol-function 'transient-setup)
+               (lambda (&rest _arguments) (push 'setup calls))))
+      (call-interactively #'ai-code-insert-menu)
+      (should (equal (nreverse calls) '(prepare setup))))))
+
+(ert-deftest test-ai-code--insert-menu-includes-all-send-variants ()
+  "Test that the independent Insert menu exposes every send variant."
+  (dolist (entry '("f" "F" "c" "o" "r" "R" "d" "D"
+                   "s" "S" "i" "I"))
+    (should (transient-get-suffix 'ai-code-insert-menu entry))))
+
+(defun ai-code-test--active-insert-menu-keys ()
+  "Return active Insert suffix keys, excluding common Transient commands."
+  (ai-code-test--call-with-menu-state
+   'ai-code-insert-menu
+   (lambda (suffixes _map)
+     (sort
+      (seq-filter
+       (lambda (key)
+         (member key '("f" "F" "c" "o" "r" "R" "d" "D"
+                       "s" "S" "i" "I")))
+       (mapcar (lambda (suffix) (oref suffix key)) suffixes))
+      #'string<))))
+
+(ert-deftest test-ai-code--insert-menu-filters-destination-and-region-commands ()
+  "The active Insert keymap should expose only usable commands."
+  (dolist (case '((nil nil ("D" "F" "I" "S"))
+                  (nil t ("D" "F" "I" "R" "S"))
+                  (t nil ("D" "F" "I" "S" "c" "d" "f" "i" "o" "s"))
+                  (t t ("D" "F" "I" "R" "S" "c" "d" "f" "i" "o" "r" "s"))))
+    (pcase-let ((`(,destination ,region ,expected) case))
+      (cl-letf (((symbol-function 'ai-code-send--default-destination-p)
+                 (lambda () destination))
+                ((symbol-function 'ai-code-send--region-available-p)
+                 (lambda () region)))
+        (should (equal (ai-code-test--active-insert-menu-keys)
+                       expected))))))
+
+(ert-deftest test-ai-code--insert-menu-allows-targeting-other-project-session ()
+  "A global session should enable only explicit targets without a default."
+  (cl-letf (((symbol-function 'ai-code-send--default-destination-p)
+             (lambda () nil))
+            ((symbol-function 'ai-code-backends-infra-session-buffers)
+             (lambda () '(other-project-session)))
+            ((symbol-function 'ai-code-send--region-available-p)
+             (lambda () nil)))
+    (should (equal (ai-code-test--active-insert-menu-keys)
+                   '("D" "F" "I" "S")))))
+
 (ert-deftest ai-code-test-menu-ai-cli-session-includes-session-dashboard-entry ()
   "Test that the AI CLI session menu exposes the session dashboard."
   (let ((suffix (transient-get-suffix 'ai-code--menu-ai-cli-session "j")))
