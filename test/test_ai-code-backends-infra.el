@@ -513,6 +513,32 @@ The prefix argument should also force instance-name prompting."
       (when (buffer-live-p buffer)
         (kill-buffer buffer)))))
 
+(ert-deftest test-ai-code-backends-infra--vterm-notification-tracker-intercepts-editor-before-render ()
+  "Vterm should remove terminal editor requests before rendering output."
+  (with-temp-buffer
+    (rename-buffer (generate-new-buffer-name "*codex[editor-request]*"))
+    (let ((buffer (current-buffer))
+          (process 'fake-process)
+          intercepted
+          rendered)
+      (cl-letf (((symbol-function 'process-buffer)
+                 (lambda (_process) buffer))
+                ((symbol-function 'ai-code-editor-viewport-filter-output)
+                 (lambda (seen-process output)
+                   (setq intercepted (list seen-process output))
+                   "visible"))
+                ((symbol-function 'ai-code-backends-infra--note-meaningful-output)
+                 (lambda (&rest _args) nil))
+                ((symbol-function 'ai-code-session-link--schedule-linkify-recent-output)
+                 (lambda (&rest _args) nil)))
+        (ai-code-backends-infra--vterm-notification-tracker
+         (lambda (_process input)
+           (setq rendered input))
+         process
+         "frame")
+        (should (equal intercepted (list process "frame")))
+        (should (equal rendered "visible"))))))
+
 (ert-deftest test-ai-code-backends-infra-vterm-notification-tracker-ignores-non-session ()
   "Non-AI vterm output should pass through unchanged."
   (let ((buffer (generate-new-buffer "*vterm*"))
@@ -1079,6 +1105,48 @@ The prefix argument should also force instance-name prompting."
           (should-not linkify-called))
       (when (buffer-live-p buffer)
         (kill-buffer buffer)))))
+
+(ert-deftest test-ai-code-backends-infra--create-terminal-session-eat-intercepts-editor-output ()
+  "Eat should remove terminal editor requests before rendering output."
+  (with-temp-buffer
+    (rename-buffer
+     (generate-new-buffer-name "*test-ai-code-eat-editor-request*"))
+    (let ((buffer-name (buffer-name))
+          (buffer (current-buffer))
+          (ai-code-backends-infra-terminal-backend 'eat)
+          wrapped-filter
+          intercepted
+          rendered)
+      (cl-letf (((symbol-function 'ai-code-backends-infra--terminal-ensure-backend)
+                 (lambda () nil))
+                ((symbol-function 'eat-mode) (lambda () nil))
+                ((symbol-function 'eat-exec) (lambda (&rest _args) nil))
+                ((symbol-function 'get-buffer-process)
+                 (lambda (_buffer) 'eat-proc))
+                ((symbol-function 'process-filter)
+                 (lambda (_process)
+                   (lambda (_process output)
+                     (setq rendered output))))
+                ((symbol-function 'set-process-filter)
+                 (lambda (_process filter)
+                   (setq wrapped-filter filter)))
+                ((symbol-function 'process-buffer)
+                 (lambda (_process) buffer))
+                ((symbol-function 'ai-code-editor-viewport-filter-output)
+                 (lambda (process output)
+                   (setq intercepted (list process output))
+                   "visible"))
+                ((symbol-function 'ai-code-backends-infra--strip-alternate-screen-sequences)
+                 #'identity)
+                ((symbol-function 'ai-code-backends-infra--output-meaningful-p)
+                 (lambda (_output) nil))
+                ((symbol-function 'ai-code-session-link--linkify-recent-output)
+                 (lambda (&rest _args) nil)))
+        (ai-code-backends-infra--create-terminal-session
+         buffer-name default-directory "echo hi" nil)
+        (funcall wrapped-filter 'eat-proc "frame")
+        (should (equal intercepted '(eat-proc "frame")))
+        (should (equal rendered "visible"))))))
 
 (ert-deftest test-ai-code-backends-infra-terminal-send-string-delegates-to-vterm-module ()
   "Terminal send should delegate vterm specifics to the vterm module."
@@ -2651,7 +2719,8 @@ The prefix argument should also force instance-name prompting."
 
 (ert-deftest test-ai-code-backends-infra-toggle-or-create-session-passes-env-vars ()
   "ENV-VARS are forwarded to `ai-code-backends-infra--create-terminal-session'."
-  (let* ((ai-code-backends-infra--processes (make-hash-table :test 'equal))
+  (let* ((ai-code-editor-viewport-enabled nil)
+         (ai-code-backends-infra--processes (make-hash-table :test 'equal))
          (working-dir "/tmp/ai-code-env-vars/")
          (buffer-name "*ai-code-env-vars*")
          (buffer (get-buffer-create buffer-name))
@@ -2721,6 +2790,65 @@ The prefix argument should also force instance-name prompting."
       (when (buffer-live-p buffer)
         (kill-buffer buffer)))))
 
+(ert-deftest test-ai-code-backends-infra--toggle-or-create-session-injects-editor-environment ()
+  "A new native CLI session should receive its viewport editor environment."
+  (with-temp-buffer
+    (rename-buffer (generate-new-buffer-name "*codex[project]*"))
+    (let ((process-table (make-hash-table :test 'equal))
+          (buffer-name (buffer-name))
+          (buffer (current-buffer))
+          environment-call
+          captured-environment)
+      (cl-letf (((symbol-function 'ai-code-backends-infra--cleanup-dead-processes)
+                 (lambda (_table) nil))
+                ((symbol-function 'ai-code-editor-viewport-environment)
+                 (lambda (environment)
+                   (setq environment-call environment)
+                   '("EDITOR=/tmp/ai-code-editor-helper")))
+                ((symbol-function 'ai-code-backends-infra--create-terminal-session)
+                 (lambda (_name _directory _command environment)
+                   (setq captured-environment environment)
+                   (cons buffer 'mock-process)))
+                ((symbol-function 'sleep-for) (lambda (&rest _args) nil))
+                ((symbol-function 'process-live-p) (lambda (&rest _args) t))
+                ((symbol-function 'set-process-sentinel) (lambda (&rest _args) nil))
+                ((symbol-function 'ai-code-backends-infra--display-buffer-in-side-window)
+                 (lambda (&rest _args) nil)))
+        (ai-code-backends-infra--toggle-or-create-session
+         "/tmp/project/" buffer-name process-table "codex"
+         nil nil nil "codex" nil '("TERM_PROGRAM=emacs"))
+        (should (equal environment-call '("TERM_PROGRAM=emacs")))
+        (should (equal captured-environment
+                       '("EDITOR=/tmp/ai-code-editor-helper")))))))
+
+(ert-deftest test-ai-code-backends-infra--remote-session-preserves-editor-environment ()
+  "A remote CLI session should retain its remote editor environment."
+  (with-temp-buffer
+    (rename-buffer (generate-new-buffer-name "*codex[remote]*"))
+    (let ((process-table (make-hash-table :test 'equal))
+          (buffer-name (buffer-name))
+          (buffer (current-buffer))
+          (environment '("EDITOR=vim" "TERM_PROGRAM=emacs"))
+          captured-environment)
+      (cl-letf (((symbol-function 'ai-code-editor-viewport-environment)
+                 (lambda (_environment)
+                   (ert-fail "Remote sessions should not inject a local editor")))
+                ((symbol-function 'ai-code-backends-infra--create-terminal-session)
+                 (lambda (_name _directory _command seen-environment)
+                   (setq captured-environment seen-environment)
+                   (cons buffer 'mock-process)))
+                ((symbol-function 'sleep-for) (lambda (&rest _args) nil))
+                ((symbol-function 'process-live-p) (lambda (&rest _args) t))
+                ((symbol-function 'ai-code-backends-infra--finalize-started-session)
+                 (lambda (&rest _args) nil))
+                ((symbol-function 'ai-code-backends-infra--remember-file-session-buffer)
+                 (lambda (&rest _args) nil)))
+        (ai-code-backends-infra--create-new-session
+         buffer-name "/ssh:example:/tmp/project/" "codex" environment
+         'session-key process-table nil "codex"
+         nil nil nil nil nil nil)
+        (should (equal captured-environment environment))))))
+
 (ert-deftest test-ai-code-backends-infra-configure-session-buffer-keeps-multiline-local ()
   "Multiline keybindings should not leak through shared mode maps."
   (let ((shared-map (make-sparse-keymap))
@@ -2758,6 +2886,16 @@ The prefix argument should also force instance-name prompting."
         (kill-buffer configured))
       (when (buffer-live-p unconfigured)
         (kill-buffer unconfigured)))))
+
+(ert-deftest test-ai-code-backends-infra--configure-session-buffer-installs-editor-submit ()
+  "Configured terminal sessions should submit completed editor input."
+  (with-temp-buffer
+    (cl-letf (((symbol-function 'ai-code-session-link--linkify-session-region)
+               (lambda (&rest _args) nil)))
+      (ai-code-backends-infra--configure-session-buffer (current-buffer))
+      (should
+       (eq ai-code-editor-viewport--submit-function
+           #'ai-code-backends-infra--terminal-send-return)))))
 
 (ert-deftest test-ai-code-backends-infra-toggle-or-create-session-calls-post-start-hook ()
   "POST-START-FN should receive the created buffer, process, and instance."

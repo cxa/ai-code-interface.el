@@ -9,6 +9,7 @@
 ;;; Code:
 
 (require 'cl-lib)
+(require 'ai-code-editor-viewport)
 (require 'ai-code-ghostel-image-preview)
 (require 'ai-code-session-link)
 
@@ -40,12 +41,15 @@ enabled by default because it widens the terminal's local resource access."
                   "ai-code-backends-infra" (buffer directory))
 (declare-function ai-code-backends-infra--sync-terminal-cursor
                   "ai-code-backends-infra" ())
+(declare-function ai-code-editor-viewport-filter-output
+                  "ai-code-editor-viewport-transport" (process output))
 (declare-function ai-code-session-update-metadata
                   "ai-code-session" (id-or-buffer metadata))
 (declare-function ghostel-exec "ghostel" (buffer program &optional args))
 (declare-function ghostel-send-key "ghostel" (key-name &optional mods))
 (declare-function ghostel-send-string "ghostel" (string))
 (declare-function ghostel-paste-string "ghostel" (string))
+(declare-function ghostel-cursor-point "ghostel" ())
 (declare-function ghostel--schedule-link-detection
                   "ghostel" (&optional begin end))
 (declare-function ghostel--run-queued-plain-link-detection
@@ -61,9 +65,11 @@ enabled by default because it widens the terminal's local resource access."
 (defvar ai-code-session-link--path-base-regexp)
 (defvar ai-code-session-link--url-pattern-regexp)
 (defvar ai-code-session-link-inhibit-functions)
+(defvar ghostel-eval-cmds)
 (defvar ghostel-inhibit-redraw-functions)
 (defvar ghostel-kitty-graphics-mediums)
 (defvar ghostel-link-map)
+(defvar ghostel-use-native-pty)
 (eval-when-compile
   (defvar ghostel-command-finish-functions)
   (defvar ghostel-command-start-functions)
@@ -76,6 +82,10 @@ enabled by default because it widens the terminal's local resource access."
   (defvar ghostel--input-mode)
   (defvar ghostel--plain-link-detection-begin)
   (defvar ghostel--plain-link-detection-end))
+
+(defconst ai-code-backends-infra-ghostel--editor-command
+  "ai-code-editor-viewport"
+  "Ghostel OSC 52;e command used for viewport editor requests.")
 
 (defvar-local ai-code-backends-infra-ghostel--progress-function nil
   "Original Ghostel progress function captured before AI Code wrapping.")
@@ -210,6 +220,42 @@ set by the subprocess, and `injected' for AI Code's ANSI gray foreground.")
     (with-current-buffer (or buffer (current-buffer))
       (and (boundp 'ai-code-backends-infra--session-terminal-backend)
            (eq ai-code-backends-infra--session-terminal-backend 'ghostel)))))
+
+(defun ai-code-backends-infra-ghostel--native-editor-transport-p ()
+  "Return non-nil when Ghostel supports native editor request callbacks."
+  (and (boundp 'ghostel-eval-cmds)
+       (fboundp 'ghostel--osc52-eval)))
+
+(defun ai-code-backends-infra-ghostel--editor-frame-prefix ()
+  "Return Ghostel's authenticated OSC 52;e editor frame prefix."
+  (concat "\e]52;e;"
+          ai-code-backends-infra-ghostel--editor-command
+          " "
+          (ai-code-editor-viewport-frame-token)
+          " "))
+
+(defun ai-code-backends-infra-ghostel--handle-editor-request (token payload)
+  "Forward Ghostel editor TOKEN and PAYLOAD to the current viewport source."
+  (ai-code-editor-viewport-handle-request
+   (current-buffer) token payload))
+
+(defun ai-code-backends-infra-ghostel--install-editor-transport ()
+  "Whitelist the token-checked viewport command in the current buffer."
+  (when (and ai-code-editor-viewport-enabled
+             (ai-code-backends-infra-ghostel--native-editor-transport-p))
+    (let* ((entry
+            (list ai-code-backends-infra-ghostel--editor-command
+                  #'ai-code-backends-infra-ghostel--handle-editor-request))
+           (commands
+            (cons
+             entry
+             (cl-remove
+              ai-code-backends-infra-ghostel--editor-command
+              ghostel-eval-cmds
+              :key #'car
+              :test #'string=))))
+      (unless (equal ghostel-eval-cmds commands)
+        (setq-local ghostel-eval-cmds commands)))))
 
 (defun ai-code-backends-infra-ghostel--update-session-metadata (buffer metadata)
   "Merge METADATA into the AI Code session associated with BUFFER."
@@ -454,8 +500,8 @@ BUFFER defaults to the current buffer.  This function is installed in
     (or (ai-code-backends-infra-ghostel--native-preedit-active-p buffer)
         (ai-code-backends-infra-ghostel--recent-input-active-p buffer))))
 
-(defun ai-code-backends-infra-ghostel--install-preedit-redraw-inhibition ()
-  "Install native preedit redraw inhibition for the current Ghostel buffer."
+(defun ai-code-backends-infra-ghostel--install-redraw-inhibition ()
+  "Install redraw inhibition for the current Ghostel buffer."
   (when (or ai-code-backends-infra-ghostel-inhibit-redraw-during-native-preedit
             ai-code-backends-infra-ghostel-inhibit-redraw-after-input)
     (add-hook 'ghostel-inhibit-redraw-functions
@@ -847,7 +893,8 @@ ORIG-FILTER is Ghostel's original process filter."
                            buffer)))
            (when (buffer-live-p target)
              (ai-code-backends-infra-ghostel--handle-process-output
-              target orig-filter proc output))))))))
+              target orig-filter proc
+              (ai-code-editor-viewport-filter-output proc output)))))))))
 
 (defun ai-code-backends-infra-ghostel--enable-ime-integration ()
   "Enable Ghostel IME integration for the current AI Code session."
@@ -883,13 +930,16 @@ Ghostel owns terminal-model resizing through its mode-local window hooks."
 (defun ai-code-backends-infra--configure-ghostel-buffer ()
   "Configure the current Ghostel buffer for AI Code sessions."
   (setq-local ai-code-backends-infra--session-terminal-backend 'ghostel)
+  (setq-local ai-code-editor-viewport-source-cursor-function
+              #'ghostel-cursor-point)
   (setq-local ghostel-set-title-function nil)
   (setq-local ghostel-kill-buffer-on-exit nil)
   (ai-code-backends-infra-ghostel--configure-image-support)
   (ai-code-backends-infra-ghostel--enable-ime-integration)
-  (ai-code-backends-infra-ghostel--install-preedit-redraw-inhibition)
+  (ai-code-backends-infra-ghostel--install-redraw-inhibition)
   (ai-code-backends-infra-ghostel--install-link-preservation-advice)
   (ai-code-backends-infra-ghostel--install-lifecycle-hooks)
+  (ai-code-backends-infra-ghostel--install-editor-transport)
   (when (ai-code-session-link--image-preview-enabled-p)
     (ai-code-ghostel-image-preview-enable))
   (ai-code-backends-infra--configure-session-input-shortcuts)
@@ -899,7 +949,17 @@ Ghostel owns terminal-model resizing through its mode-local window hooks."
   "Start a Ghostel session in BUFFER for COMMAND."
   (with-current-buffer buffer
     (ai-code-backends-infra--configure-ghostel-buffer)
-    (let* ((argv (split-string-shell-command command))
+    (let* ((native-editor-transport-p
+            (ai-code-backends-infra-ghostel--native-editor-transport-p))
+           (configured-native-pty
+            (and (boundp 'ghostel-use-native-pty)
+                 (symbol-value 'ghostel-use-native-pty)))
+           (effective-native-pty
+            (if (and ai-code-editor-viewport-enabled
+                     (not native-editor-transport-p))
+                nil
+              configured-native-pty))
+           (argv (split-string-shell-command command))
            (program (car argv))
            (args (cdr argv)))
       (cond
@@ -908,7 +968,9 @@ Ghostel owns terminal-model resizing through its mode-local window hooks."
         (let ((proc
                (let ((ghostel-kitty-graphics-mediums
                       (ai-code-backends-infra-ghostel--effective-kitty-graphics-mediums)))
-                 (ghostel-exec buffer program args))))
+                 (cl-progv '(ghostel-use-native-pty)
+                     (list effective-native-pty)
+                   (ghostel-exec buffer program args)))))
           ;; `ghostel-exec' enters `ghostel-mode', which resets local state.
           (ai-code-backends-infra--configure-ghostel-buffer)
           proc))
@@ -922,7 +984,16 @@ COMMAND is the shell command to run and ENV-VARS are extra environment
 variables for the terminal process."
   (let* ((working-dir (file-name-as-directory (expand-file-name working-dir)))
          (buffer (get-buffer-create buffer-name))
-         (process-environment (append env-vars process-environment)))
+         (editor-environment
+          (if (and (not (file-remote-p working-dir))
+                   ai-code-editor-viewport-enabled
+                   (ai-code-backends-infra-ghostel--native-editor-transport-p))
+              (ai-code-editor-viewport-environment
+               env-vars
+               (ai-code-backends-infra-ghostel--editor-frame-prefix))
+            env-vars))
+         (process-environment
+          (append editor-environment process-environment)))
     (ai-code-backends-infra--set-session-directory buffer working-dir)
     (with-current-buffer buffer
       (setq-local default-directory working-dir)

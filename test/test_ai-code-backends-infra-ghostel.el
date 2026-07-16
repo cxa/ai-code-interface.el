@@ -19,6 +19,7 @@
 (defvar ghostel-kill-buffer-on-exit)
 (defvar ghostel-kitty-graphics-mediums)
 (defvar ghostel-inhibit-redraw-functions)
+(defvar ghostel-eval-cmds)
 (defvar ai-code-session-link-inhibit-functions)
 (defvar ai-code-session-link-image-preview-source-function)
 (defvar ai-code-session-link-image-preview-transaction-function)
@@ -32,6 +33,122 @@
 
 (declare-function ai-code-ghostel-image-preview--cached-source
                   "ai-code-ghostel-image-preview" (link-text))
+(declare-function ghostel-cursor-point "ghostel" ())
+
+(ert-deftest test-ai-code-backends-infra-ghostel--native-editor-transport-p-requires-osc52-callback ()
+  "An editor whitelist alone should not imply OSC 52;e support."
+  (let ((ghostel-eval-cmds '(("message" message))))
+    (should-not
+     (ai-code-backends-infra-ghostel--native-editor-transport-p))
+    (cl-letf (((symbol-function 'ghostel--osc52-eval)
+               (lambda (_payload) nil)))
+      (should
+       (ai-code-backends-infra-ghostel--native-editor-transport-p)))))
+
+(ert-deftest test-ai-code-backends-infra-ghostel--install-editor-transport-replaces-command ()
+  "Ghostel sessions should whitelist only AI Code's token-checked callback."
+  (with-temp-buffer
+    (setq-local ghostel-eval-cmds
+                '(("ai-code-editor-viewport" ignore)
+                  ("message" message)))
+    (let ((ai-code-editor-viewport-enabled t))
+      (cl-letf (((symbol-function 'ghostel--osc52-eval)
+                 (lambda (_payload) nil)))
+        (ai-code-backends-infra-ghostel--install-editor-transport)
+        (should
+         (equal ghostel-eval-cmds
+                '(("ai-code-editor-viewport"
+                   ai-code-backends-infra-ghostel--handle-editor-request)
+                  ("message" message))))
+        (let ((commands ghostel-eval-cmds))
+          (ai-code-backends-infra-ghostel--install-editor-transport)
+          (should (eq ghostel-eval-cmds commands)))))))
+
+(ert-deftest test-ai-code-backends-infra-ghostel--start-ghostel-process-falls-back-from-unsupported-native-transport ()
+  "Ghostel should use an Emacs PTY when native callbacks are unavailable."
+  (with-temp-buffer
+    (let ((ai-code-editor-viewport-enabled t)
+          native-pty-seen)
+      (cl-progv '(ghostel-use-native-pty) '(t)
+        (cl-letf (((symbol-function 'ai-code-backends-infra--configure-session-input-shortcuts)
+                   (lambda () nil))
+                  ((symbol-function 'ai-code-backends-infra--install-navigation-cursor-sync)
+                   (lambda () nil))
+                  ((symbol-function 'ai-code-backends-infra-ghostel--native-editor-transport-p)
+                   (lambda () nil))
+                  ((symbol-function 'ghostel-exec)
+                   (lambda (_buffer _program _args)
+                     (setq native-pty-seen
+                           (symbol-value 'ghostel-use-native-pty))
+                     nil)))
+          (ai-code-backends-infra--start-ghostel-process
+           (current-buffer) "codex")))
+      (should-not native-pty-seen))))
+
+(ert-deftest test-ai-code-backends-infra-ghostel--create-session-selects-editor-transport-before-exec ()
+  "Ghostel's child should inherit the native editor callback transport."
+  (with-temp-buffer
+    (rename-buffer " *ai-code-ghostel-editor-transport*")
+    (setq-local ghostel-eval-cmds '(("message" message)))
+    (let ((buffer-name (buffer-name))
+          (ai-code-editor-viewport-enabled t)
+          (ai-code-editor-viewport--protocol-token "test-token")
+          (process-environment nil)
+          environment-seen)
+      (cl-letf (((symbol-function 'ai-code-backends-infra--set-session-directory)
+                 (lambda (&rest _args) nil))
+                ((symbol-function 'ai-code-backends-infra--configure-session-input-shortcuts)
+                 (lambda () nil))
+                ((symbol-function 'ai-code-backends-infra--install-navigation-cursor-sync)
+                 (lambda () nil))
+                ((symbol-function 'ghostel-exec)
+                 (lambda (_buffer _program _args)
+                   (setq environment-seen process-environment)
+                   nil))
+                ((symbol-function 'ghostel--osc52-eval)
+                 (lambda (_payload) nil)))
+        (ai-code-backends-infra-ghostel-create-session
+         buffer-name
+         default-directory
+         "codex"
+         nil))
+      (should
+       (member
+        (concat "AI_CODE_EDITOR_VIEWPORT_FRAME_PREFIX="
+                "\e]52;e;ai-code-editor-viewport test-token ")
+               environment-seen)))))
+
+(ert-deftest test-ai-code-backends-infra-ghostel--remote-session-preserves-editor-environment ()
+  "A remote Ghostel child should retain its remote editor environment."
+  (let* ((buffer-name " *ai-code-ghostel-remote-editor*")
+         (environment '("EDITOR=vim" "TERM_PROGRAM=ghostel"))
+         (process-environment '("PATH=/bin"))
+         buffer
+         environment-seen)
+    (unwind-protect
+        (cl-letf (((symbol-function 'ai-code-backends-infra--set-session-directory)
+                   (lambda (&rest _args) nil))
+                  ((symbol-function 'ai-code-backends-infra--configure-session-input-shortcuts)
+                   (lambda () nil))
+                  ((symbol-function 'ai-code-backends-infra--install-navigation-cursor-sync)
+                   (lambda () nil))
+                  ((symbol-function 'ai-code-backends-infra--configure-ghostel-buffer)
+                   (lambda () nil))
+                  ((symbol-function 'ai-code-backends-infra-ghostel--native-editor-transport-p)
+                   (lambda () t))
+                  ((symbol-function 'ai-code-editor-viewport-environment)
+                   (lambda (&rest _args)
+                     (ert-fail "Remote Ghostel should not inject a local editor")))
+                  ((symbol-function 'ghostel-exec)
+                   (lambda (seen-buffer _program _args)
+                     (setq buffer seen-buffer
+                           environment-seen process-environment)
+                     nil)))
+          (ai-code-backends-infra-ghostel-create-session
+           buffer-name "/ssh:example:/tmp/project/" "codex" environment)
+          (should (member "EDITOR=vim" environment-seen)))
+      (when (buffer-live-p buffer)
+        (kill-buffer buffer)))))
 
 (ert-deftest test-ai-code-backends-infra-ghostel-create-session-restores-ai-state ()
   "Ghostel session creation should restore AI Code local state after mode reset."
@@ -94,6 +211,9 @@
                 #'ai-code-backends-infra-ghostel--progress))
     (should (eq ai-code-backends-infra-ghostel--progress-function
                 #'ignore))
+    (should
+     (eq ai-code-editor-viewport-source-cursor-function
+         #'ghostel-cursor-point))
     (should (bound-and-true-p ai-code-ghostel-image-preview-mode))
     (should
      (eq ai-code-session-link-image-preview-transaction-function
@@ -880,6 +1000,42 @@
         (delete-process proc))
       (when (buffer-live-p buffer)
         (kill-buffer buffer)))))
+
+(ert-deftest test-ai-code-backends-infra-ghostel--wrap-process-filter-intercepts-editor-before-render ()
+  "Ghostel should remove terminal editor requests before rendering output."
+  (with-temp-buffer
+    (let ((buffer (current-buffer))
+          (ai-code-backends-infra-ghostel-anti-flicker nil)
+          proc
+          intercepted
+          rendered)
+      (unwind-protect
+          (progn
+            (setq proc
+                  (make-pipe-process
+                   :name "ai-code-ghostel-editor-request"
+                   :buffer buffer
+                   :noquery t
+                   :filter (lambda (_process output)
+                             (setq rendered output))))
+            (with-current-buffer buffer
+              (setq-local ai-code-backends-infra--session-terminal-backend
+                          'ghostel))
+            (ai-code-backends-infra-ghostel--wrap-process-filter buffer proc)
+            (cl-letf (((symbol-function 'ai-code-editor-viewport-filter-output)
+                       (lambda (process output)
+                         (setq intercepted (list process output))
+                         "visible"))
+                      ((symbol-function 'ai-code-backends-infra--output-meaningful-p)
+                       (lambda (_output) nil))
+                      ((symbol-function
+                        'ai-code-session-link--schedule-linkify-recent-output)
+                       (lambda (&rest _args) nil)))
+              (funcall (process-filter proc) proc "frame"))
+            (should (equal intercepted (list proc "frame")))
+            (should (equal rendered "visible")))
+        (when (processp proc)
+          (delete-process proc))))))
 
 (ert-deftest test-ai-code-backends-infra-ghostel-command-lifecycle-updates-session-metadata ()
   "OSC 133 command hooks should write structured session metadata."

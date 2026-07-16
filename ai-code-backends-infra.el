@@ -17,6 +17,7 @@
 
 (require 'cl-lib)
 (require 'subr-x)
+(require 'ai-code-editor-viewport)
 (require 'ai-code-session)
 (require 'ai-code-session-link)
 ;; Terminal-specific implementations live in dedicated modules so this
@@ -532,6 +533,8 @@ ESCAPE-FN is bound to `C-<escape>' when non-nil.
 MULTILINE-INPUT-SEQUENCE configures `S-<return>' and `C-<return>' when non-nil."
   (with-current-buffer buffer
     (ai-code-backends-infra--ensure-buffer-local-keymap)
+    (setq-local ai-code-editor-viewport--submit-function
+                #'ai-code-backends-infra--terminal-send-return)
     (when escape-fn
       (define-key (current-local-map) (kbd "C-<escape>") escape-fn))
     (ai-code-backends-infra--configure-multiline-input
@@ -1364,9 +1367,13 @@ SESSION-KEY and PROCESS-TABLE register the process.
 RESOLVED-INSTANCE, PREFIX, ESCAPE-FN, CLEANUP-FN,
 MULTILINE-INPUT-SEQUENCE, and POST-START-FN configure startup behavior.
 TASK-FILE and SOURCE-BUFFER preserve file-to-session binding."
-  (let* ((buffer-and-process
+  (let* ((editor-environment
+          (if (file-remote-p working-dir)
+              env-vars
+            (ai-code-editor-viewport-environment env-vars)))
+         (buffer-and-process
           (ai-code-backends-infra--create-terminal-session
-           resolved-buffer-name working-dir command env-vars))
+           resolved-buffer-name working-dir command editor-environment))
          (new-buffer (car buffer-and-process))
          (process (cdr buffer-and-process)))
     (puthash session-key process process-table)

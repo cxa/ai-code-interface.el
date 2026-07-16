@@ -32,6 +32,8 @@ a more stable viewing experience when working with multiple windows."
                   "ai-code-backends-infra" (str))
 (declare-function ai-code-backends-infra--sync-terminal-cursor
                   "ai-code-backends-infra" ())
+(declare-function ai-code-editor-viewport-filter-output
+                  "ai-code-editor-viewport-transport" (process output))
 (declare-function eat-term-send-string "eat" (&rest args))
 (declare-function eat-term-send-string-as-yank "eat" (&rest args))
 (declare-function eat--adjust-process-window-size "eat" (&rest args))
@@ -133,7 +135,7 @@ variables for the terminal process."
       (setq-local process-environment (append env-vars process-environment))
       (let ((default-directory working-dir))
         (eat-exec buffer buffer-name program nil args))
-      (when-let ((proc (get-buffer-process buffer)))
+      (when-let* ((proc (get-buffer-process buffer)))
         (let ((orig-filter (process-filter proc)))
           (set-process-filter
            proc
@@ -141,7 +143,9 @@ variables for the terminal process."
              (when (buffer-live-p buffer)
                (let ((filtered-output
                       (with-current-buffer buffer
-                        (ai-code-backends-infra--strip-alternate-screen-sequences output))))
+                        (ai-code-backends-infra--strip-alternate-screen-sequences
+                         (ai-code-editor-viewport-filter-output
+                          process output)))))
                  (when orig-filter
                    (funcall orig-filter process filtered-output))
                  (when (buffer-live-p buffer)

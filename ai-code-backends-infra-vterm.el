@@ -37,6 +37,8 @@
                   "ai-code-backends-infra" (str))
 (declare-function ai-code-backends-infra--sync-terminal-cursor
                   "ai-code-backends-infra" ())
+(declare-function ai-code-editor-viewport-filter-output
+                  "ai-code-editor-viewport-transport" (process output))
 (declare-function ai-code-notifications-response-ready
                   "ai-code-notifications" (&optional backend-name))
 (declare-function vterm "vterm" (&optional buffer-name))
@@ -212,19 +214,26 @@ If PASTE is non-nil, send it as a pasted string."
 When `ai-code-backends-infra-strip-alternate-screen' is non-nil,
 strip alternate screen buffer sequences from INPUT for PROCESS so that TUI
 applications write to the normal screen buffer (preserving scrollback)."
-  (let ((filtered-input
-         (if (ai-code-backends-infra--session-buffer-p (process-buffer process))
+  (let* ((session-p
+          (ai-code-backends-infra--session-buffer-p (process-buffer process)))
+         (editor-filtered-input
+          (if session-p
+              (ai-code-editor-viewport-filter-output process input)
+            input))
+         (filtered-input
+          (if session-p
              (with-current-buffer (process-buffer process)
                (ai-code-backends-infra--vterm-normalize-dim-sgr
-                (ai-code-backends-infra--strip-alternate-screen-sequences input)))
-           input)))
-    (when (ai-code-backends-infra--session-buffer-p (process-buffer process))
+                (ai-code-backends-infra--strip-alternate-screen-sequences
+                 editor-filtered-input)))
+           editor-filtered-input)))
+    (when session-p
       (with-current-buffer (process-buffer process)
         (when (ai-code-backends-infra--output-meaningful-p filtered-input)
           (ai-code-backends-infra--note-meaningful-output))))
     (prog1
         (funcall orig-fun process filtered-input)
-      (when (ai-code-backends-infra--session-buffer-p (process-buffer process))
+      (when session-p
         (ai-code-session-link--schedule-linkify-recent-output
          (process-buffer process)
          filtered-input)))))
