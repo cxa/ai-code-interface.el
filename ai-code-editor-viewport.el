@@ -32,12 +32,33 @@
 
 (defcustom ai-code-editor-viewport-window-placement 'below
   "Where to display an editor viewport relative to its originating session.
-Use `below' to keep the session visible above the viewport.  Use `replace' to
-show the viewport in the originating session window.  If `below' cannot make
-room for another window, the editor request fails instead of replacing the
-session window."
-  :type '(choice (const :tag "Below the current window" below)
+Use `below' to prefer a viewport below the session.  When that is impossible,
+try a viewport on the right, then on the left, and temporarily replace the
+session window only as a last resort.  Use `replace' to always show the
+viewport in the session window."
+  :type '(choice (const :tag "Below, right/left, then replace" below)
                  (const :tag "Replace the session window" replace))
+  :group 'ai-code)
+
+(defcustom ai-code-editor-viewport-window-height 12
+  "Target total height of an editor viewport displayed below its session.
+Below placement is attempted only when the originating window is at least
+twice this many lines high."
+  :type 'integer
+  :group 'ai-code)
+
+(defcustom ai-code-editor-viewport-min-height 8
+  "Minimum acceptable total height of a viewport displayed below.
+If the resulting editor viewport is shorter than this many lines, restore the
+window layout and try a side placement instead."
+  :type 'integer
+  :group 'ai-code)
+
+(defcustom ai-code-editor-viewport-min-width 24
+  "Minimum acceptable width of each window in a side-by-side layout.
+If either the editor viewport or its originating session is narrower than this
+many columns, restore the window layout and try the next placement instead."
+  :type 'integer
   :group 'ai-code)
 
 (defcustom ai-code-editor-viewport-submit-delay 0.2
@@ -74,6 +95,8 @@ the input view before AI Code sends the return key."
 
 (defvar-local ai-code-editor-viewport-source-cursor-function nil
   "Function returning the live terminal cursor position for this source.")
+
+(defvar recentf-exclude)
 
 (defun ai-code-editor-viewport-source-buffer (&optional viewport)
   "Return VIEWPORT's associated live CLI session buffer.
@@ -224,10 +247,11 @@ column.  Return the source column where the draft line begins."
         match-column))))
 
 (defun ai-code-editor-viewport--disable-source-input
-    (source-buffer &optional draft cursor-offset)
+    (source-buffer &optional draft cursor-offset placement)
   "Visually disable the current input line in SOURCE-BUFFER.
 When DRAFT and CURSOR-OFFSET are available, use them to find the input
-boundary without assuming a particular TUI prompt format.
+boundary without assuming a particular TUI prompt format.  PLACEMENT is the
+actual viewport placement used for this edit.
 Return the temporary overlay, or nil when SOURCE-BUFFER is no longer live."
   (when (buffer-live-p source-buffer)
     (with-current-buffer source-buffer
@@ -297,11 +321,13 @@ Return the temporary overlay, or nil when SOURCE-BUFFER is no longer live."
                   (list 'ai-code-editor-viewport-source-hint-face
                         source-face))))
                (message-text
-                (format (if (eq ai-code-editor-viewport-window-placement
-                                'replace)
-                            " Editing in current window — %s"
-                          " Editing in viewport below — %s")
-                        (ai-code-editor-viewport--source-hint-message)))
+                (format
+                 (pcase (or placement
+                            ai-code-editor-viewport-window-placement)
+                   ('replace " Editing in current window — %s")
+                   ('side " Editing in viewport beside — %s")
+                   (_ " Editing in viewport below — %s"))
+                 (ai-code-editor-viewport--source-hint-message)))
                (message
                 (propertize
                  (concat message-text
@@ -346,84 +372,171 @@ Return the temporary overlay, or nil when SOURCE-BUFFER is no longer live."
     (select-window window)
     (list :window window
           :previous-buffer previous-buffer
-          :created-window nil)))
+          :created-window nil
+          :placement 'replace)))
 
-(defun ai-code-editor-viewport--next-side-slot (anchor-window)
-  "Return a side-window slot geometrically below ANCHOR-WINDOW."
-  (let* ((frame (window-frame anchor-window))
-         (side (window-parameter anchor-window 'window-side))
-         (anchor-slot (window-parameter anchor-window 'window-slot))
-         (slots
-          (seq-keep
-           (lambda (window)
-             (when (eq (window-parameter window 'window-side) side)
-               (let ((slot (window-parameter window 'window-slot)))
-                 (and (numberp slot) slot))))
-           (window-list frame 'nomini))))
-    (1+ (apply #'max (cons (if (numberp anchor-slot) anchor-slot 0)
-                           slots)))))
+(defun ai-code-editor-viewport--run-display-action
+    (buffer anchor-window action &optional alist)
+  "Run ACTION for BUFFER from ANCHOR-WINDOW using only ALIST.
+Use a fully local `display-buffer' action chain so external actions and alists
+cannot alter the placement or use another frame.  Return the resulting window,
+or nil when ACTION cannot display BUFFER."
+  (with-selected-window anchor-window
+    (let ((display-buffer-alist nil)
+          (display-buffer-base-action nil)
+          (display-buffer-fallback-action nil)
+          (display-buffer-overriding-action
+           (cons
+            (list action #'display-buffer-no-window)
+            (append alist
+                    '((allow-no-window . t)
+                      (inhibit-same-window . t))))))
+      (display-buffer buffer nil (window-frame anchor-window)))))
+
+(defun ai-code-editor-viewport--split-normal-window
+    (buffer anchor-window size direction)
+  "Split ANCHOR-WINDOW by SIZE in DIRECTION and display BUFFER normally."
+  (let* ((ignore-window-parameters t)
+         (window (split-window anchor-window size direction)))
+    (set-window-buffer window buffer)
+    window))
 
 (defun ai-code-editor-viewport--display-below-action (buffer anchor-window)
-  "Display BUFFER below ANCHOR-WINDOW and return the resulting window."
-  (let ((side (window-parameter anchor-window 'window-side)))
-    (with-selected-window anchor-window
-      (if (memq side '(left right))
-          (display-buffer
-           buffer
-           `((display-buffer-in-side-window)
-             (side . ,side)
-             (slot . ,(ai-code-editor-viewport--next-side-slot
-                       anchor-window))
-             (inhibit-same-window . t)))
-        (display-buffer
-         buffer
-         '((display-buffer-below-selected)
-           (inhibit-same-window . t)))))))
+  "Display BUFFER below ANCHOR-WINDOW and return the resulting window.
+Split lateral side windows directly so the new viewport is a normal window,
+not another same-side sibling that layout transposition can detach."
+  (if (memq (window-parameter anchor-window 'window-side) '(left right))
+      (ai-code-editor-viewport--split-normal-window
+       buffer anchor-window (- ai-code-editor-viewport-window-height) 'below)
+    (ai-code-editor-viewport--run-display-action
+     buffer anchor-window #'display-buffer-below-selected
+     `((window-height . ,ai-code-editor-viewport-window-height)
+       (window-min-height . ,ai-code-editor-viewport-min-height)))))
 
-(defun ai-code-editor-viewport--display-below (buffer anchor-window)
-  "Display BUFFER below ANCHOR-WINDOW and return its display state."
-  (let* ((windows-before
+(defun ai-code-editor-viewport--display-side-action
+    (direction buffer anchor-window)
+  "Display BUFFER from ANCHOR-WINDOW in DIRECTION and return its window.
+Use a normal directional window rather than another window with the same
+`window-side', since layout transposition can detach same-side siblings from
+their required common parent.  Let Emacs split available space evenly instead
+of forcing the viewport to its minimum acceptable width."
+  (let ((anchor-side (window-parameter anchor-window 'window-side)))
+    (if (memq anchor-side '(top bottom left right))
+        (ai-code-editor-viewport--split-normal-window
+         buffer anchor-window nil direction)
+      (ai-code-editor-viewport--run-display-action
+       buffer anchor-window #'display-buffer-in-direction
+       `((direction . ,direction)
+         (window-min-width . ,ai-code-editor-viewport-min-width))))))
+
+(defun ai-code-editor-viewport--window-below-p (window anchor-window)
+  "Return non-nil when WINDOW fits below ANCHOR-WINDOW."
+  (and (>= (nth 1 (window-edges window))
+           (nth 3 (window-edges anchor-window)))
+       (>= (window-total-height window)
+           ai-code-editor-viewport-min-height)
+       (>= (window-total-height anchor-window)
+           ai-code-editor-viewport-min-height)))
+
+(defun ai-code-editor-viewport--side-windows-usable-p (window anchor-window)
+  "Return non-nil when WINDOW and ANCHOR-WINDOW are both wide enough."
+  (and (>= (window-total-width window)
+           ai-code-editor-viewport-min-width)
+       (>= (window-total-width anchor-window)
+           ai-code-editor-viewport-min-width)))
+
+(defun ai-code-editor-viewport--window-right-p (window anchor-window)
+  "Return non-nil when WINDOW fits right of a usable ANCHOR-WINDOW."
+  (and (>= (nth 0 (window-edges window))
+           (nth 2 (window-edges anchor-window)))
+       (ai-code-editor-viewport--side-windows-usable-p
+        window anchor-window)))
+
+(defun ai-code-editor-viewport--window-left-p (window anchor-window)
+  "Return non-nil when WINDOW fits left of a usable ANCHOR-WINDOW."
+  (and (<= (nth 2 (window-edges window))
+           (nth 0 (window-edges anchor-window)))
+       (ai-code-editor-viewport--side-windows-usable-p
+        window anchor-window)))
+
+(defun ai-code-editor-viewport--try-display
+    (buffer anchor-window action placement geometry-predicate)
+  "Try displaying BUFFER from ANCHOR-WINDOW with ACTION.
+PLACEMENT identifies the attempted placement.  GEOMETRY-PREDICATE must accept
+the resulting window and ANCHOR-WINDOW and confirm the requested geometry.
+Return display state on success, or nil after undoing a failed attempt."
+  (let* ((window-configuration
+          (current-window-configuration (window-frame anchor-window)))
+         (windows-before
           (mapcar
            (lambda (window)
              (cons window (window-buffer window)))
            (window-list (window-frame anchor-window) 'nomini)))
-         (viewport-window
-          (ai-code-editor-viewport--display-below-action
-           buffer anchor-window)))
+         viewport-window)
+    (condition-case nil
+        (setq viewport-window (funcall action buffer anchor-window))
+      (error
+       (set-window-configuration window-configuration)))
     (let ((previous (and (window-live-p viewport-window)
                          (assq viewport-window windows-before))))
       (if (and (window-live-p viewport-window)
                (not (eq viewport-window anchor-window))
                (eq (window-frame viewport-window)
                    (window-frame anchor-window))
-               (>= (nth 1 (window-edges viewport-window))
-                   (nth 3 (window-edges anchor-window))))
+               (eq (window-buffer viewport-window) buffer)
+               (or (not (eq placement 'side))
+                   (not previous))
+               (or (not (eq placement 'side))
+                   (<= (abs (- (window-total-width viewport-window)
+                               (window-total-width anchor-window)))
+                       1))
+               (funcall geometry-predicate viewport-window anchor-window))
           (progn
             (select-window viewport-window)
             (list :window viewport-window
                   :previous-buffer (cdr previous)
-                  :created-window (not previous)))
-        (when (and (window-live-p viewport-window)
-                   (eq (window-frame viewport-window)
-                       (window-frame anchor-window))
-                   (eq (window-buffer viewport-window) buffer))
-          (if previous
-              (set-window-buffer viewport-window (cdr previous))
-            (quit-window nil viewport-window)))
-        (user-error
-         "Cannot display AI Code editor viewport below the current window")))))
+                  :created-window (not previous)
+                  :placement placement))
+        (set-window-configuration window-configuration)
+        nil))))
 
-(defun ai-code-editor-viewport--display (buffer source-buffer)
+(defun ai-code-editor-viewport--display-with-fallbacks (buffer anchor-window)
+  "Display BUFFER from ANCHOR-WINDOW using the default fallback chain."
+  (or (and (>= (window-total-height anchor-window)
+               (* 2 ai-code-editor-viewport-window-height))
+           (ai-code-editor-viewport--try-display
+            buffer anchor-window
+            #'ai-code-editor-viewport--display-below-action
+            'below #'ai-code-editor-viewport--window-below-p))
+      (ai-code-editor-viewport--try-display
+       buffer anchor-window
+       (apply-partially
+        #'ai-code-editor-viewport--display-side-action 'right)
+       'side #'ai-code-editor-viewport--window-right-p)
+      (ai-code-editor-viewport--try-display
+       buffer anchor-window
+       (apply-partially
+        #'ai-code-editor-viewport--display-side-action 'left)
+       'side #'ai-code-editor-viewport--window-left-p)
+      (ai-code-editor-viewport--replace-window buffer anchor-window)))
+
+(defun ai-code-editor-viewport--display
+    (buffer source-buffer &optional origin-frame)
   "Display BUFFER as a viewport associated with SOURCE-BUFFER.
+ORIGIN-FRAME is the frame selected when the editor request was dispatched.
 Return a plist that records the window and its previous buffer."
-  (let* ((source-window (and (buffer-live-p source-buffer)
-                             (get-buffer-window source-buffer t)))
+  (let* ((origin-frame (if (frame-live-p origin-frame)
+                           origin-frame
+                         (selected-frame)))
+         (source-window (and (buffer-live-p source-buffer)
+                             (get-buffer-window source-buffer origin-frame)))
          (anchor-window (if (window-live-p source-window)
                             source-window
-                          (selected-window))))
+                          (frame-selected-window origin-frame))))
     (pcase ai-code-editor-viewport-window-placement
       ('below
-       (ai-code-editor-viewport--display-below buffer anchor-window))
+       (ai-code-editor-viewport--display-with-fallbacks
+        buffer anchor-window))
       ('replace
        (ai-code-editor-viewport--replace-window buffer anchor-window))
       (_
@@ -439,11 +552,16 @@ Return a plist that records the window and its previous buffer."
                (eq (window-buffer window) buffer))
       (cond
        (created-window
-       (quit-window nil window))
+        ;; Delete the exact viewport even after layout transposition moves it
+        ;; beside a side window, where `quit-window' may only change its buffer.
+        (let ((ignore-window-parameters t))
+          (if (eq (window-deletable-p window) t)
+              (delete-window window)
+            (quit-window nil window))))
        ((buffer-live-p previous-buffer)
         (set-window-buffer window previous-buffer))
-        (t
-         (quit-window nil window))))))
+       (t
+        (quit-window nil window))))))
 
 (defun ai-code-editor-viewport--buffer-text (buffer)
   "Return BUFFER's accessible text without properties."
@@ -538,10 +656,30 @@ Return a plist that records the window and its previous buffer."
               (ai-code-editor-viewport--draft-cursor-offset-at-source
                visible-draft cursor-position))))))))
 
-(defun ai-code-editor-viewport--make-buffer (file source-buffer)
-  "Return per-request editing state for FILE and SOURCE-BUFFER."
+(defmacro ai-code-editor-viewport--without-recentf-file (file &rest body)
+  "Run BODY without allowing `recentf' to record FILE."
+  (declare (indent 1) (debug (form body)))
+  (let ((excluded-file (make-symbol "excluded-file"))
+        (candidate (make-symbol "candidate")))
+    `(let* ((,excluded-file ,file)
+            (recentf-exclude
+             (cons
+              (lambda (,candidate)
+                (file-equal-p ,candidate ,excluded-file))
+              (and (boundp 'recentf-exclude) recentf-exclude))))
+       ,@body)))
+
+(defun ai-code-editor-viewport--make-buffer
+    (file source-buffer &optional staging-file-p)
+  "Return per-request editing state for FILE and SOURCE-BUFFER.
+When STAGING-FILE-P is non-nil, keep FILE out of `recentf'."
   (let* ((existing-base-buffer (find-buffer-visiting file))
-         (base-buffer (or existing-base-buffer (find-file-noselect file)))
+         (base-buffer
+          (or existing-base-buffer
+              (if staging-file-p
+                  (ai-code-editor-viewport--without-recentf-file file
+                    (find-file-noselect file))
+                (find-file-noselect file))))
          (owned-base-buffer (unless existing-base-buffer base-buffer))
          (snapshot (ai-code-editor-viewport--buffer-text base-buffer))
          (name (generate-new-buffer-name
@@ -567,8 +705,9 @@ Return a plist that records the window and its previous buffer."
           :snapshot snapshot)))
 
 (defun ai-code-editor-viewport--commit-buffer
-    (base-buffer viewport-buffer snapshot)
-  "Save VIEWPORT-BUFFER changes to BASE-BUFFER if it still matches SNAPSHOT."
+    (base-buffer viewport-buffer snapshot &optional staging-file-p)
+  "Save VIEWPORT-BUFFER changes to BASE-BUFFER if it still matches SNAPSHOT.
+When STAGING-FILE-P is non-nil, keep the saved file out of `recentf'."
   (unless (buffer-live-p base-buffer)
     (user-error "The file buffer was closed while its viewport was active"))
   (unless (equal snapshot
@@ -587,16 +726,23 @@ Return a plist that records the window and its previous buffer."
               (widen)
               (erase-buffer)
               (insert contents))
-            (save-buffer)
+            (if staging-file-p
+                (ai-code-editor-viewport--without-recentf-file buffer-file-name
+                  (save-buffer))
+              (save-buffer))
             (accept-change-group change-group)
             (setq change-group nil))
         (when change-group
           (cancel-change-group change-group))))))
 
-(defun ai-code-editor-viewport--edit-file (file source-buffer &optional line column)
+(defun ai-code-editor-viewport--edit-file
+    (file source-buffer &optional line column origin-frame staging-file-p)
   "Edit FILE in a viewport associated with SOURCE-BUFFER.
-LINE is one-based and COLUMN is zero-based, matching editor arguments."
-  (let* ((state (ai-code-editor-viewport--make-buffer file source-buffer))
+LINE is one-based and COLUMN is zero-based, matching editor arguments.
+ORIGIN-FRAME preserves the request's frame across deferred handling.  When
+STAGING-FILE-P is non-nil, keep FILE out of `recentf'."
+  (let* ((state (ai-code-editor-viewport--make-buffer
+                 file source-buffer staging-file-p))
          (base-buffer (plist-get state :base-buffer))
          (owned-base-buffer (plist-get state :owned-base-buffer))
          (buffer (plist-get state :viewport-buffer))
@@ -622,16 +768,18 @@ LINE is one-based and COLUMN is zero-based, matching editor arguments."
              (min (point-max)
                   (+ (point-min) source-cursor-offset)))))
           (setq display-state
-                (ai-code-editor-viewport--display buffer source-buffer))
+                (ai-code-editor-viewport--display
+                 buffer source-buffer origin-frame))
           (unwind-protect
               (progn
                 (setq source-input-overlay
                       (ai-code-editor-viewport--disable-source-input
-                       source-buffer snapshot source-cursor-offset))
+                       source-buffer snapshot source-cursor-offset
+                       (plist-get display-state :placement)))
                 (recursive-edit)
                 (when (eq ai-code-editor-viewport--outcome 'finished)
                   (ai-code-editor-viewport--commit-buffer
-                   base-buffer buffer snapshot)
+                   base-buffer buffer snapshot staging-file-p)
                   (setq finished t)))
             (when (overlayp source-input-overlay)
               (delete-overlay source-input-overlay))
@@ -673,26 +821,37 @@ Return plists containing :file, :line, and :column entries."
               next-column nil))))
     (nreverse files)))
 
-(defun ai-code-editor-viewport--edit-files (source-buffer directory file-arguments)
+(defun ai-code-editor-viewport--edit-files
+    (source-buffer directory file-arguments
+                   &optional origin-frame staging-request-p)
   "Edit FILE-ARGUMENTS for SOURCE-BUFFER relative to DIRECTORY.
+ORIGIN-FRAME preserves the request's frame across deferred handling.  When
+STAGING-REQUEST-P is non-nil, keep only requested files inside the directory
+named by variable `temporary-file-directory' out of `recentf'.
 Return non-nil only when every file was saved and finished."
   (when-let* ((files
                (ai-code-editor-viewport--parse-file-arguments
                 directory file-arguments)))
     (cl-every
      (lambda (file-request)
-       (ai-code-editor-viewport--edit-file
-        (plist-get file-request :file)
-        source-buffer
-        (plist-get file-request :line)
-        (plist-get file-request :column)))
+       (let* ((file (plist-get file-request :file))
+              (staging-file-p
+               (and staging-request-p
+                    (file-in-directory-p
+                     file temporary-file-directory))))
+         (ai-code-editor-viewport--edit-file
+          file source-buffer
+          (plist-get file-request :line)
+          (plist-get file-request :column)
+          origin-frame staging-file-p)))
      files)))
 
 ;;;; Terminal request protocol
 
 (defun ai-code-editor-viewport--decode-request (payload)
   "Decode terminal editor PAYLOAD into a request plist.
-The plist records the response file, directory, submit intent, and arguments."
+The plist records the response file, directory, submit and staging intent,
+and editor arguments."
   (let* ((decoded
           (decode-coding-string
            (base64-decode-string payload)
@@ -705,10 +864,25 @@ The plist records the response file, directory, submit intent, and arguments."
       (error "Malformed AI Code editor request"))
     (unless (member (nth 2 fields) '("0" "1"))
       (error "Invalid AI Code editor submit intent"))
-    (list :status-file (nth 0 fields)
-          :directory (nth 1 fields)
-          :submit-p (string= (nth 2 fields) "1")
-          :arguments (nthcdr 3 fields))))
+    (let* ((versioned-request-p
+            (equal (nth 3 fields)
+                   ai-code-editor-viewport--request-version))
+           (request-kind (and versioned-request-p (nth 4 fields))))
+      (when (and versioned-request-p
+                 (not (member request-kind '("regular" "staging"))))
+        (error "Invalid AI Code editor request kind"))
+      (list :status-file (nth 0 fields)
+            :directory (nth 1 fields)
+            :submit-p (string= (nth 2 fields) "1")
+            :staging-request-p
+            (if versioned-request-p
+                (equal request-kind "staging")
+              ;; Old helpers only distinguished general editor requests by
+              ;; their submit intent; preserve staging hygiene for those.
+              (string= (nth 2 fields) "1"))
+            ;; Accept payloads from helpers generated before versioned request
+            ;; kinds were added.  Newly generated helpers are explicit.
+            :arguments (nthcdr (if versioned-request-p 5 3) fields)))))
 
 (defun ai-code-editor-viewport--valid-status-file-p (file)
   "Return non-nil when FILE is a helper-created response file."
@@ -775,10 +949,11 @@ The plist records the response file, directory, submit intent, and arguments."
                  #'ai-code-editor-viewport--submit-source-buffer
                  source-buffer)))
 
-(defun ai-code-editor-viewport--open-request (source-buffer payload)
+(defun ai-code-editor-viewport--open-request
+    (source-buffer payload &optional origin-frame)
   "Open terminal editor PAYLOAD for SOURCE-BUFFER in a viewport.
 PAYLOAD contains a response file, working directory, submit intent, and
-editor arguments.
+editor arguments.  ORIGIN-FRAME is the frame selected at dispatch time.
 Return non-nil after saving every requested file."
   (let (status-file completed succeeded submit-p submit-token)
     (unwind-protect
@@ -794,7 +969,8 @@ Return non-nil after saving every requested file."
               (setq status-file (plist-get request :status-file))
               (setq succeeded
                     (ai-code-editor-viewport--edit-files
-                     source-buffer directory arguments))
+                     source-buffer directory arguments origin-frame
+                     (plist-get request :staging-request-p)))
               (setq submit-p
                     (and (plist-get request :submit-p)
                          succeeded

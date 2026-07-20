@@ -11,7 +11,10 @@
 
 (require 'ert)
 (require 'cl-lib)
+(require 'recentf)
 (require 'ai-code-editor-viewport)
+
+(declare-function window-layout-transpose "window-x" (&optional window))
 
 (cl-defmacro ai-code-editor-viewport-test--with-buffer
     ((buffer name) &rest body)
@@ -21,6 +24,42 @@
      (rename-buffer (generate-new-buffer-name ,name))
      (let ((,buffer (current-buffer)))
        ,@body)))
+
+(defun ai-code-editor-viewport-test--display-from-lateral-side
+    (side source-buffer viewport-buffer &optional width)
+  "Display VIEWPORT-BUFFER from a SIDE SOURCE-BUFFER fixture.
+Give the source side window WIDTH columns, defaulting to 40."
+  (let* ((ai-code-editor-viewport-window-placement 'below)
+         (window-sides-slots '(nil nil nil nil))
+         (source-window
+          (display-buffer-in-side-window
+           source-buffer
+           `((side . ,side)
+             (slot . 0)
+             (window-width . ,(or width 40))
+             (preserve-size . (t . nil))
+             (window-parameters
+              . ((no-delete-other-windows . t)
+                 (window-size-fixed . width))))))
+         (source-height (window-total-height source-window))
+         (source-width (window-total-width source-window))
+         (main-window (window-main-window))
+         (main-buffer (window-buffer main-window))
+         (display-state
+          (ai-code-editor-viewport--display viewport-buffer source-buffer)))
+    (list :source-window source-window
+          :source-height source-height
+          :source-width source-width
+          :main-window main-window
+          :main-buffer main-buffer
+          :display-state display-state
+          :viewport-window (plist-get display-state :window))))
+
+(defun ai-code-editor-viewport-test--transpose-parent-if-supported (window)
+  "Transpose WINDOW's parent when the current Emacs provides `window-x'."
+  (when (require 'window-x nil t)
+    (let ((ignore-window-parameters t))
+      (window-layout-transpose (window-parent window)))))
 
 (ert-deftest test-ai-code-editor-viewport--mode-uses-one-yank-key ()
   "Viewport users should paste every supported clipboard type with `C-y'."
@@ -224,6 +263,96 @@
           (kill-buffer buffer))
         (delete-directory directory t)))))
 
+(defun ai-code-editor-viewport-test--temporary-file-recorded-in-recentf-p
+    (finish-p staging-request-p &optional project-file-p)
+  "Return non-nil when an editor file enters `recentf'.
+When FINISH-P is non-nil, finish and save the edit; otherwise cancel it.
+STAGING-REQUEST-P is the request's explicit staging marker.  When
+PROJECT-FILE-P is non-nil, place the file outside the configured temporary
+directory."
+  (ai-code-editor-viewport-test--with-buffer
+      (source-buffer "*ai-code-editor-recentf-source*")
+    (let* ((root (make-temp-file "ai-code-editor-recentf-" t))
+           (staging-directory (expand-file-name "staging/" root))
+           (project-directory (expand-file-name "project/" root))
+           (_ (make-directory staging-directory))
+           (_ (make-directory project-directory))
+           (temporary-file-directory
+            (file-name-as-directory staging-directory))
+           (directory (if project-file-p
+                          project-directory
+                        staging-directory))
+           (file (expand-file-name ".tmpABC123.md" directory))
+           (recentf-list nil)
+           (find-file-hook
+            (cons #'recentf-track-opened-file find-file-hook))
+           (write-file-functions
+            (if finish-p
+                (cons #'recentf-track-opened-file write-file-functions)
+              write-file-functions)))
+      (unwind-protect
+          (progn
+            (with-temp-file file
+              (insert "draft"))
+            (cl-letf (((symbol-function 'ai-code-editor-viewport--display)
+                       (lambda (&rest _args) nil))
+                      ((symbol-function 'recursive-edit)
+                       (lambda ()
+                         (if finish-p
+                             (ai-code-editor-viewport-finish)
+                           (ai-code-editor-viewport-cancel))))
+                      ((symbol-function 'exit-recursive-edit)
+                       (lambda () nil)))
+              (should
+               (eq (not (null
+                         (ai-code-editor-viewport--edit-files
+                          source-buffer directory (list file)
+                          nil staging-request-p)))
+                   finish-p)))
+            (member (file-truename file)
+                    (mapcar #'file-truename recentf-list)))
+        (when-let* ((buffer (get-file-buffer file)))
+          (kill-buffer buffer))
+        (delete-directory root t)))))
+
+(ert-deftest test-ai-code-editor-viewport--edit-files-excludes-temporary-file-from-recentf ()
+  "Canceling a temporary editor file should not record it in `recentf'."
+  (should-not
+   (ai-code-editor-viewport-test--temporary-file-recorded-in-recentf-p
+    nil t)))
+
+(ert-deftest test-ai-code-editor-viewport--edit-files-keeps-saved-temporary-file-out-of-recentf ()
+  "Saving a temporary editor file should not record it in `recentf'."
+  (should-not
+   (ai-code-editor-viewport-test--temporary-file-recorded-in-recentf-p
+    t t)))
+
+(ert-deftest test-ai-code-editor-viewport--edit-files-records-normal-file-in-recentf ()
+  "A normal file opened through the viewport should still enter `recentf'."
+  (should
+   (ai-code-editor-viewport-test--temporary-file-recorded-in-recentf-p
+    nil nil)))
+
+(ert-deftest test-ai-code-editor-viewport--staging-request-records-project-file ()
+  "A project file should enter `recentf' even for a staging request."
+  (should
+   (ai-code-editor-viewport-test--temporary-file-recorded-in-recentf-p
+    nil t t)))
+
+(ert-deftest test-ai-code-editor-viewport--without-recentf-file-preserves-bindings ()
+  "The recentf guard should preserve caller bindings and exclusions."
+  (let* ((excluded-file 'caller-value)
+         (original-exclusions (list "keep-this-exclusion"))
+         (recentf-exclude original-exclusions)
+         exclusions-inside)
+    (should
+     (eq (ai-code-editor-viewport--without-recentf-file "ignored-file"
+           (setq exclusions-inside recentf-exclude)
+           excluded-file)
+         'caller-value))
+    (should (eq (cdr exclusions-inside) original-exclusions))
+    (should (eq recentf-exclude original-exclusions))))
+
 (ert-deftest test-ai-code-editor-viewport--edit-files-disables-source-input ()
   "An active viewport should replace the source input only visually."
   (ai-code-editor-viewport-test--with-buffer
@@ -339,6 +468,25 @@
                    " C-c C-c: submit, C-g/C-c C-k: cancel")))
         (delete-overlay overlay)))))
 
+(ert-deftest test-ai-code-editor-viewport--disable-source-input-describes-side-window ()
+  "The source hint should describe a viewport beside its source window."
+  (ai-code-editor-viewport-test--with-buffer
+      (source-buffer "*codex[side hint]*")
+    (insert "› prompt")
+    (goto-char (point-min))
+    (forward-char 2)
+    (let* ((overlay
+            (ai-code-editor-viewport--disable-source-input
+             source-buffer nil nil 'side))
+           (display (get-char-property (point) 'display)))
+      (unwind-protect
+          (should
+           (equal (substring-no-properties display)
+                  (concat
+                   " Editing in viewport beside —"
+                   " C-c C-c: submit, C-g/C-c C-k: cancel")))
+        (delete-overlay overlay)))))
+
 (ert-deftest test-ai-code-editor-viewport--disable-source-input-uses-current-bindings ()
   "The source hint should reflect the viewport mode's current bindings."
   (ai-code-editor-viewport-test--with-buffer
@@ -401,27 +549,68 @@
     (let* ((status-file (make-temp-file "ai-code-editor-status-"))
            (directory "/tmp/project with spaces/")
            (arguments '("+12:3" "draft's prompt.md"))
-           (fields (append (list status-file directory "1") arguments))
+           (fields
+            (append
+             (list status-file directory "1"
+                   ai-code-editor-viewport--request-version "staging")
+             arguments))
            (payload
             (base64-encode-string
              (concat (mapconcat #'identity fields "\0") "\0")
              t))
+           (origin-frame (selected-frame))
            captured)
       (unwind-protect
           (cl-letf (((symbol-function 'ai-code-editor-viewport--edit-files)
-                     (lambda (source seen-directory seen-arguments)
+                     (lambda (source seen-directory seen-arguments
+                              &optional seen-frame staging-request-p)
                        (setq captured
-                             (list source seen-directory seen-arguments))
+                             (list source seen-directory seen-arguments
+                                   seen-frame staging-request-p))
                        t)))
             (should (ai-code-editor-viewport--open-request
-                     source-buffer payload))
+                     source-buffer payload origin-frame))
             (should (equal captured
-                           (list source-buffer directory arguments)))
+                           (list source-buffer directory arguments
+                                 origin-frame t)))
             (with-temp-buffer
               (insert-file-contents status-file)
               (should (equal (buffer-string) "0\n"))))
         (when (file-exists-p status-file)
           (delete-file status-file))))))
+
+(ert-deftest test-ai-code-editor-viewport--decode-request-accepts-legacy-staging-name ()
+  "An old payload may use `staging' as an ordinary first file name."
+  (let* ((fields '("/tmp/status" "/tmp/project" "0" "staging"))
+         (payload
+          (base64-encode-string
+           (concat (mapconcat #'identity fields "\0") "\0") t))
+         (request (ai-code-editor-viewport--decode-request payload)))
+    (should-not (plist-get request :staging-request-p))
+    (should (equal (plist-get request :arguments) '("staging")))))
+
+(ert-deftest test-ai-code-editor-viewport--decode-request-preserves-legacy-staging ()
+  "An old submitting helper should retain staging-file hygiene."
+  (let* ((fields '("/tmp/status" "/tmp/project" "1" "prompt.md"))
+         (payload
+          (base64-encode-string
+           (concat (mapconcat #'identity fields "\0") "\0") t))
+         (request (ai-code-editor-viewport--decode-request payload)))
+    (should (plist-get request :staging-request-p))
+    (should (equal (plist-get request :arguments) '("prompt.md")))))
+
+(ert-deftest test-ai-code-editor-viewport--decode-request-rejects-invalid-kind ()
+  "A versioned payload should reject an unknown request kind."
+  (let* ((fields
+          (list "/tmp/status" "/tmp/project" "0"
+                ai-code-editor-viewport--request-version "unknown"
+                "prompt.md"))
+         (payload
+          (base64-encode-string
+           (concat (mapconcat #'identity fields "\0") "\0") t)))
+    (should-error
+     (ai-code-editor-viewport--decode-request payload)
+     :type 'error)))
 
 (ert-deftest test-ai-code-editor-viewport--open-request-finish-requests-submit ()
   "Finishing should tell the helper to submit after releasing the terminal."
@@ -681,70 +870,460 @@
       (delete-directory helper-directory t)
       (delete-directory other-directory t))))
 
+(ert-deftest test-ai-code-editor-viewport--try-display-rejects-reused-side-window ()
+  "Side placement should create a window instead of reusing a neighbor."
+  (ai-code-editor-viewport-test--with-buffer
+      (source-buffer "*ai-code-editor-reuse-source*")
+    (ai-code-editor-viewport-test--with-buffer
+        (neighbor-buffer "*ai-code-editor-reuse-neighbor*")
+      (ai-code-editor-viewport-test--with-buffer
+          (viewport-buffer "*ai-code-editor-reuse-viewport*")
+        (save-window-excursion
+          (delete-other-windows)
+          (switch-to-buffer source-buffer)
+          (let* ((anchor-window (selected-window))
+                 (neighbor-window (split-window-right)))
+            (set-window-buffer neighbor-window neighbor-buffer)
+            (should-not
+             (ai-code-editor-viewport--try-display
+              viewport-buffer anchor-window
+              (lambda (buffer _anchor)
+                (set-window-buffer neighbor-window buffer)
+                neighbor-window)
+              'side #'ai-code-editor-viewport--window-right-p))
+            (should (window-live-p neighbor-window))
+            (should (eq (window-buffer neighbor-window) neighbor-buffer))
+            (should-not (get-buffer-window viewport-buffer t))))))))
+
+(ert-deftest test-ai-code-editor-viewport--try-display-rejects-unbalanced-side-window ()
+  "Side placement should reject a newly split but unbalanced layout."
+  (ai-code-editor-viewport-test--with-buffer
+      (source-buffer "*ai-code-editor-unbalanced-source*")
+    (ai-code-editor-viewport-test--with-buffer
+        (viewport-buffer "*ai-code-editor-unbalanced-viewport*")
+      (save-window-excursion
+        (delete-other-windows)
+        (switch-to-buffer source-buffer)
+        (let* ((anchor-window (selected-window))
+               (minimum-width ai-code-editor-viewport-min-width))
+          (should (>= (window-total-width anchor-window)
+                      (+ (* 2 minimum-width) 2)))
+          (should-not
+           (ai-code-editor-viewport--try-display
+            viewport-buffer anchor-window
+            (lambda (buffer anchor)
+              (ai-code-editor-viewport--split-normal-window
+               buffer anchor minimum-width 'right))
+            'side #'ai-code-editor-viewport--window-right-p))
+          (should (= (length (window-list)) 1))
+          (should (eq (window-buffer anchor-window) source-buffer))
+          (should-not (get-buffer-window viewport-buffer t)))))))
+
 (ert-deftest test-ai-code-editor-viewport--display-defaults-below-source-window ()
-  "A viewport should open below its visible source window by default."
+  "The default setup should prefer a viewport below the source window."
   (should (eq (default-value 'ai-code-editor-viewport-window-placement)
               'below))
   (ai-code-editor-viewport-test--with-buffer
       (source-buffer "*ai-code-editor-below-source*")
     (ai-code-editor-viewport-test--with-buffer
         (viewport-buffer "*ai-code-editor-below-viewport*")
+      (ai-code-editor-viewport-test--with-buffer
+          (other-buffer "*ai-code-editor-below-other*")
+        (save-window-excursion
+          (delete-other-windows)
+          (switch-to-buffer source-buffer)
+          (let* ((source-window (selected-window))
+                 (other-window (split-window-right))
+                 (source-height (window-total-height source-window)))
+            (set-window-buffer other-window other-buffer)
+            (let* ((ai-code-editor-viewport-window-height
+                    (/ source-height 2))
+                   (display-state
+                    (ai-code-editor-viewport--display
+                     viewport-buffer source-buffer))
+                   (viewport-window (plist-get display-state :window)))
+              (should (window-live-p viewport-window))
+              (should-not (eq viewport-window source-window))
+              (should (eq (plist-get display-state :placement) 'below))
+              (should (eq (window-buffer source-window) source-buffer))
+              (should (eq (window-buffer viewport-window) viewport-buffer))
+              (should (>= (window-total-height source-window)
+                          ai-code-editor-viewport-min-height))
+              (should (>= (window-total-height viewport-window)
+                          ai-code-editor-viewport-min-height))
+              (should (= (window-total-height viewport-window)
+                         ai-code-editor-viewport-window-height))
+              (should (>= (nth 1 (window-edges viewport-window))
+                          (nth 3 (window-edges source-window))))
+              (should (= (length (window-list)) 3))
+              (ai-code-editor-viewport--restore-window
+               display-state viewport-buffer)
+              (should (= (length (window-list)) 2))
+              (should (eq (window-buffer source-window) source-buffer))
+              (should (eq (window-buffer other-window) other-buffer))
+              (should (eq (selected-window) source-window))
+              (should-not (get-buffer-window viewport-buffer t)))))))))
+
+(ert-deftest test-ai-code-editor-viewport--display-defaults-to-usable-dimensions ()
+  "Viewport placement should default to usable minimum dimensions."
+  (should (= (default-value 'ai-code-editor-viewport-window-height) 12))
+  (should (= (* 2 (default-value 'ai-code-editor-viewport-window-height)) 24))
+  (should (= (default-value 'ai-code-editor-viewport-min-height) 8))
+  (should (= (default-value 'ai-code-editor-viewport-min-width) 24)))
+
+(ert-deftest test-ai-code-editor-viewport--display-accepts-eight-line-minimum ()
+  "Below placement should accept eight lines but reject seven."
+  (ai-code-editor-viewport-test--with-buffer
+      (source-buffer "*ai-code-editor-min-height-source*")
+    (ai-code-editor-viewport-test--with-buffer
+        (viewport-buffer "*ai-code-editor-min-height-viewport*")
+      (dolist (height '(7 8))
+        (save-window-excursion
+          (delete-other-windows)
+          (switch-to-buffer source-buffer)
+          (let* ((source-height (window-total-height))
+                 (ai-code-editor-viewport-window-height
+                  (/ source-height 2))
+                 (ai-code-editor-viewport-min-width 20)
+                 display-state)
+            (cl-letf
+                (((symbol-function
+                   'ai-code-editor-viewport--display-below-action)
+                  (lambda (buffer anchor-window)
+                    (let ((window
+                           (split-window anchor-window (- height) 'below)))
+                      (set-window-buffer window buffer)
+                      window))))
+              (setq display-state
+                    (ai-code-editor-viewport--display
+                     viewport-buffer source-buffer)))
+            (if (= height 8)
+                (should (eq (plist-get display-state :placement) 'below))
+              (should-not (eq (plist-get display-state :placement) 'below)))
+            (ai-code-editor-viewport--restore-window
+             display-state viewport-buffer)))))))
+
+(ert-deftest test-ai-code-editor-viewport--display-uses-side-for-short-window ()
+  "A ten-line source should preserve its height with a side viewport."
+  (ai-code-editor-viewport-test--with-buffer
+      (source-buffer "*ai-code-editor-short-source*")
+    (ai-code-editor-viewport-test--with-buffer
+        (viewport-buffer "*ai-code-editor-short-viewport*")
+      (ai-code-editor-viewport-test--with-buffer
+          (other-buffer "*ai-code-editor-short-other*")
+        (save-window-excursion
+          (delete-other-windows)
+          (switch-to-buffer source-buffer)
+          (let* ((source-window (selected-window))
+                 (other-window (split-window source-window 10 'below)))
+            (set-window-buffer other-window other-buffer)
+            (should (= (window-total-height source-window) 10))
+            (let* ((display-state
+                    (ai-code-editor-viewport--display
+                     viewport-buffer source-buffer))
+                   (viewport-window (plist-get display-state :window)))
+              (should (eq (plist-get display-state :placement) 'side))
+              (should (>= (window-total-width source-window) 24))
+              (should (>= (window-total-width viewport-window) 24))
+              (should (<= (abs (- (window-total-width source-window)
+                                  (window-total-width viewport-window)))
+                          1))
+              (should (= (window-total-height source-window) 10))
+              (should (= (window-total-height viewport-window) 10))
+              (ai-code-editor-viewport--restore-window
+               display-state viewport-buffer)
+              (should (window-live-p source-window))
+              (should (window-live-p other-window))
+              (should-not (get-buffer-window viewport-buffer t)))))))))
+
+(ert-deftest test-ai-code-editor-viewport--display-replaces-narrow-source ()
+  "Side placement should not squeeze a narrow source to make the viewport fit."
+  (ai-code-editor-viewport-test--with-buffer
+      (source-buffer "*ai-code-editor-narrow-source*")
+    (ai-code-editor-viewport-test--with-buffer
+        (viewport-buffer "*ai-code-editor-narrow-viewport*")
+      (ai-code-editor-viewport-test--with-buffer
+          (other-buffer "*ai-code-editor-narrow-other*")
+        (save-window-excursion
+          (delete-other-windows)
+          (switch-to-buffer source-buffer)
+          (let* ((source-window (selected-window))
+                 (right-window (split-window source-window 33 'right))
+                 (bottom-window (split-window source-window 10 'below)))
+            (set-window-buffer right-window other-buffer)
+            (set-window-buffer bottom-window other-buffer)
+            (let* ((display-state
+                    (ai-code-editor-viewport--display
+                     viewport-buffer source-buffer))
+                   (viewport-window (plist-get display-state :window)))
+              (should (eq (plist-get display-state :placement) 'replace))
+              (should (eq viewport-window source-window))
+              (should (= (window-total-width source-window) 33))
+              (should (eq (window-buffer source-window) viewport-buffer))
+              (should (eq (window-buffer right-window) other-buffer))
+              (should (eq (window-buffer bottom-window) other-buffer))
+              (ai-code-editor-viewport--restore-window
+               display-state viewport-buffer)
+              (should (eq (window-buffer source-window)
+                          source-buffer)))))))))
+
+(ert-deftest test-ai-code-editor-viewport--display-replaces-narrow-lateral-source ()
+  "Side placement should reject a usable viewport beside a narrow side source."
+  (ai-code-editor-viewport-test--with-buffer
+      (source-buffer "*ai-code-editor-narrow-side-source*")
+    (ai-code-editor-viewport-test--with-buffer
+        (viewport-buffer "*ai-code-editor-narrow-side-viewport*")
+      (save-window-excursion
+        (delete-other-windows)
+        (let* ((ai-code-editor-viewport-window-height 13)
+               (fixture
+                (ai-code-editor-viewport-test--display-from-lateral-side
+                 'right source-buffer viewport-buffer 20))
+               (source-window (plist-get fixture :source-window))
+               (source-height (plist-get fixture :source-height))
+               (main-window (plist-get fixture :main-window))
+               (main-buffer (plist-get fixture :main-buffer))
+               (display-state (plist-get fixture :display-state))
+               (viewport-window (plist-get fixture :viewport-window)))
+          (should (< source-height
+                     (* 2 ai-code-editor-viewport-window-height)))
+          (should (= (window-total-width source-window) 20))
+          (should (eq (plist-get display-state :placement) 'replace))
+          (should (eq viewport-window source-window))
+          (ai-code-editor-viewport--restore-window
+           display-state viewport-buffer)
+          (should (eq (window-buffer source-window) source-buffer))
+          (should (eq (window-parameter source-window 'window-side) 'right))
+          (should (window-live-p main-window))
+          (should (eq (window-buffer main-window) main-buffer)))))))
+
+(ert-deftest test-ai-code-editor-viewport--display-side-from-wide-lateral-side-uses-normal-window ()
+  "A short wide lateral session should use a restorable normal side window."
+  (ai-code-editor-viewport-test--with-buffer
+      (source-buffer "*ai-code-editor-wide-lateral-source*")
+    (ai-code-editor-viewport-test--with-buffer
+        (viewport-buffer "*ai-code-editor-wide-lateral-viewport*")
+      (dolist (side '(left right))
+        (save-window-excursion
+          (delete-other-windows)
+          (let* ((ai-code-editor-viewport-window-height 13)
+                 (fixture
+                  (ai-code-editor-viewport-test--display-from-lateral-side
+                   side source-buffer viewport-buffer 55))
+                 (source-window (plist-get fixture :source-window))
+                 (source-height (plist-get fixture :source-height))
+                 (source-width (plist-get fixture :source-width))
+                 (main-window (plist-get fixture :main-window))
+                 (main-buffer (plist-get fixture :main-buffer))
+                 (display-state (plist-get fixture :display-state))
+                 (viewport-window (plist-get fixture :viewport-window)))
+            (should (< source-height
+                       (* 2 ai-code-editor-viewport-window-height)))
+            (should (>= source-width
+                        (* 2 ai-code-editor-viewport-min-width)))
+            (should (eq (plist-get display-state :placement) 'side))
+            (should (window-live-p viewport-window))
+            (should-not (eq viewport-window source-window))
+            (should (eq (window-parameter source-window 'window-side) side))
+            (should-not (window-parameter viewport-window 'window-side))
+            (should (>= (window-total-width source-window)
+                        ai-code-editor-viewport-min-width))
+            (should (>= (window-total-width viewport-window)
+                        ai-code-editor-viewport-min-width))
+            (should (<= (abs (- (window-total-width source-window)
+                                (window-total-width viewport-window)))
+                        1))
+            (should (>= (nth 0 (window-edges viewport-window))
+                        (nth 2 (window-edges source-window))))
+            (window--check)
+            (ai-code-editor-viewport-test--transpose-parent-if-supported
+             viewport-window)
+            (window--check)
+            (ai-code-editor-viewport--restore-window
+             display-state viewport-buffer)
+            (window--check)
+            (should (window-live-p source-window))
+            (should (eq (window-buffer source-window) source-buffer))
+            (should (eq (window-parameter source-window 'window-side) side))
+            (should (window-live-p main-window))
+            (should (eq (window-buffer main-window) main-buffer))
+            (should-not (get-buffer-window viewport-buffer t))))))))
+
+(ert-deftest test-ai-code-editor-viewport--display-uses-right-when-below-unavailable ()
+  "A viewport should use the right side when below placement is unavailable."
+  (ai-code-editor-viewport-test--with-buffer
+      (source-buffer "*ai-code-editor-right-source*")
+    (ai-code-editor-viewport-test--with-buffer
+        (viewport-buffer "*ai-code-editor-right-viewport*")
       (save-window-excursion
         (delete-other-windows)
         (switch-to-buffer source-buffer)
-        (let* ((source-window (selected-window))
-               (display-state
-                (ai-code-editor-viewport--display
-                 viewport-buffer source-buffer))
-               (viewport-window (plist-get display-state :window)))
-          (should (window-live-p viewport-window))
-          (should-not (eq viewport-window source-window))
-          (should (eq (window-buffer source-window) source-buffer))
-          (should (eq (window-buffer viewport-window) viewport-buffer))
-          (should (>= (nth 1 (window-edges viewport-window))
-                      (nth 3 (window-edges source-window))))
-          (ai-code-editor-viewport--restore-window
-           display-state viewport-buffer)
-          (should (window-live-p source-window))
-          (should-not (window-live-p viewport-window)))))))
+        (let* ((ai-code-editor-viewport-window-placement 'below)
+               (source-window (selected-window))
+               display-state)
+          (cl-letf
+              (((symbol-function
+                 'ai-code-editor-viewport--display-below-action)
+                (lambda (&rest _args) nil)))
+            (setq display-state
+                  (ai-code-editor-viewport--display
+                   viewport-buffer source-buffer)))
+          (let ((viewport-window (plist-get display-state :window)))
+            (should (eq (plist-get display-state :placement) 'side))
+            (should (window-live-p viewport-window))
+            (should (>= (window-total-width source-window)
+                        ai-code-editor-viewport-min-width))
+            (should (>= (window-total-width viewport-window)
+                        ai-code-editor-viewport-min-width))
+            (should (<= (abs (- (window-total-width source-window)
+                                (window-total-width viewport-window)))
+                        1))
+            (should (>= (nth 0 (window-edges viewport-window))
+                        (nth 2 (window-edges source-window))))
+            (ai-code-editor-viewport--restore-window
+             display-state viewport-buffer)
+            (should (window-live-p source-window))
+            (should-not (get-buffer-window viewport-buffer t))))))))
 
-(ert-deftest test-ai-code-editor-viewport--display-opens-below-side-window ()
-  "A viewport should open below an AI session shown in a side window."
+(ert-deftest test-ai-code-editor-viewport--display-uses-below-for-tall-lateral-window ()
+  "A tall lateral side session should display its viewport below."
   (ai-code-editor-viewport-test--with-buffer
       (source-buffer "*ai-code-editor-side-source*")
     (ai-code-editor-viewport-test--with-buffer
         (viewport-buffer "*ai-code-editor-side-viewport*")
+      (dolist (side '(left right))
+        (save-window-excursion
+          (delete-other-windows)
+          (let* ((ai-code-editor-viewport-window-height 11)
+                 (fixture
+                  (ai-code-editor-viewport-test--display-from-lateral-side
+                   side source-buffer viewport-buffer))
+                 (source-window (plist-get fixture :source-window))
+                 (source-height (plist-get fixture :source-height))
+                 (main-window (plist-get fixture :main-window))
+                 (main-buffer (plist-get fixture :main-buffer))
+                 (display-state (plist-get fixture :display-state))
+                 (viewport-window (plist-get fixture :viewport-window)))
+            (should (>= source-height
+                        (* 2 ai-code-editor-viewport-window-height)))
+            (should (window-live-p viewport-window))
+            (should-not (eq viewport-window source-window))
+            (should (eq (plist-get display-state :placement) 'below))
+            (should (eq (window-buffer source-window) source-buffer))
+            (should (eq (window-buffer viewport-window) viewport-buffer))
+            (should (>= (window-total-height source-window)
+                        ai-code-editor-viewport-min-height))
+            (should (>= (window-total-height viewport-window)
+                        ai-code-editor-viewport-min-height))
+            (should (= (window-total-height viewport-window)
+                       ai-code-editor-viewport-window-height))
+            (should (= (nth 0 (window-edges viewport-window))
+                       (nth 0 (window-edges source-window))))
+            (should (= (nth 2 (window-edges viewport-window))
+                       (nth 2 (window-edges source-window))))
+            (should (>= (nth 1 (window-edges viewport-window))
+                        (nth 3 (window-edges source-window))))
+            (ai-code-editor-viewport--restore-window
+             display-state viewport-buffer)
+            (should (window-live-p source-window))
+            (should (window-live-p main-window))
+            (should (eq (window-buffer main-window) main-buffer))
+            (should-not (get-buffer-window viewport-buffer t))))))))
+
+(ert-deftest test-ai-code-editor-viewport--display-replaces-narrow-lateral-window ()
+  "A short lateral session should replace when a balanced side cannot fit."
+  (ai-code-editor-viewport-test--with-buffer
+      (source-buffer "*ai-code-editor-short-side-source*")
+    (ai-code-editor-viewport-test--with-buffer
+        (viewport-buffer "*ai-code-editor-short-side-viewport*")
+      (dolist (side '(left right))
+        (save-window-excursion
+          (delete-other-windows)
+          (let* ((ai-code-editor-viewport-window-height 13)
+                 (fixture
+                  (ai-code-editor-viewport-test--display-from-lateral-side
+                   side source-buffer viewport-buffer))
+                 (source-window (plist-get fixture :source-window))
+                 (source-height (plist-get fixture :source-height))
+                 (source-width (window-total-width source-window))
+                 (main-window (plist-get fixture :main-window))
+                 (main-buffer (plist-get fixture :main-buffer))
+                 (display-state (plist-get fixture :display-state))
+                 (viewport-window (plist-get fixture :viewport-window)))
+            (should (< source-height
+                       (* 2 ai-code-editor-viewport-window-height)))
+            (should (< source-width
+                       (* 2 ai-code-editor-viewport-min-width)))
+            (should (eq (plist-get display-state :placement) 'replace))
+            (should (eq viewport-window source-window))
+            (should (= (window-total-width source-window) source-width))
+            (should (eq (window-buffer source-window) viewport-buffer))
+            (ai-code-editor-viewport--restore-window
+             display-state viewport-buffer)
+            (should (window-live-p source-window))
+            (should (eq (window-buffer source-window) source-buffer))
+            (should (eq (window-parameter source-window 'window-side) side))
+            (should (window-live-p main-window))
+            (should (eq (window-buffer main-window) main-buffer))
+            (should-not (get-buffer-window viewport-buffer t))))))))
+
+(ert-deftest test-ai-code-editor-viewport--restore-created-sole-window-hides-viewport ()
+  "Restoring a sole created window should hide the viewport without error."
+  (ai-code-editor-viewport-test--with-buffer
+      (source-buffer "*ai-code-editor-sole-source*")
+    (ai-code-editor-viewport-test--with-buffer
+        (viewport-buffer "*ai-code-editor-sole-viewport*")
       (save-window-excursion
         (delete-other-windows)
-        (let* ((window-sides-slots '(nil nil nil nil))
-               (source-window
-                (display-buffer-in-side-window
-                 source-buffer
-                 '((side . right)
-                   (slot . 0)
-                   (window-width . 40)
-                   (preserve-size . (t . nil))
-                   (window-parameters
-                    . ((no-delete-other-windows . t)
-                       (window-size-fixed . width))))))
-               (display-state
+        (switch-to-buffer source-buffer)
+        (let* ((display-state
                 (ai-code-editor-viewport--display
                  viewport-buffer source-buffer))
                (viewport-window (plist-get display-state :window)))
-          (should (window-live-p viewport-window))
-          (should-not (eq viewport-window source-window))
-          (should (eq (window-buffer source-window) source-buffer))
-          (should (eq (window-buffer viewport-window) viewport-buffer))
-          (should (eq (window-parameter viewport-window 'window-side) 'right))
-          (should (>= (nth 1 (window-edges viewport-window))
-                      (nth 3 (window-edges source-window))))
+          (let ((ignore-window-parameters t))
+            (delete-other-windows viewport-window))
+          (should-not (eq (window-deletable-p viewport-window) t))
           (ai-code-editor-viewport--restore-window
            display-state viewport-buffer)
-          (should (window-live-p source-window))
-          (should-not (window-live-p viewport-window)))))))
+          (should-not (get-buffer-window viewport-buffer t)))))))
 
-(ert-deftest test-ai-code-editor-viewport--display-below-errors-without-space ()
-  "Below placement should never replace the source window as a fallback."
+(ert-deftest test-ai-code-editor-viewport--display-below-from-side-uses-normal-window ()
+  "A below-side layout should use a restorable normal viewport window."
+  (ai-code-editor-viewport-test--with-buffer
+      (source-buffer "*ai-code-editor-transpose-source*")
+    (ai-code-editor-viewport-test--with-buffer
+        (viewport-buffer "*ai-code-editor-transpose-viewport*")
+      (save-window-excursion
+        (delete-other-windows)
+        (let* ((ai-code-editor-viewport-window-height 11)
+               (fixture
+                (ai-code-editor-viewport-test--display-from-lateral-side
+                 'right source-buffer viewport-buffer))
+               (source-window (plist-get fixture :source-window))
+               (main-window (plist-get fixture :main-window))
+               (main-buffer (plist-get fixture :main-buffer))
+               (display-state (plist-get fixture :display-state))
+               (viewport-window (plist-get fixture :viewport-window)))
+          (should (= (length (window-list)) 3))
+          (window--check)
+          (should (eq (window-parameter source-window 'window-side) 'right))
+          (should-not (window-parameter viewport-window 'window-side))
+          (ai-code-editor-viewport-test--transpose-parent-if-supported
+           viewport-window)
+          (window--check)
+          (should (eq (plist-get display-state :placement) 'below))
+          (ai-code-editor-viewport--restore-window
+           display-state viewport-buffer)
+          (window--check)
+          (should (= (length (window-list)) 2))
+          (should (window-live-p source-window))
+          (should (eq (window-parameter source-window 'window-side) 'right))
+          (should (window-live-p main-window))
+          (should (eq (window-buffer main-window) main-buffer))
+          (should-not (get-buffer-window viewport-buffer t)))))))
+
+(ert-deftest test-ai-code-editor-viewport--display-replaces-without-space ()
+  "Default placement should replace only after all placement attempts fail."
   (ai-code-editor-viewport-test--with-buffer
       (source-buffer "*ai-code-editor-no-space-source*")
     (ai-code-editor-viewport-test--with-buffer
@@ -752,14 +1331,254 @@
       (save-window-excursion
         (delete-other-windows)
         (switch-to-buffer source-buffer)
-        (let ((ai-code-editor-viewport-window-placement 'below))
+        (let ((ai-code-editor-viewport-window-placement 'below)
+              (source-window (selected-window))
+              display-state)
           (cl-letf (((symbol-function 'display-buffer)
                      (lambda (&rest _args) nil)))
-            (should-error
-             (ai-code-editor-viewport--display
-              viewport-buffer source-buffer)
-             :type 'user-error))
-          (should (eq (window-buffer (selected-window)) source-buffer)))))))
+            (setq display-state
+                  (ai-code-editor-viewport--display
+                   viewport-buffer source-buffer)))
+          (should (eq (plist-get display-state :window) source-window))
+          (should (eq (plist-get display-state :placement) 'replace))
+          (should (eq (window-buffer source-window) viewport-buffer))
+          (ai-code-editor-viewport--restore-window
+           display-state viewport-buffer)
+          (should (eq (window-buffer source-window) source-buffer)))))))
+
+(ert-deftest test-ai-code-editor-viewport--display-fallback-order ()
+  "Default placement should try below, right, left, and replace in order."
+  (ai-code-editor-viewport-test--with-buffer
+      (source-buffer "*ai-code-editor-order-source*")
+    (ai-code-editor-viewport-test--with-buffer
+        (viewport-buffer "*ai-code-editor-order-viewport*")
+      (save-window-excursion
+        (delete-other-windows)
+        (switch-to-buffer source-buffer)
+        (let ((ai-code-editor-viewport-window-placement 'below)
+              (ai-code-editor-viewport-window-height 11)
+              attempts)
+          (cl-letf
+              (((symbol-function
+                 'ai-code-editor-viewport--display-below-action)
+                (lambda (&rest _args)
+                  (push 'below attempts)
+                  nil))
+               ((symbol-function
+                 'ai-code-editor-viewport--display-side-action)
+                (lambda (direction &rest _args)
+                  (push direction attempts)
+                  nil))
+               ((symbol-function 'ai-code-editor-viewport--replace-window)
+                (lambda (_buffer window)
+                  (push 'replace attempts)
+                  (list :window window :placement 'replace))))
+            (should
+             (eq (plist-get
+                  (ai-code-editor-viewport--display
+                   viewport-buffer source-buffer)
+                  :placement)
+                 'replace)))
+          (should
+           (equal (nreverse attempts) '(below right left replace))))))))
+
+(ert-deftest test-ai-code-editor-viewport--display-never-runs-frame-actions ()
+  "Viewport placement should never delegate to a frame display action."
+  (ai-code-editor-viewport-test--with-buffer
+      (source-buffer "*ai-code-editor-no-frame-source*")
+    (ai-code-editor-viewport-test--with-buffer
+        (viewport-buffer "*ai-code-editor-no-frame-viewport*")
+      (save-window-excursion
+        (delete-other-windows)
+        (switch-to-buffer source-buffer)
+        (let ((ai-code-editor-viewport-window-placement 'below)
+              (ai-code-editor-viewport-window-height 11)
+              (frames-before (frame-list))
+              frame-action-called
+              display-state)
+          (let ((display-buffer-overriding-action
+                 (list
+                  (list
+                   (lambda (&rest _args)
+                     (setq frame-action-called t)
+                     nil)))))
+            (setq display-state
+                  (ai-code-editor-viewport--display
+                   viewport-buffer source-buffer)))
+          (should-not frame-action-called)
+          (should (equal (frame-list) frames-before))
+          (should (eq (plist-get display-state :placement) 'below)))))))
+
+(ert-deftest test-ai-code-editor-viewport--display-scopes-source-to-selected-frame ()
+  "Viewport placement should not look up its source on another frame."
+  (ai-code-editor-viewport-test--with-buffer
+      (source-buffer "*ai-code-editor-frame-source*")
+    (ai-code-editor-viewport-test--with-buffer
+        (viewport-buffer "*ai-code-editor-frame-viewport*")
+      (save-window-excursion
+        (delete-other-windows)
+        (let ((ai-code-editor-viewport-window-placement 'replace)
+              (origin-frame (selected-frame))
+              requested-frame
+              display-state)
+          (cl-letf (((symbol-function 'get-buffer-window)
+                     (lambda (_buffer frame)
+                       (setq requested-frame frame)
+                       nil)))
+            (setq display-state
+                  (ai-code-editor-viewport--display
+                   viewport-buffer source-buffer)))
+          (should (eq requested-frame origin-frame))
+          (should (eq (window-frame (plist-get display-state :window))
+                      origin-frame))
+          (ai-code-editor-viewport--restore-window
+           display-state viewport-buffer))))))
+
+(ert-deftest test-ai-code-editor-viewport--display-uses-dispatch-frame ()
+  "Viewport placement should honor a live frame captured at dispatch time."
+  (ai-code-editor-viewport-test--with-buffer
+      (source-buffer "*ai-code-editor-captured-frame-source*")
+    (ai-code-editor-viewport-test--with-buffer
+        (viewport-buffer "*ai-code-editor-captured-frame-viewport*")
+      (let ((ai-code-editor-viewport-window-placement 'replace)
+            (origin-frame 'origin-frame)
+            (later-frame 'later-frame)
+            (anchor-window 'origin-window)
+            requested-frame)
+        (cl-letf (((symbol-function 'frame-live-p)
+                   (lambda (frame) (eq frame origin-frame)))
+                  ((symbol-function 'selected-frame)
+                   (lambda () later-frame))
+                  ((symbol-function 'get-buffer-window)
+                   (lambda (_buffer frame)
+                     (setq requested-frame frame)
+                     nil))
+                  ((symbol-function 'frame-selected-window)
+                   (lambda (frame)
+                     (should (eq frame origin-frame))
+                     anchor-window))
+                  ((symbol-function 'ai-code-editor-viewport--replace-window)
+                   (lambda (_buffer window)
+                     (list :window window :placement 'replace))))
+          (should
+           (eq (plist-get
+                (ai-code-editor-viewport--display
+                 viewport-buffer source-buffer origin-frame)
+                :window)
+               anchor-window))
+          (should (eq requested-frame origin-frame)))))))
+
+(ert-deftest test-ai-code-editor-viewport--display-falls-back-from-deleted-frame ()
+  "A deleted dispatch frame should fall back to the selected frame."
+  (ai-code-editor-viewport-test--with-buffer
+      (source-buffer "*ai-code-editor-deleted-frame-source*")
+    (ai-code-editor-viewport-test--with-buffer
+        (viewport-buffer "*ai-code-editor-deleted-frame-viewport*")
+      (let ((ai-code-editor-viewport-window-placement 'replace)
+            (deleted-frame 'deleted-frame)
+            (current-frame 'current-frame)
+            (anchor-window 'current-window)
+            requested-frame)
+        (cl-letf (((symbol-function 'frame-live-p) #'ignore)
+                  ((symbol-function 'selected-frame)
+                   (lambda () current-frame))
+                  ((symbol-function 'get-buffer-window)
+                   (lambda (_buffer frame)
+                     (setq requested-frame frame)
+                     nil))
+                  ((symbol-function 'frame-selected-window)
+                   (lambda (frame)
+                     (should (eq frame current-frame))
+                     anchor-window))
+                  ((symbol-function 'ai-code-editor-viewport--replace-window)
+                   (lambda (_buffer window)
+                     (list :window window :placement 'replace))))
+          (should
+           (eq (plist-get
+                (ai-code-editor-viewport--display
+                 viewport-buffer source-buffer deleted-frame)
+                :window)
+               anchor-window))
+          (should (eq requested-frame current-frame)))))))
+
+(ert-deftest test-ai-code-editor-viewport--display-ignores-external-action-alists ()
+  "Viewport placement should ignore external display action constraints."
+  (ai-code-editor-viewport-test--with-buffer
+      (source-buffer "*ai-code-editor-no-alist-source*")
+    (ai-code-editor-viewport-test--with-buffer
+        (viewport-buffer "*ai-code-editor-no-alist-viewport*")
+      (save-window-excursion
+        (delete-other-windows)
+        (switch-to-buffer source-buffer)
+        (let ((ai-code-editor-viewport-window-placement 'below)
+              (ai-code-editor-viewport-window-height 11)
+              (display-buffer-alist
+               `((,(regexp-quote (buffer-name viewport-buffer))
+                  (window-min-height . 1000))))
+              (display-buffer-base-action
+               '((display-buffer-reuse-window)
+                 (window-min-height . 1000)))
+              (display-buffer-fallback-action
+               '((display-buffer-pop-up-frame)
+                 (window-min-height . 1000))))
+          (let ((display-state
+                 (ai-code-editor-viewport--display
+                  viewport-buffer source-buffer)))
+            (should (eq (plist-get display-state :placement) 'below))
+            (ai-code-editor-viewport--restore-window
+             display-state viewport-buffer)))))))
+
+(ert-deftest test-ai-code-editor-viewport--display-side-from-horizontal-side-uses-normal-window ()
+  "A short top or bottom session should use a restorable normal side window."
+  (ai-code-editor-viewport-test--with-buffer
+      (source-buffer "*ai-code-editor-horizontal-side-source*")
+    (ai-code-editor-viewport-test--with-buffer
+        (viewport-buffer "*ai-code-editor-horizontal-side-viewport*")
+      (dolist (side '(top bottom))
+        (save-window-excursion
+          (delete-other-windows)
+          (let* ((ai-code-editor-viewport-window-placement 'below)
+                 (window-sides-slots '(nil nil nil nil))
+                 (source-window
+                  (display-buffer-in-side-window
+                   source-buffer
+                   `((side . ,side)
+                     (slot . 0)
+                     (window-height . 8)
+                     (preserve-size . (nil . t))
+                     (window-parameters
+                      . ((no-delete-other-windows . t)
+                         (window-size-fixed . height))))))
+                 (main-window (window-main-window))
+                 (main-buffer (window-buffer main-window))
+                 (display-state
+                  (ai-code-editor-viewport--display
+                   viewport-buffer source-buffer))
+                 (viewport-window (plist-get display-state :window)))
+            (should (eq (plist-get display-state :placement) 'side))
+            (should (window-live-p viewport-window))
+            (should-not (eq viewport-window source-window))
+            (should (eq (window-parameter source-window 'window-side) side))
+            (should-not (window-parameter viewport-window 'window-side))
+            (should (>= (window-total-width source-window)
+                        ai-code-editor-viewport-min-width))
+            (should (>= (window-total-width viewport-window)
+                        ai-code-editor-viewport-min-width))
+            (should (>= (nth 0 (window-edges viewport-window))
+                        (nth 2 (window-edges source-window))))
+            (window--check)
+            (ai-code-editor-viewport-test--transpose-parent-if-supported
+             viewport-window)
+            (window--check)
+            (ai-code-editor-viewport--restore-window
+             display-state viewport-buffer)
+            (window--check)
+            (should (window-live-p source-window))
+            (should (eq (window-buffer source-window) source-buffer))
+            (should (eq (window-parameter source-window 'window-side) side))
+            (should (window-live-p main-window))
+            (should (eq (window-buffer main-window) main-buffer))
+            (should-not (get-buffer-window viewport-buffer t))))))))
 
 (ert-deftest test-ai-code-editor-viewport--display-replace-restores-hidden-source-window ()
   "Replacement placement should restore the user's previous window buffer."

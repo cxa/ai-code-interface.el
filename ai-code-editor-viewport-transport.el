@@ -16,7 +16,8 @@
 (require 'subr-x)
 
 (declare-function ai-code-editor-viewport--open-request
-                  "ai-code-editor-viewport" (source-buffer payload))
+                  "ai-code-editor-viewport"
+                  (source-buffer payload &optional origin-frame))
 (declare-function ai-code-editor-viewport--schedule-submit
                   "ai-code-editor-viewport" (source-buffer))
 
@@ -42,6 +43,10 @@
 
 (defconst ai-code-editor-viewport--submit-ready-prefix "submit-ready:"
   "Prefix for completion payloads emitted after a helper is reaped.")
+
+(defconst ai-code-editor-viewport--request-version
+  "ai-code-editor-viewport-v1"
+  "Version marker for editor request payloads with explicit request kinds.")
 
 (defconst ai-code-editor-viewport--frame-prefix-environment-variable
   "AI_CODE_EDITOR_VIEWPORT_FRAME_PREFIX"
@@ -178,9 +183,10 @@ When TOKEN is nil, discard any pending token."
     (if (string-prefix-p ai-code-editor-viewport--submit-ready-prefix payload)
         (ai-code-editor-viewport--consume-submit-ready source-buffer payload)
       (ai-code-editor-viewport--discard-submit-token source-buffer)
-      (run-at-time 0 nil
-                   #'ai-code-editor-viewport--open-request
-                   source-buffer payload)
+      (let ((origin-frame (selected-frame)))
+        (run-at-time 0 nil
+                     #'ai-code-editor-viewport--open-request
+                     source-buffer payload origin-frame))
       t)))
 
 (defun ai-code-editor-viewport-filter-output (process output)
@@ -225,6 +231,9 @@ STATUS-DIRECTORY is where the helper creates its response files."
                                temporary-file-directory))))
     (concat
      "#!/bin/sh\n"
+     "request_kind=regular\n"
+     "[ \"${1-}\" = \"--ai-code-staging\" ]"
+     " && request_kind=staging && shift\n"
      "submit=0\n"
      "[ \"${1-}\" = \"--ai-code-submit\" ] && submit=1 && shift\n"
      "[ \"$#\" -gt 0 ] || exit 1\n"
@@ -239,6 +248,10 @@ STATUS-DIRECTORY is where the helper creates its response files."
      "    printf '%s\\0' \"$status_file\"\n"
      "    printf '%s\\0' \"${PWD-}\"\n"
      "    printf '%s\\0' \"$submit\"\n"
+     "    printf '%s\\0' \""
+     ai-code-editor-viewport--request-version
+     "\"\n"
+     "    printf '%s\\0' \"$request_kind\"\n"
      "    printf '%s\\0' \"$@\"\n"
      "  } | base64 | tr -d '\\r\\n'\n"
      ") || exit 1\n"
@@ -341,17 +354,18 @@ STATUS-DIRECTORY is where the helper creates its response files."
   "Return ENVIRONMENT configured to edit through a terminal viewport.
 FRAME-PREFIX, when non-nil, selects an adapter-specific terminal frame.
 General editor requests submit restored input when
-`ai-code-editor-viewport-auto-submit' is non-nil.  Git editor requests only
-save."
+`ai-code-editor-viewport-auto-submit' is non-nil.  They are marked as staging
+requests independently of submission.  Git editor requests only save."
   (if (or (not ai-code-editor-viewport-enabled)
           (not (ai-code-editor-viewport--supported-p)))
       environment
     (let* ((helper (ai-code-editor-viewport--ensure-helper))
            (helper-command (shell-quote-argument helper))
-           (submit-command (concat helper-command " --ai-code-submit"))
+           (staging-command (concat helper-command " --ai-code-staging"))
+           (submit-command (concat staging-command " --ai-code-submit"))
            (editor-command (if ai-code-editor-viewport-auto-submit
                                submit-command
-                             helper-command))
+                             staging-command))
            (prefix (or frame-prefix
                        (ai-code-editor-viewport--frame-prefix))))
       (append

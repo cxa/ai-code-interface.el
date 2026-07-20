@@ -35,8 +35,8 @@
         (ai-code-editor-viewport-environment
          '("TERM_PROGRAM=emacs" "EDITOR=vim" "VISUAL=nano"
            "GIT_EDITOR=vi" "GIT_SEQUENCE_EDITOR=vim"))
-        '("EDITOR=/tmp/ai-code-editor-helper --ai-code-submit"
-          "VISUAL=/tmp/ai-code-editor-helper --ai-code-submit"
+        '("EDITOR=/tmp/ai-code-editor-helper --ai-code-staging --ai-code-submit"
+          "VISUAL=/tmp/ai-code-editor-helper --ai-code-staging --ai-code-submit"
           "GIT_EDITOR=/tmp/ai-code-editor-helper"
           "GIT_SEQUENCE_EDITOR=/tmp/ai-code-editor-helper"
           "AI_CODE_EDITOR_VIEWPORT_FRAME_PREFIX=\e]6973;ai-code-editor;test-token;"
@@ -54,8 +54,8 @@
       (should
        (equal
         (seq-take (ai-code-editor-viewport-environment nil) 4)
-        '("EDITOR=/tmp/ai-code-editor-helper"
-          "VISUAL=/tmp/ai-code-editor-helper"
+        '("EDITOR=/tmp/ai-code-editor-helper --ai-code-staging"
+          "VISUAL=/tmp/ai-code-editor-helper --ai-code-staging"
           "GIT_EDITOR=/tmp/ai-code-editor-helper"
           "GIT_SEQUENCE_EDITOR=/tmp/ai-code-editor-helper"))))))
 
@@ -75,11 +75,26 @@
     (should
      (string-match-p
       (regexp-quote
+       "[ \"${1-}\" = \"--ai-code-staging\" ] && request_kind=staging && shift")
+      content))
+    (should
+     (string-match-p
+      (regexp-quote
        "[ \"${1-}\" = \"--ai-code-submit\" ] && submit=1 && shift")
       content))
     (should
      (string-match-p
       (regexp-quote "printf '%s\\0' \"$submit\"")
+      content))
+    (should
+     (string-match-p
+      (regexp-quote
+       (format "printf '%%s\\0' \"%s\""
+               ai-code-editor-viewport--request-version))
+      content))
+    (should
+     (string-match-p
+      (regexp-quote "printf '%s\\0' \"$request_kind\"")
       content))
     (should
      (string-match-p
@@ -128,6 +143,7 @@
   "Adapter requests should require the session token before opening a viewport."
   (with-temp-buffer
     (let ((source-buffer (current-buffer))
+          (origin-frame (selected-frame))
           (ai-code-editor-viewport--protocol-token "test-token")
           (ai-code-editor-viewport--pending-submit-token "old-submit-token")
           scheduled)
@@ -148,7 +164,7 @@
         (should
          (equal scheduled
                 `((ai-code-editor-viewport--open-request
-                   ,source-buffer "PAYLOAD"))))))))
+                   ,source-buffer "PAYLOAD" ,origin-frame))))))))
 
 (ert-deftest test-ai-code-editor-viewport-transport--handle-request-rejects-oversized-payload ()
   "Adapter requests over the protocol limit should not be scheduled."
@@ -250,11 +266,12 @@
            visible-output)
       (unwind-protect
           (cl-letf (((symbol-function 'ai-code-editor-viewport--open-request)
-                     (lambda (buffer payload)
+                     (lambda (buffer payload &optional origin-frame)
                        (setq request
                              (list buffer
                                    (ai-code-editor-viewport--decode-request
-                                    payload)))
+                                    payload)
+                                   origin-frame))
                        (ai-code-editor-viewport--write-status
                         (plist-get (cadr request) :status-file) 0)
                        t)))
@@ -279,7 +296,9 @@
             (should (eq (process-status process) 'exit))
             (should (= (process-exit-status process) 0))
             (should (eq (car request) source-buffer))
+            (should (eq (nth 2 request) (selected-frame)))
             (should (eq (plist-get (cadr request) :submit-p) t))
+            (should (eq (plist-get (cadr request) :staging-request-p) t))
             (should
              (equal
               (list (plist-get (cadr request) :directory)
@@ -389,6 +408,7 @@
   (with-temp-buffer
     (let ((ai-code-editor-viewport--protocol-token "test-token")
           (source-buffer (current-buffer))
+          (origin-frame (selected-frame))
           scheduled)
       (cl-letf (((symbol-function 'process-buffer)
                  (lambda (_process) source-buffer))
@@ -419,9 +439,9 @@
          (equal
           (nreverse scheduled)
           `((ai-code-editor-viewport--open-request
-             ,source-buffer "PAYLOAD")
+             ,source-buffer "PAYLOAD" ,origin-frame)
             (ai-code-editor-viewport--open-request
-             ,source-buffer "TWO"))))))))
+             ,source-buffer "TWO" ,origin-frame))))))))
 
 (ert-deftest test-ai-code-editor-viewport-transport--filter-output-discards-oversized-request ()
   "A complete editor request over the configured limit should not be opened."
