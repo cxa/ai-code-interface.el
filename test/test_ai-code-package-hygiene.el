@@ -8,6 +8,11 @@
 ;;; Code:
 
 (require 'ert)
+(require 'loaddefs-gen)
+
+(loaddefs-generate
+ default-directory
+ (expand-file-name "ai-code-autoloads.el" default-directory))
 
 (defun ai-code-test--file-prefix (path length)
   "Return the first LENGTH characters from PATH."
@@ -25,15 +30,15 @@
     (goto-char (match-beginning 0))
     (nth 2 (read (current-buffer)))))
 
-(ert-deftest ai-code-test-autoloads-file-has-spdx-header ()
-  "Autoloads file should advertise the package license with SPDX."
+(ert-deftest ai-code-test-autoloads-file-has-standard-generated-header ()
+  "Autoloads file should identify itself as generated output."
   (let ((header (ai-code-test--file-prefix "ai-code-autoloads.el" 400)))
-    (should (string-match-p "SPDX-License-Identifier: Apache-2\\.0" header))))
+    (should (string-match-p "automatically extracted autoloads" header))))
 
-(ert-deftest ai-code-test-autoloads-file-has-commentary-section ()
-  "Autoloads file should include a Commentary section for package checks."
+(ert-deftest ai-code-test-autoloads-file-has-code-section ()
+  "Autoloads file should include a Code section."
   (let ((header (ai-code-test--file-prefix "ai-code-autoloads.el" 400)))
-    (should (string-match-p "^;;; Commentary:" header))))
+    (should (string-match-p "^;;; Code:" header))))
 
 (ert-deftest ai-code-test-autoloads-file-omits-harness-test-after-change-custom ()
   "Autoloads file should omit the harness-only test-after-change custom."

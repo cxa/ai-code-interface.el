@@ -48,6 +48,7 @@
 (declare-function flycheck-error-message "flycheck" (error))
 (declare-function flycheck-overlay-errors-at "flycheck" (position))
 
+;;;###autoload
 (defcustom ai-code-send-screenshot-command
   (cond
    ((eq system-type 'darwin) '("/usr/sbin/screencapture" "-i"))
