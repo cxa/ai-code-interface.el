@@ -24,6 +24,7 @@
 ;;
 ;; Supported AI coding CLIs include:
 ;;   - OpenAI Codex
+;;   - Pi
 ;;   - Antigravity CLI
 ;;   - Opencode
 ;;   - Claude Code
@@ -50,7 +51,8 @@
 ;;        (global-set-key (kbd "C-c a") #'ai-code-menu))
 ;;
 ;;   2) First 60 seconds:
-;;      - C-c a a : Start AI CLI session
+;;      - C-c a a : Start the selected AI CLI session
+;;      - C-c a p : Select Pi and start it directly (C-u: resume)
 ;;      - C-c a c : Ask AI to change current function/region
 ;;      - C-c a q : Ask question only (no code change)
 ;;      - C-c a z : Jump back to active AI session buffer
@@ -59,7 +61,7 @@
 ;;
 ;; (use-package ai-code
 ;;   :config
-;;   ;; use codex as backend, other options are 'gemini, 'github-copilot-cli, 'open-interpreter, 'opencode, 'kilo, 'grok, 'claude-code-ide, 'claude-code-el, 'claude-code, 'cursor, 'kiro, 'codebuddy, 'aider, 'agent-shell, 'eca
+;;   ;; use codex as backend, other options are 'pi, 'gemini, 'github-copilot-cli, 'open-interpreter, 'opencode, 'kilo, 'grok, 'claude-code-ide, 'claude-code-el, 'claude-code, 'cursor, 'kiro, 'codebuddy, 'aider, 'agent-shell, 'eca
 ;;   (ai-code-set-backend 'codex) ;; set your preferred backend
 ;;   ;; Optional: use a narrower transient menu on smaller frames
 ;;   ;; (setq ai-code-menu-layout 'two-columns)
@@ -400,6 +402,17 @@ Otherwise switch to AI CLI buffer."
       (wrong-number-of-arguments ;; will be triggered during calling corresponding function in external backends such as claude-code-ide.el, claude-code.el, since the corresponding function doesn't have parameter
        (ai-code-cli-switch-to-buffer)))))
 
+;;;###autoload
+(defun ai-code-start-pi (&optional arg)
+  "Select the Pi backend and start a Pi session.
+With prefix ARG, open Pi's session picker instead of starting a new session."
+  (interactive "P")
+  (ai-code-set-backend 'pi)
+  (if arg
+      (let ((current-prefix-arg nil))
+        (ai-code-cli-resume))
+    (ai-code-cli-start)))
+
 (defclass ai-code--use-prompt-suffix-type (transient-lisp-variable)
   ((variable :initform 'ai-code-use-prompt-suffix)
    (format :initform "%k %d %v")
@@ -500,6 +513,7 @@ Shows the current backend label to the right."
 ;; Mirror aider.el's reusable-section approach using `transient-define-group`.
 (transient-define-group ai-code--menu-ai-cli-session
   ("a" "Start AI CLI (C-u: args)" ai-code-cli-start)
+  ("p" "Start Pi (C-u: resume)" ai-code-start-pi)
   ("R" "Resume AI CLI (C-u: args)" ai-code-cli-resume)
   ("z" "Switch to AI CLI (C-u: hide)" ai-code-cli-switch-to-buffer-or-hide)
   ("s" ai-code-select-backend :description ai-code--select-backend-description)
@@ -571,8 +585,7 @@ Shows the current backend label to the right."
   ("e" "Investigate exception (C-u: clipboard)" ai-code-investigate-exception)
   ("f" "Fix Flycheck errors in scope" ai-code-flycheck-fix-errors-in-scope)
   ("k" "Copy Cur File Name (C-u: full)" ai-code-copy-buffer-file-name-to-clipboard)
-  ;; ("o" "Open recent file (C-u: insert)" ai-code-git-repo-recent-modified-files)
-  ("p" "Open prompt history file" ai-code-open-prompt-file)
+  ("o" "Open prompt history file" ai-code-open-prompt-file)
   ;; ("m" "Debug python MCP server" ai-code-debug-mcp)
   ;; ("N" "Toggle notifications" ai-code-notifications-toggle)
   ("d" "Debug Emacs runtime" ai-code-debug-emacs-runtime)
