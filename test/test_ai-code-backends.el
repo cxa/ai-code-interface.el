@@ -166,6 +166,23 @@
     (should (equal (plist-get (cdr spec) :upgrade) "agy update"))
     (should (equal (plist-get (cdr spec) :cli) "agy"))))
 
+(ert-deftest ai-code-test-pi-backend-spec-contract ()
+  "Ensure the Pi backend entry exposes required integration keys."
+  (let ((spec (ai-code--backend-spec 'pi)))
+    (should spec)
+    (should (eq (plist-get (cdr spec) :require) 'ai-code-pi))
+    (should (eq (plist-get (cdr spec) :start) 'ai-code-pi-start))
+    (should (eq (plist-get (cdr spec) :switch) 'ai-code-pi-switch-to-buffer))
+    (should (eq (plist-get (cdr spec) :send) 'ai-code-pi-send-command))
+    (should (eq (plist-get (cdr spec) :resume) 'ai-code-pi-resume))
+    (should (equal (plist-get (cdr spec) :config)
+                   "~/.pi/agent/settings.json"))
+    (should (equal (plist-get (cdr spec) :agent-file) "AGENTS.md"))
+    (should (equal (plist-get (cdr spec) :install)
+                   "npm install -g --ignore-scripts @earendil-works/pi-coding-agent"))
+    (should (equal (plist-get (cdr spec) :upgrade) "pi update --self"))
+    (should (equal (plist-get (cdr spec) :cli) "pi"))))
+
 (ert-deftest ai-code-test-backend-selection-keeps-repo-session-backend ()
   "Switching backend in one repo should not overwrite started backend in another repo."
   (let* ((ai-code-backends

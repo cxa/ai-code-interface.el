@@ -270,6 +270,19 @@ so the CLI itself handles the installation details."
      :upgrade nil
      :install-skills nil
      :cli     "codex")
+    (pi
+     :label "Pi"
+     :require ai-code-pi
+     :start   ai-code-pi-start
+     :switch  ai-code-pi-switch-to-buffer
+     :send    ai-code-pi-send-command
+     :resume  ai-code-pi-resume
+     :config  "~/.pi/agent/settings.json"
+     :agent-file "AGENTS.md"
+     :install "npm install -g --ignore-scripts @earendil-works/pi-coding-agent"
+     :upgrade "pi update --self"
+     :install-skills nil
+     :cli     "pi")
     (open-interpreter
      :label "Open Interpreter CLI"
      :require ai-code-open-interpreter-cli
